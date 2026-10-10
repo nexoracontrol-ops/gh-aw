@@ -109,13 +109,51 @@ func ComputePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig) *Permissio
 	return computePermissionsForSafeOutputs(safeOutputs, false)
 }
 
-func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePerHandlerApps bool) *Permissions {
+// safeOutputsGlobalAppTokenMinted reports whether the consolidated safe_outputs job
+// mints the global "safe-outputs-app-token" step. The step is skipped when no enabled
+// handler consumes GitHub permissions from the global app (for example when every
+// handler is staged, or in a Linear-only configuration), so token expressions that
+// reference the step must fall back to a regular token in that case.
+//
+// This must stay in sync with buildPreambleTokenSteps, which uses the same condition
+// to decide whether to emit the minting step.
+func safeOutputsGlobalAppTokenMinted(safeOutputs *SafeOutputsConfig) bool {
+	if safeOutputs == nil || safeOutputs.GitHubApp == nil {
+		return false
+	}
+	return globalAppTokenNeededForPermissions(computePermissionsForSafeOutputs(safeOutputs, true))
+}
+
+// globalAppTokenNeededForPermissions reports whether the permission set computed for the
+// global GitHub App requires minting an installation token. An explicitly empty permission
+// set means no enabled handler consumes the global app, so no token is minted.
+func globalAppTokenNeededForPermissions(appPermissions *Permissions) bool {
+	return appPermissions == nil || len(appPermissions.permissions) > 0
+}
+
+func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePerHandlerApps bool) *Permissions { //nolint:largefunc // Permission aggregation is clearer as one sequential pass.
 	if safeOutputs == nil {
 		safeOutputsPermissionsLog.Print("No safe outputs configured, returning empty permissions")
 		return NewPermissions()
 	}
 
 	permissions := NewPermissions()
+	if len(safeOutputs.ClaimAdapters) > 0 && !templatableBoolIsTrue(safeOutputs.Staged) {
+		for _, adapter := range safeOutputs.ClaimAdapters {
+			if adapter != nil && adapter.EffectType == "github_rest" && adapter.Request != nil {
+				permissions.Set(PermissionScope(adapter.Request.Permission), PermissionWrite)
+			} else if adapter != nil && adapter.EffectType == "github_graphql" && adapter.GraphQL != nil {
+				permissions.Set(PermissionScope(adapter.GraphQL.Permission), PermissionWrite)
+			} else if adapter != nil && adapter.EffectType == "git_tree" && adapter.GitTree != nil {
+				permissions.Set(PermissionContents, PermissionWrite)
+				if adapter.GitTree.PullRequest {
+					permissions.Set(PermissionPullRequests, PermissionWrite)
+				}
+			} else {
+				permissions.Set(PermissionIssues, PermissionWrite)
+			}
+		}
+	}
 
 	for _, handler := range safeOutputHandlers {
 		if handler.PermissionBuilder == nil {
@@ -132,6 +170,15 @@ func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePer
 			safeOutputsPermissionsLog.Printf("Adding permissions for %s", handler.Key)
 		}
 		permissions.Merge(handlerPermissions)
+	}
+
+	if safeOutputs.AddComments != nil && addCommentTargetsEnabled(safeOutputs.AddComments) {
+		// Mention resolution fetches explicit comment targets through the Issues API,
+		// including when add-comment is configured for pull requests only. Add this
+		// only when the selected safe-output token does not already have Issues access.
+		if _, hasIssuesPermission := permissions.Get(PermissionIssues); !hasIssuesPermission {
+			permissions.Set(PermissionIssues, PermissionRead)
+		}
 	}
 
 	if dispatchRepositoryPermissions := computeDispatchRepositoryPermissions(safeOutputs, excludePerHandlerApps); dispatchRepositoryPermissions != nil {
@@ -177,6 +224,30 @@ func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePer
 
 	safeOutputsPermissionsLog.Printf("Computed permissions with %d scopes", len(permissions.permissions))
 	return permissions
+}
+
+func buildMentionResolutionPermissions(safeOutputs *SafeOutputsConfig) *Permissions {
+	permissions := NewPermissions()
+	if safeOutputs == nil {
+		return permissions
+	}
+	if safeOutputs.AddComments != nil && addCommentTargetsEnabled(safeOutputs.AddComments) {
+		// The pre-handler author lookup uses issues.get for both issue and PR targets.
+		permissions.Set(PermissionIssues, PermissionRead)
+		if safeOutputs.AddComments.PullRequests == nil || *safeOutputs.AddComments.PullRequests {
+			permissions.Set(PermissionPullRequests, PermissionRead)
+		}
+	}
+	if safeOutputs.Mentions != nil && len(safeOutputs.Mentions.AllowedTeams) > 0 {
+		permissions.Set(PermissionMembers, PermissionRead)
+	}
+	return permissions
+}
+
+func addCommentTargetsEnabled(config *AddCommentsConfig) bool {
+	return config != nil &&
+		((config.Issues == nil || *config.Issues) ||
+			(config.PullRequests == nil || *config.PullRequests))
 }
 
 func computeDispatchRepositoryPermissions(safeOutputs *SafeOutputsConfig, excludePerToolApps bool) *Permissions {

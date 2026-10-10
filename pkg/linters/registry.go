@@ -10,6 +10,8 @@ import (
 	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
 	"github.com/github/gh-aw/pkg/linters/bytescomparestring"
+	"github.com/github/gh-aw/pkg/linters/closeerrorunchecked"
+	"github.com/github/gh-aw/pkg/linters/consolestderr"
 	"github.com/github/gh-aw/pkg/linters/contextcancelnotdeferred"
 	"github.com/github/gh-aw/pkg/linters/ctxbackground"
 	"github.com/github/gh-aw/pkg/linters/deferinloop"
@@ -21,6 +23,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
+	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
 	"github.com/github/gh-aw/pkg/linters/fprintlnsprintf"
 	"github.com/github/gh-aw/pkg/linters/generatedyamlheredoc"
 	"github.com/github/gh-aw/pkg/linters/globwalkignorederror"
@@ -46,6 +49,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
+	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
 	"github.com/github/gh-aw/pkg/linters/regexpcompileinfunction"
 	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
@@ -69,7 +73,9 @@ import (
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
 	"github.com/github/gh-aw/pkg/linters/tolowerequalfold"
 	"github.com/github/gh-aw/pkg/linters/trimleftright"
+	"github.com/github/gh-aw/pkg/linters/typeassertionnil"
 	"github.com/github/gh-aw/pkg/linters/typeassertionokdiscarded"
+	uncheckedsliceindex "github.com/github/gh-aw/pkg/linters/unchecked-slice-index"
 	"github.com/github/gh-aw/pkg/linters/uncheckedflushreturn"
 	"github.com/github/gh-aw/pkg/linters/uncheckedtypeassertion"
 	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
@@ -94,6 +100,8 @@ var allAnalyzers = []*analysis.Analyzer{
 	bufioscannererunchecked.Analyzer,
 	bytesbufferstring.Analyzer,
 	bytescomparestring.Analyzer,
+	closeerrorunchecked.Analyzer,
+	consolestderr.Analyzer,
 	contextcancelnotdeferred.Analyzer,
 	ctxbackground.Analyzer,
 	deferinloop.Analyzer,
@@ -106,6 +114,7 @@ var allAnalyzers = []*analysis.Analyzer{
 	excessivefuncparams.Analyzer,
 	fileclosenotdeferred.Analyzer,
 	fmterrorfnoverbs.Analyzer,
+	fprintferrorunchecked.Analyzer,
 	generatedyamlheredoc.Analyzer,
 	globwalkignorederror.Analyzer,
 	goroutinemissingrecover.Analyzer,
@@ -127,6 +136,7 @@ var allAnalyzers = []*analysis.Analyzer{
 	packagelevelmutableslicemap.Analyzer,
 	panicinlibrarycode.Analyzer,
 	rawloginlib.Analyzer,
+	reflectdeepequalusage.Analyzer,
 	regexpcompileinfunction.Analyzer,
 	regexpdynamicpattern.Analyzer,
 	ssljson.Analyzer,
@@ -153,7 +163,9 @@ var allAnalyzers = []*analysis.Analyzer{
 	timenowsub.Analyzer,
 	tolowerequalfold.Analyzer,
 	trimleftright.Analyzer,
+	typeassertionnil.Analyzer,
 	typeassertionokdiscarded.Analyzer,
+	uncheckedsliceindex.Analyzer,
 	uncheckedtypeassertion.Analyzer,
 	uncheckedflushreturn.Analyzer,
 	walkfuncerrshadow.Analyzer,

@@ -30,6 +30,15 @@ describe("setup action Windows support", () => {
   });
 });
 
+describe("setup.sh Copilot runtime files", () => {
+  it("copies the shared routing effort dependency alongside Copilot runtime scripts", () => {
+    expect(setupShContent).toContain('for file in "${JS_SOURCE_DIR}"/*.cjs; do');
+    expect(setupShContent).toContain('cp "$file" "${DESTINATION}/${filename}"');
+    expect(getDirectLocalRequires("copilot_harness.cjs")).toContain("copilot_routing_effort.cjs");
+    expect(getDirectLocalRequires("copilot_sdk_driver.cjs")).toContain("copilot_routing_effort.cjs");
+  });
+});
+
 /**
  * Parse a bash array from setup.sh, e.g.:
  *   MCP_SCRIPTS_FILES=(
@@ -108,6 +117,31 @@ describe("setup.sh MCP_SCRIPTS_FILES", () => {
 });
 
 describe("setup.sh SAFE_OUTPUTS_FILES", () => {
+  it("prepares the isolated work queue finish-intent mount", () => {
+    expect(setupShContent).toContain('create_dir "${SAFE_OUTPUTS_DEST}/work-queue"');
+  });
+
+  it("includes the work queue replay module", () => {
+    expect(safeOutputsFiles).toContain("work_queue_replay.cjs");
+    expect(safeOutputsFiles).toContain("work_queue_store.cjs");
+    expect(safeOutputsFiles).toContain("work_queue_logging.cjs");
+  });
+
+  it("deploys checked transport and Issue binding dependencies with the queue runtime", () => {
+    expect(getDirectLocalRequires("work_queue_store.cjs")).toContain("work_queue_checked_transport.cjs");
+    expect(getDirectLocalRequires("work_queue_replay.cjs")).toContain("work_queue_issue_contract.cjs");
+    expect(safeOutputsFiles).toContain("work_queue_checked_transport.cjs");
+    expect(safeOutputsFiles).toContain("work_queue_issue_contract.cjs");
+  });
+
+  it("deploys Claim authority and worker route provisioning dependencies", () => {
+    expect(getDirectLocalRequires("safe_outputs_handlers.cjs")).toContain("work_queue_claim_scope.cjs");
+    expect(getDirectLocalRequires("work_queue_provisioning.cjs")).toContain("work_queue_yaml.cjs");
+    for (const file of ["work_queue_claim_scope.cjs", "finish_work_queue_claim.cjs", "work_queue_resource_scope.cjs", "work_queue_effect_client.cjs", "work_queue_yaml.cjs"]) {
+      expect(safeOutputsFiles).toContain(file);
+    }
+  });
+
   it("contains all transitive local dependencies (including entry point safe-outputs-mcp-server.cjs)", () => {
     const listed = new Set(safeOutputsFiles);
     // Entry point is also deployed (as mcp-server.cjs), so its deps must be covered too

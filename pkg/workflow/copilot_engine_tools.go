@@ -68,15 +68,16 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	hasUnrestrictedBash := false
 
 	// Check if bash has wildcard - if so, use --allow-all-tools in CLI mode.
-	// SDK mode must keep shell permission scoped because its explicit session
-	// catalog can contain non-shell tools that wildcard bash must not authorize.
+	// SDK mode and restricted-network workflows must keep shell permission scoped
+	// because --allow-all-tools would also authorize hosted web tools.
 	if bashConfig, hasBash := tools["bash"]; hasBash {
 		if bashCommands, ok := bashConfig.([]any); ok {
 			// Check for :* or * wildcard - if present, allow all tools
 			for _, cmd := range bashCommands {
 				if cmdStr, ok := cmd.(string); ok {
 					if cmdStr == ":*" || cmdStr == "*" {
-						if copilotNeedsBuiltinMCPs(workflowData) || isCopilotSDKMode(workflowData) {
+						if isCopilotSDKMode(workflowData) ||
+							(workflowData != nil && hasNetworkRestrictions(workflowData.NetworkPermissions)) {
 							hasUnrestrictedBash = true
 							break
 						}
@@ -168,8 +169,8 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 		args = append(args, "--allow-tool", constants.MCPScriptsMCPServerID.String())
 	}
 
-	// Handle web-fetch builtin tool (Copilot CLI uses web_fetch with underscore)
-	if isCopilotToolValueEnabled(tools, "web-fetch") {
+	// SDK mode supplies a custom proxy-aware fetch tool; native web tools are unavailable.
+	if isCopilotSDKMode(workflowData) && isCopilotToolValueEnabled(tools, "web-fetch") {
 		copilotEngineToolsLog.Print("Web-fetch tool enabled, adding web_fetch permission")
 		// web-fetch -> web_fetch
 		args = append(args, "--allow-tool", "web_fetch")
@@ -178,6 +179,7 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	// Built-in tool names that should be skipped when processing MCP servers
 	// Note: GitHub is NOT included here because it needs MCP configuration in CLI mode
 	// Note: web-fetch is NOT included here because it needs explicit --allow-tool argument
+	// Note: native web-search is unavailable in offline BYOK mode
 	builtInTools := map[string]struct {
 	}{
 		"bash":         {},
@@ -267,8 +269,12 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	// all become "jq"), producing duplicate --allow-tool shell(jq) entries.
 	if len(args) > 0 {
 		var values []string
-		for i := 1; i < len(args); i += 2 {
-			values = append(values, args[i])
+		expectValue := false
+		for _, arg := range args {
+			if expectValue {
+				values = append(values, arg)
+			}
+			expectValue = !expectValue
 		}
 		sort.Strings(values)
 
@@ -301,10 +307,16 @@ func (e *CopilotEngine) generateCopilotToolArgumentsComment(tools map[string]any
 	comment.WriteString(indent + "# Copilot CLI tool arguments (sorted):\n")
 
 	// Group flag-value pairs for better readability
-	for i := 0; i < len(toolArgs); i += 2 {
-		if i+1 < len(toolArgs) {
-			fmt.Fprintf(&comment, "%s# %s %s\n", indent, toolArgs[i], toolArgs[i+1])
+	var flag string
+	expectValue := false
+	for _, arg := range toolArgs {
+		if !expectValue {
+			flag = arg
+			expectValue = true
+			continue
 		}
+		fmt.Fprintf(&comment, "%s# %s %s\n", indent, flag, arg)
+		expectValue = false
 	}
 
 	return comment.String()

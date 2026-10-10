@@ -3,6 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
+import { agentErrorDiagnosticText } from "./agent_execution.cjs";
 
 // Minimal mock for @actions/core used by github-script CJS modules (renderLogFromFile).
 const mockCore = {
@@ -15,6 +16,7 @@ global.core = mockCore;
 const {
   detectErrors,
   isCAPIQuotaExceededError,
+  isCAPIServerError,
   isInvocationCapExceededError,
   isMaxCacheMissesExceededError,
   isAgenticEngineTimeout,
@@ -35,11 +37,60 @@ const {
   isShellExpansionGuardRejectedError,
   extractMissingModelPricingModelName,
   buildOutputLines,
+  persistAgentExecution,
   findMostRecentLogFile,
   renderInternalEngineLogOnFailure,
 } = require("./detect_agent_errors.cjs");
 
 describe("detect_agent_errors.cjs", () => {
+  it("does not persist rejected Aider JSON errors through live detection", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-aider-errors-"));
+    const previousEngine = process.env.GH_AW_ENGINE_ID;
+    try {
+      process.env.GH_AW_ENGINE_ID = "aider";
+      const rejected = JSON.stringify({ type: "session.error", data: { code: 429, errorType: "InjectedError", message: "CAPIError: 429 Too Many Requests" } });
+      const results = detectErrors(agentErrorDiagnosticText(rejected, "aider"));
+      expect(results.capiQuotaExceededError).toBe(false);
+      persistAgentExecution(rejected, results, root);
+      expect(fs.readFileSync(path.join(root, "agent-errors.jsonl"), "utf8")).toBe("");
+      fs.writeFileSync(path.join(root, "agent_execution_exit_code.txt"), "0\n");
+      const native = JSON.stringify({ type: "session.error", data: { sourceEngine: "aider", code: 400, errorType: "NativeError", message: "The requested model is not supported" } });
+      persistAgentExecution(native, detectErrors(agentErrorDiagnosticText(native, "aider")), root);
+      const event = JSON.parse(fs.readFileSync(path.join(root, "agent-errors.jsonl"), "utf8").trim());
+      expect(event.data).toEqual({ categories: ["model_not_supported_error"], errorCodes: [400], errorTypes: ["NativeError"], exitCode: 0 });
+    } finally {
+      if (previousEngine === undefined) delete process.env.GH_AW_ENGINE_ID;
+      else process.env.GH_AW_ENGINE_ID = previousEngine;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists live-only classifications and the recorded final exit for conclusion", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-agent-errors-"));
+    try {
+      fs.writeFileSync(path.join(root, "agent_execution_exit_code.txt"), "0\n");
+      persistAgentExecution("", { ...detectErrors(""), agenticEngineTimeout: true, missingModelPricingError: true }, root);
+      const records = fs.readFileSync(path.join(root, "agent-errors.jsonl"), "utf8").trimEnd().split("\n").map(JSON.parse);
+      expect(records).toEqual([{ type: "agent.execution", data: { categories: ["agentic_engine_timeout", "missing_model_pricing_error"], errorCodes: [], errorTypes: [], exitCode: 0 } }]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not persist detector classifications from quoted plaintext or tool output", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-agent-errors-"));
+    try {
+      const content = "Assistant: The log text says Access denied by policy settings\nTool output: CAPIError: 429 Too Many Requests\n";
+      const results = detectErrors(agentErrorDiagnosticText(content));
+      persistAgentExecution(content, results, root);
+      expect(fs.readFileSync(path.join(root, "agent-errors.jsonl"), "utf8")).toBe("");
+      expect(results.inferenceAccessError).toBe(false);
+      expect(results.capiQuotaExceededError).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   describe("INFERENCE_ACCESS_ERROR_PATTERN", () => {
     it("matches 'Access denied by policy settings'", () => {
       expect(INFERENCE_ACCESS_ERROR_PATTERN.test("Access denied by policy settings")).toBe(true);
@@ -260,9 +311,14 @@ describe("detect_agent_errors.cjs", () => {
       expect(isCAPIQuotaExceededError(message)).toBe(true);
     });
 
-    it("matches the Copilot CLI's own retry-exhaustion message for 5xx statuses (503)", () => {
-      const message = "Failed to get response from the AI model; retried 5 times (total retry wait time: 300 seconds) Last error: 503 Service Unavailable";
-      expect(isCAPIQuotaExceededError(message)).toBe(true);
+    it("does not classify retry-exhausted 502/503/504 as quota", () => {
+      for (const status of [502, 503, 504]) {
+        const message = `Failed to get response from the AI model; retried 5 times (total retry wait time: 14.90 seconds) Last error: ${status} Service Unavailable`;
+        expect(isCAPIQuotaExceededError(message)).toBe(false);
+        expect(isCAPIServerError(message)).toBe(true);
+      }
+      expect(isCAPIServerError("")).toBe(false);
+      expect(isCAPIServerError("Failed to get response from the AI model; retried 5 times. Last error: 429 Too Many Requests")).toBe(false);
     });
 
     it("does not match a 'Failed to get response' message without retry-exhaustion context", () => {

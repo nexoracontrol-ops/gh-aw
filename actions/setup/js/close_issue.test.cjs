@@ -1,6 +1,7 @@
 // @ts-check
 import { describe, it, expect, beforeEach } from "vitest";
-const { main, parseDuplicateOf } = require("./close_issue.cjs");
+const { main: createHandler, parseDuplicateOf } = require("./close_issue.cjs");
+const main = (config = {}) => createHandler({ target: "*", ...config });
 
 describe("close_issue", () => {
   let mockCore;
@@ -14,6 +15,7 @@ describe("close_issue", () => {
       warning: () => {},
       error: () => {},
       debug: () => {},
+      debugs: [],
       messages: [],
       infos: [],
       warnings: [],
@@ -32,6 +34,10 @@ describe("close_issue", () => {
     mockCore.error = msg => {
       mockCore.errors.push(msg);
       mockCore.messages.push({ level: "error", message: msg });
+    };
+    mockCore.debug = msg => {
+      mockCore.debugs.push(msg);
+      mockCore.messages.push({ level: "debug", message: msg });
     };
 
     mockGithub = {
@@ -65,6 +71,7 @@ describe("close_issue", () => {
     };
 
     mockContext = {
+      eventName: "issues",
       repo: {
         owner: "test-owner",
         repo: "test-repo",
@@ -171,6 +178,64 @@ describe("close_issue", () => {
       expect(requestCalls[0].params.rationale).toBeUndefined();
       expect(requestCalls[0].params.confidence).toBeUndefined();
       expect(requestCalls[0].params.headers).toBeUndefined();
+      expect(mockCore.debugs).toContain("Attempting issue-intent close request");
+      expect(mockCore.debugs).toContain("Issue-intent close request succeeded");
+    });
+
+    it.each([403, 422, 500])("should fail without a legacy close when the intent request returns %i", async status => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent rejected"), { status });
+      };
+      mockGithub.rest.issues.update = async () => {
+        updateCalled = true;
+        throw new Error("Legacy close must not be called");
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Intent rejected");
+      expect(updateCalled).toBe(false);
+      expect(mockCore.debugs).toContain(`Issue-intent close request failed; legacy fallback disabled (status=${status})`);
+      expect(mockCore.debugs.join(" ")).not.toContain("Intent rejected");
+    });
+
+    it.each([404, 501])("should fall back to a legacy close when the intent endpoint returns %i", async status => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent endpoint unavailable"), { status });
+      };
+      mockGithub.rest.issues.update = async params => {
+        updateCalled = true;
+        return { data: { number: params.issue_number, title: "Test Issue", html_url: "https://github.com/test-owner/test-repo/issues/456" } };
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalled).toBe(true);
+      expect(mockCore.warnings).toEqual([`Issue-intent close endpoint unavailable (status=${status}); falling back to legacy close path`]);
+    });
+
+    it("should fall back when the unavailable intent status is wrapped in the response", async () => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent endpoint unavailable"), { response: { status: 404 } });
+      };
+      mockGithub.rest.issues.update = async params => {
+        updateCalled = true;
+        return { data: { number: params.issue_number, title: "Test Issue", html_url: "https://github.com/test-owner/test-repo/issues/456" } };
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalled).toBe(true);
+      expect(mockCore.warnings).toEqual(["Issue-intent close endpoint unavailable (status=404); falling back to legacy close path"]);
     });
 
     it("should skip issue-intent metadata when explicitly disabled", async () => {
@@ -205,7 +270,7 @@ describe("close_issue", () => {
     });
 
     it("should close an issue from context when issue_number not provided", async () => {
-      const handler = await main({ max: 10 });
+      const handler = await main({ max: 10, target: "triggering" });
       const updateCalls = [];
 
       mockGithub.rest.issues.update = async params => {
@@ -239,18 +304,18 @@ describe("close_issue", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("Invalid issue number");
+      expect(result.error).toContain("Invalid item_number/issue_number");
     });
 
     it("should handle missing issue_number and no context", async () => {
       mockContext.payload = {};
 
-      const handler = await main({ max: 10 });
+      const handler = await main({ max: 10, target: "triggering" });
 
       const result = await handler({ body: "Trying to close" }, {});
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("No issue number available");
+      expect(result.error).toContain("no issue found");
     });
 
     it("should respect max count limit", async () => {
@@ -419,6 +484,22 @@ describe("close_issue", () => {
       expect(commentCalls[0].body).toContain("for #123");
       expect(commentCalls[0].body).toContain("gh-aw-agentic-workflow:");
       expect(commentCalls[0].body).not.toContain("Default comment from config");
+    });
+
+    it("should pass shell metacharacters in a comment as API data", async () => {
+      const payload = "$(touch /tmp/gh-aw-command-injection); echo safe";
+      const handler = await main({ max: 10 });
+      const commentCalls = [];
+      mockGithub.rest.issues.createComment = async params => {
+        commentCalls.push(params);
+        return { data: { id: 999, html_url: "https://github.com/test-owner/test-repo/issues/100#issuecomment-999" } };
+      };
+
+      const result = await handler({ issue_number: 100, body: payload }, {});
+
+      expect(result.success).toBe(true);
+      expect(commentCalls).toHaveLength(1);
+      expect(commentCalls[0].body).toContain(payload);
     });
 
     it("should require body field when no config comment is set", async () => {

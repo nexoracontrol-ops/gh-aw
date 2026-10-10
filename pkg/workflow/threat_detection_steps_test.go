@@ -286,7 +286,7 @@ func TestBuildUploadDetectionLogStep(t *testing.T) {
 	expectedComponents := []string{
 		"name: Upload threat detection log",
 		"if: always()",
-		"uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+		"uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
 		"name: " + constants.DetectionArtifactName.String(),
 		"            /tmp/gh-aw/threat-detection/detection.log",
 		"            /tmp/gh-aw/threat-detection/detection_usage.json",
@@ -446,6 +446,49 @@ func TestPrepareDetectionFilesStepInvokesSetupScript(t *testing.T) {
 	joined := strings.Join(steps, "")
 	if !strings.Contains(joined, `bash "${RUNNER_TEMP}/gh-aw/actions/prepare_threat_detection_files.sh"`) {
 		t.Error("Expected prepare step to invoke prepare_threat_detection_files.sh")
+	}
+}
+
+func TestBuildInstallThreatDetectStepEmbedsReviewedPins(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{},
+		},
+	}
+
+	step := strings.Join(compiler.buildInstallThreatDetectStep(data), "")
+	for _, expected := range []string{
+		"id: threat_detect_install",
+		string(constants.DefaultThreatDetectVersion),
+		constants.DefaultThreatDetectArtifactBaseURL,
+		"--sha256-amd64 " + constants.DefaultThreatDetectSHA256["threat-detect-linux-amd64"],
+		"--sha256-arm64 " + constants.DefaultThreatDetectSHA256["threat-detect-linux-arm64"],
+	} {
+		if !strings.Contains(step, expected) {
+			t.Errorf("install step does not contain %q:\n%s", expected, step)
+		}
+	}
+}
+
+func TestBuildInstallThreatDetectStepUsesArtifactMirror(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{
+				ArtifactBaseURL: "https://artifacts.example.com/threat-detect/releases/download",
+			},
+		},
+	}
+
+	step := strings.Join(compiler.buildInstallThreatDetectStep(data), "")
+	if !strings.Contains(step, "--artifact-base-url https://artifacts.example.com/threat-detect/releases/download") {
+		t.Errorf("install step does not contain configured artifact mirror:\n%s", step)
+	}
+	for _, asset := range []string{"threat-detect-linux-amd64", "threat-detect-linux-arm64"} {
+		if !strings.Contains(step, constants.DefaultThreatDetectSHA256[asset]) {
+			t.Errorf("mirror install step does not retain compiler pin for %s:\n%s", asset, step)
+		}
 	}
 }
 

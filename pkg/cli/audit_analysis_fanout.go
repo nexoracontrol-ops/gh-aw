@@ -39,9 +39,30 @@ func collectAuditAnalysisResults(ctx context.Context, run WorkflowRun, runOutput
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to load usage activity summary for run %d: %v", run.DatabaseID, usageErr)))
 	}
 	if usageSummary != nil {
-		results.workingSet = usageSummary.WorkingSet
+		applyUsageSummaryToAuditResults(usageSummary, &results)
+		results.skillActivations = mergeUsageActivitySkills(usageSummary.Skills, run, results.skillActivations)
+	}
+	results.modelRouting = analyzeModelRouting(runOutputDir)
+	// Historical runs predate precomputed friction: derive the observable subset
+	// from raw logs so audit output stays useful without rewriting history.
+	if results.friction == nil {
+		var session *usageActivitySession
+		if usageSummary != nil {
+			session = usageSummary.Session
+		}
+		results.friction = deriveFrictionFromLogs(results.mcpToolUsage, session)
 	}
 	return results, nil
+}
+
+func applyUsageSummaryToAuditResults(summary *usageActivitySummary, results *auditAnalysisResults) {
+	results.workingSet = summary.WorkingSet
+	results.ledger = summary.Ledger
+	results.friction = summary.Friction
+	applyUsageActivitySteeringSummary(summary.Steering, &results.tokenUsageSummary)
+	usageResult := &DownloadResult{RunAnalysis: RunAnalysis{MCPToolUsage: results.mcpToolUsage}}
+	applyUsageActivityMCPSummary(summary.Gateway, summary.Integrity, usageResult)
+	results.mcpToolUsage = usageResult.MCPToolUsage
 }
 
 // launchCoreAuditAnalyses exclusively writes missingTools, missingData, noops, mcpFailures, and accessAnalysis.
@@ -132,7 +153,7 @@ func launchJobDetailsAnalysis(g *errgroup.Group, gctx context.Context, results *
 	})
 }
 
-// launchFirewallAuditAnalyses exclusively writes policyAnalysis, mcpToolUsage, and tokenUsageSummary.
+// launchFirewallAuditAnalyses exclusively writes policyAnalysis, mcpToolUsage, tokenUsageSummary, and gatewaySteeringEvents.
 func launchFirewallAuditAnalyses(g *errgroup.Group, gctx context.Context, results *auditAnalysisResults, runOutputDir string, verbose bool) {
 	launchFirewallAnalysis(g, gctx, results, runOutputDir, verbose)
 	runAuditAnalysis(g, gctx, verbose, "analyzeFirewallPolicy", "Failed to analyze firewall policy", func(v *PolicyAnalysis) {
@@ -149,6 +170,11 @@ func launchFirewallAuditAnalyses(g *errgroup.Group, gctx context.Context, result
 		results.tokenUsageSummary = v
 	}, func() (*TokenUsageSummary, error) {
 		return analyzeTokenUsage(runOutputDir, verbose)
+	})
+	runAuditAnalysis(g, gctx, verbose, "extractGatewaySteeringEvents", "Failed to extract gateway steering events", func(v []GatewaySteeringEvent) {
+		results.gatewaySteeringEvents = v
+	}, func() ([]GatewaySteeringEvent, error) {
+		return extractGatewaySteeringEvents(runOutputDir)
 	})
 }
 
@@ -182,6 +208,11 @@ func launchFirewallAnalysis(g *errgroup.Group, gctx context.Context, results *au
 
 // launchSupplementalAuditAnalyses exclusively writes redactedDomainsAnalysis, rateLimitUsage, artifacts, and safeItemsCount.
 func launchSupplementalAuditAnalyses(g *errgroup.Group, gctx context.Context, results *auditAnalysisResults, runOutputDir string, verbose bool) {
+	runAuditAnalysis(g, gctx, true, "extractWorkQueueReport", "Failed to extract work queue operations", func(v *WorkQueueReport) {
+		results.workQueue = v
+	}, func() (*WorkQueueReport, error) {
+		return extractWorkQueueReport(runOutputDir)
+	})
 	runAuditAnalysis(g, gctx, verbose, "analyzeRedactedDomains", "Failed to analyze redacted domains", func(v *RedactedDomainsAnalysis) {
 		results.redactedDomainsAnalysis = v
 	}, func() (*RedactedDomainsAnalysis, error) {

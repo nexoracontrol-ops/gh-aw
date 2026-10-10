@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -70,18 +69,21 @@ Returns a JSON array where each element has the following structure:
 
 // compileArgs holds the input parameters for the compile tool.
 type compileArgs struct {
-	Workflows   []string `json:"workflows,omitempty" jsonschema:"Workflow files to compile as an array (e.g., [\"workflow.md\"]) (empty for all)"`
-	Strict      bool     `json:"strict,omitempty" jsonschema:"Override frontmatter to enforce strict mode validation for all workflows. Note: Workflows default to strict mode unless frontmatter sets strict: false"`
-	Zizmor      bool     `json:"zizmor,omitempty" jsonschema:"Run zizmor security scanner on generated .lock.yml files"`
-	Poutine     bool     `json:"poutine,omitempty" jsonschema:"Run poutine security scanner on generated .lock.yml files"`
-	Actionlint  bool     `json:"actionlint,omitempty" jsonschema:"Run actionlint linter on generated .lock.yml files"`
-	RunnerGuard bool     `json:"runner-guard,omitempty" jsonschema:"Run runner-guard taint analysis scanner on generated .lock.yml files"`
-	Syft        bool     `json:"syft,omitempty" jsonschema:"Run syft SBOM scanner on container images referenced in compiled .lock.yml files"`
-	Grype       bool     `json:"grype,omitempty" jsonschema:"Run grype vulnerability scanner on container images referenced in compiled .lock.yml files"`
-	Grant       bool     `json:"grant,omitempty" jsonschema:"Run grant license scanner on container images referenced in compiled .lock.yml files"`
-	Yamllint    bool     `json:"yamllint,omitempty" jsonschema:"Run yamllint YAML linter on generated .lock.yml files"`
-	Fix         bool     `json:"fix,omitempty" jsonschema:"Apply automatic codemod fixes to workflows before compiling"`
-	MaxTokens   int      `json:"max_tokens,omitempty" jsonschema:"Deprecated: accepted for backward compatibility but ignored."`
+	Workflows      []string `json:"workflows,omitempty" jsonschema:"Workflow files to compile as an array (e.g., [\"workflow.md\"]) (empty for all)"`
+	DryRun         bool     `json:"dry_run,omitempty" jsonschema:"Disable compiler-managed GitHub mutations, stage safe outputs, record dry_run in aw_info.json, and enable strict validation, shellcheck, and model checks; Docker-based scanners are opt-in; JSON includes a batch dry-run gate and scanner invocation coverage; model inventory refresh warnings fail the gate; custom scripts and external MCP effects remain unverified; explicitly disabling a required check is rejected; does not authorize execution, upload, or dispatch workflows"`
+	Environment    string   `json:"environment,omitempty" jsonschema:"Override the environment on every generated job; reusable-workflow caller jobs are rejected"`
+	Strict         bool     `json:"strict,omitempty" jsonschema:"Override frontmatter to enforce strict mode validation for all workflows. Note: Workflows default to strict mode unless frontmatter sets strict: false"`
+	ValidateImages bool     `json:"validate_images,omitempty" jsonschema:"Require Docker for container image validation; fail instead of skipping when Docker is unavailable"`
+	Zizmor         bool     `json:"zizmor,omitempty" jsonschema:"Run zizmor security scanner on generated .lock.yml files"`
+	Poutine        bool     `json:"poutine,omitempty" jsonschema:"Run poutine security scanner on generated .lock.yml files"`
+	Actionlint     bool     `json:"actionlint,omitempty" jsonschema:"Run actionlint linter on generated .lock.yml files"`
+	RunnerGuard    bool     `json:"runner-guard,omitempty" jsonschema:"Run runner-guard taint analysis scanner on generated .lock.yml files"`
+	Syft           bool     `json:"syft,omitempty" jsonschema:"Run syft SBOM scanner on container images referenced in compiled .lock.yml files"`
+	Grype          bool     `json:"grype,omitempty" jsonschema:"Run grype vulnerability scanner on container images referenced in compiled .lock.yml files"`
+	Grant          bool     `json:"grant,omitempty" jsonschema:"Run grant license scanner on container images referenced in compiled .lock.yml files"`
+	Yamllint       bool     `json:"yamllint,omitempty" jsonschema:"Run yamllint YAML linter on generated .lock.yml files"`
+	Fix            bool     `json:"fix,omitempty" jsonschema:"Apply automatic codemod fixes to workflows before compiling"`
+	MaxTokens      int      `json:"max_tokens,omitempty" jsonschema:"Deprecated: accepted for backward compatibility but ignored."`
 }
 
 // registerCompileTool registers the compile tool with the MCP server.
@@ -122,6 +124,7 @@ Returns JSON array with validation results for each workflow:
 - valid: Boolean indicating if compilation was successful
 - errors: Array of error objects with type, message, and optional line number
 - warnings: Array of warning objects
+- scope: "batch" for compiler/scanner diagnostics that cannot be attributed to one workflow (omitted for workflow results); development compilation fails if any result is invalid
 - compiled_file: Path to the generated .lock.yml file`,
 		InputSchema: compileSchema,
 		Icons:       mcpToolIcons("📋"),
@@ -133,6 +136,26 @@ Returns JSON array with validation results for each workflow:
 		default:
 		}
 
+		if args.DryRun {
+			var rawArgs map[string]json.RawMessage
+			if err := json.Unmarshal(req.Params.Arguments, &rawArgs); err != nil {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "invalid compile arguments", err.Error())
+			}
+			explicitFlags := make(map[string]bool)
+			for _, name := range DryRunRequiredBoolFlags() {
+				if raw, supplied := rawArgs[name]; supplied {
+					var enabled bool
+					if err := json.Unmarshal(raw, &enabled); err != nil {
+						return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "invalid boolean compile flag", name)
+					}
+					explicitFlags[name] = enabled
+				}
+			}
+			if err := ValidateDevelopmentCompileFlags(args.DryRun, explicitFlags); err != nil {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, err.Error(), nil)
+			}
+		}
+
 		// dockerUnavailableWarning is set when Docker is not accessible but the compile
 		// should still proceed without the static-analysis tools.  After the compile
 		// attempt, the warning is appended to workflow results in the JSON output so
@@ -141,7 +164,8 @@ Returns JSON array with validation results for each workflow:
 		var dockerUnavailableWarning string
 
 		// Check if any static analysis tools are requested that require Docker images
-		if args.Zizmor || args.Poutine || args.Actionlint || args.RunnerGuard || args.Syft || args.Grype || args.Grant || args.Yamllint {
+		// Development mode delegates requested checks to the CLI without downgrading them.
+		if !args.DryRun && (args.Zizmor || args.Poutine || args.Actionlint || args.RunnerGuard || args.Syft || args.Grype || args.Grant || args.Yamllint) {
 			// Check if Docker images are available; if not, start downloading and return retry message
 			if err := CheckAndPrepareDockerImages(ctx, DockerImagesOptions{
 				Zizmor:      args.Zizmor,
@@ -159,9 +183,15 @@ Returns JSON array with validation results for each workflow:
 					// compile without the Docker-based tools and surface a warning so
 					// the caller knows static analysis was skipped.
 					dockerUnavailableWarning = err.Error()
-					args.Zizmor = false
-					args.Poutine = false
-					args.Actionlint = false
+					if localScannerPath(ctx, "zizmor") == "" {
+						args.Zizmor = false
+					}
+					if localScannerPath(ctx, "poutine") == "" {
+						args.Poutine = false
+					}
+					if localScannerPath(ctx, "actionlint") == "" {
+						args.Actionlint = false
+					}
 					args.RunnerGuard = false
 					args.Syft = false
 					args.Grype = false
@@ -171,8 +201,7 @@ Returns JSON array with validation results for each workflow:
 					// Images are still downloading — ask the caller to retry.
 					// Build per-workflow validation errors instead of throwing an MCP protocol error,
 					// so callers always receive consistent JSON regardless of the failure mode.
-					results := buildCompileErrorResults(args.Workflows, err.Error())
-					jsonBytes, jsonErr := json.Marshal(results)
+					jsonBytes, jsonErr := marshalMCPCompileErrorResults(args.Workflows, err.Error())
 					if jsonErr != nil {
 						return nil, nil, newMCPError(jsonrpc.CodeInternalError, "failed to marshal docker error results", jsonErr.Error())
 					}
@@ -202,6 +231,15 @@ Returns JSON array with validation results for each workflow:
 		// Add strict flag if requested
 		if args.Strict {
 			cmdArgs = append(cmdArgs, "--strict")
+		}
+		if args.DryRun {
+			cmdArgs = append(cmdArgs, "--dry-run")
+		}
+		if args.Environment != "" {
+			cmdArgs = append(cmdArgs, "--environment", args.Environment)
+		}
+		if args.ValidateImages {
+			cmdArgs = append(cmdArgs, "--validate-images")
 		}
 
 		// Add static analysis flags if requested
@@ -245,7 +283,7 @@ Returns JSON array with validation results for each workflow:
 		// Use separate stdout/stderr capture instead of CombinedOutput because:
 		// - Stdout contains JSON output (--json flag)
 		// - Stderr contains console messages that shouldn't be mixed with JSON
-		stdout, stderr, err := runMCPExecOutputWithStderr(ctx, execCmd, cmdArgs...)
+		stdout, diagnostics, err := runMCPCompileOutput(ctx, execCmd, cmdArgs...)
 
 		// The compile command always outputs JSON to stdout when --json flag is used, even on error.
 		// We should return the JSON output to the LLM so it can see validation errors.
@@ -257,22 +295,8 @@ Returns JSON array with validation results for each workflow:
 		if err != nil {
 			mcpLog.Printf("Compile command exited with error: %v (output length: %d)", err, len(outputStr))
 			// If we have no output, this is a real execution failure
-			if outputStr == "" {
-				// Try to get stderr for error details
-				var stderrText string
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					stderrText = string(exitErr.Stderr)
-				}
-				if strings.TrimSpace(stderrText) == "" {
-					stderrText = string(stderr)
-				}
-				errMsg := strings.TrimSpace(stderrText)
-				if errMsg == "" {
-					errMsg = err.Error()
-				}
-				results := buildCompileErrorResults(args.Workflows, errMsg)
-				jsonBytes, jsonErr := json.Marshal(results)
+			if strings.TrimSpace(outputStr) == "" {
+				jsonBytes, jsonErr := marshalMCPCompileErrorResults(args.Workflows, diagnostics.failureMessage(err))
 				if jsonErr != nil {
 					return nil, nil, newMCPError(jsonrpc.CodeInternalError, "failed to marshal compile error results", jsonErr.Error())
 				}
@@ -290,7 +314,11 @@ Returns JSON array with validation results for each workflow:
 		if dockerUnavailableWarning != "" {
 			outputStr = injectDockerUnavailableWarning(outputStr, dockerUnavailableWarning)
 		}
-		outputStr = injectShellcheckDiagnostics(outputStr, string(stderr))
+		if args.DryRun {
+			outputStr = injectDevelopmentShellcheckDiagnostics(outputStr, diagnostics.shellcheck.String())
+		} else {
+			outputStr = injectShellcheckDiagnostics(outputStr, diagnostics.shellcheck.String())
+		}
 
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -506,6 +534,38 @@ func injectDockerUnavailableWarning(outputStr, warningMsg string) string {
 		Type:    "docker_unavailable",
 		Message: warningMsg,
 	})
+}
+
+func injectDevelopmentShellcheckDiagnostics(outputStr, stderrOutput string) string {
+	diagnostics := extractShellcheckDiagnostics(stderrOutput)
+	if len(diagnostics) == 0 {
+		return outputStr
+	}
+	var results []ValidationResult
+	if err := json.Unmarshal([]byte(outputStr), &results); err != nil {
+		return outputStr
+	}
+	index := -1
+	for i, result := range results {
+		if result.Scope == "batch" && result.Workflow == "shellcheck" {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		results = append(results, ValidationResult{Scope: "batch", Workflow: "shellcheck", Valid: false, Warnings: []ValidationIssue{}})
+		index = len(results) - 1
+	}
+	if index >= 0 && index < len(results) {
+		for _, diagnostic := range diagnostics {
+			results[index].Errors = append(results[index].Errors, ValidationIssue{Type: "shellcheck", Message: diagnostic})
+		}
+	}
+	output, err := formatValidationOutput(results)
+	if err != nil {
+		return outputStr
+	}
+	return output
 }
 
 func injectShellcheckDiagnostics(outputStr, stderrOutput string) string {

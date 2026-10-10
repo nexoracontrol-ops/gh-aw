@@ -23,39 +23,41 @@ import (
 // If experimentFilter is non-empty, the run is skipped when its experiment artifact does
 // not contain an assignment for that experiment name. If variantFilter is also non-empty,
 // the assigned variant must equal variantFilter.
-func AuditWorkflowRun(ctx context.Context, runID int64, opts AuditOptions) error {
+// The returned bool reports whether the run was skipped (excluded by --experiment,
+// --runtime, or --evals filtering) rather than fully analyzed and reported.
+func AuditWorkflowRun(ctx context.Context, runID int64, opts AuditOptions) (bool, error) {
 	cfg, err := newAuditRunConfig(runID, opts)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := ensureAuditNotCancelled(ctx); err != nil {
-		return err
+		return false, err
 	}
 	announceAuditRun(cfg)
 	if cfg.jobID > 0 {
-		return auditJobRun(cfg.jobOptions())
+		return false, auditJobRun(cfg.jobOptions())
 	}
-	if done, err := renderCachedAuditIfAvailable(ctx, cfg); done {
-		return err
+	if done, skipped, err := renderCachedAuditIfAvailable(ctx, cfg); done {
+		return skipped, err
 	}
 	run, err := prepareAuditWorkflowRun(ctx, cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	results, err := collectAuditAnalysisResults(ctx, run, cfg.outputDir, cfg.verbose, artifactMatchesFilter(constants.AgentArtifactName.String(), cfg.artifactFilter))
 	if err != nil {
-		return err
+		return false, err
 	}
 	run = applyAuditMetrics(run, results)
 	processedRun := buildProcessedAuditRun(run, results)
 	saveAuditRunSummary(cfg.outputDir, run, processedRun, results, cfg.verbose)
 	if shouldSkipAuditRun(cfg.runID, cfg.outputDir, cfg.experimentFilter, cfg.variantFilter, cfg.runtimeFilter) {
-		return nil
+		return true, nil
 	}
 	if shouldSkipForEvals(ctx, cfg, run) {
-		return nil
+		return true, nil
 	}
-	return renderAuditReport(ctx, processedRun, results.metrics, results.mcpToolUsage, cfg.auditOptions())
+	return false, renderAuditReport(ctx, processedRun, results.metrics, results.mcpToolUsage, cfg.auditOptions())
 }
 
 func newAuditRunConfig(runID int64, opts AuditOptions) (auditRunConfig, error) {
@@ -74,10 +76,13 @@ func newAuditRunConfig(runID int64, opts AuditOptions) (auditRunConfig, error) {
 		jobID:                  opts.JobID,
 		stepNumber:             opts.StepNumber,
 		artifactFilter:         ResolveArtifactFilter(opts.ArtifactSets),
+		includeWorkQueue:       workQueueEvidenceRequested(opts.ArtifactSets),
 		experimentFilter:       opts.ExperimentFilter,
 		variantFilter:          opts.VariantFilter,
 		runtimeFilter:          opts.RuntimeFilter,
 		evalsOnly:              opts.EvalsOnly,
+		group:                  opts.Group,
+		noBaseline:             opts.NoBaseline,
 		evalsArtifactRequested: isEvalsArtifactRequested(opts.EvalsOnly, opts.ArtifactSets),
 	}, nil
 }
@@ -158,20 +163,32 @@ func (cfg auditRunConfig) auditOptions() AuditOptions {
 		Parse:      cfg.parse,
 		JSONOutput: cfg.jsonOutput,
 		EvalsOnly:  cfg.evalsOnly,
+		Group:      cfg.group,
+		NoBaseline: cfg.noBaseline,
 	}
 }
 
-func renderCachedAuditIfAvailable(ctx context.Context, cfg auditRunConfig) (bool, error) {
+// renderCachedAuditIfAvailable attempts to render an audit report from a cached run
+// summary. It returns done=true when no further processing is needed (either because
+// the cached report was rendered or the run was skipped by filtering), along with
+// whether the run was skipped and any error encountered.
+func renderCachedAuditIfAvailable(ctx context.Context, cfg auditRunConfig) (done bool, skipped bool, err error) {
 	summary, ok := loadRunSummary(cfg.outputDir, cfg.verbose)
 	if !ok {
-		return false, nil
+		return false, false, nil
+	}
+	if cfg.includeWorkQueue && len(cfg.artifactFilter) > 0 && len(findMissingFilterEntries(cfg.artifactFilter, cfg.outputDir)) > 0 {
+		return false, false, nil
+	}
+	if workQueueLogsMissing(cfg.includeWorkQueue, cfg.outputDir) {
+		return false, false, nil
 	}
 	auditLog.Printf("Using cached run summary for run %d (processed at %s)", cfg.runID, summary.ProcessedAt.Format(time.RFC3339))
 	if cfg.verbose {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Using cached run summary for run %d (processed at %s)", cfg.runID, summary.ProcessedAt.Format(time.RFC3339))))
 	}
 	if shouldSkipAuditRun(cfg.runID, cfg.outputDir, cfg.experimentFilter, cfg.variantFilter, cfg.runtimeFilter) {
-		return true, nil
+		return true, true, nil
 	}
 	// When evals are requested but evals are not present locally (e.g., the run was
 	// cached before evals were included in the usage artifact), bypass the cache
@@ -180,13 +197,58 @@ func renderCachedAuditIfAvailable(ctx context.Context, cfg auditRunConfig) (bool
 	if cfg.evalsArtifactRequested && !runHasEvals(cfg.outputDir, cfg.verbose) &&
 		!ensureEvalsResultsFromBranch(ctx, summary.Run, cfg.outputDir, cfg.owner, cfg.repo, cfg.hostname, cfg.verbose) {
 		auditLog.Printf("Cache miss for run %d evals: evals not present locally, bypassing cache", cfg.runID)
-		return false, nil
+		return false, false, nil
+	}
+	if auditNeedsDetectionArtifact(cfg, summary) {
+		auditLog.Printf("Cache miss for run %d threat detection: detection artifact not present locally, bypassing cache", cfg.runID)
+		if err := invalidateCompleteArtifactDownloadMarker(cfg.outputDir); err != nil {
+			return false, false, err
+		}
+		return false, false, nil
 	}
 	processedRun := processedRunFromSummary(summary, cfg.outputDir)
-	return true, renderAuditReport(ctx, processedRun, summary.Metrics, summary.MCPToolUsage, cfg.auditOptions())
+	return true, false, renderAuditReport(ctx, processedRun, summary.Metrics, summary.MCPToolUsage, cfg.auditOptions())
+}
+
+func invalidateCompleteArtifactDownloadMarker(runOutputDir string) error {
+	markerPath := filepath.Join(runOutputDir, downloadedArtifactsMarkerDir, string(ArtifactSetAll))
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to invalidate complete artifact download marker: %w", err)
+	}
+	return nil
+}
+
+func auditNeedsDetectionArtifact(cfg auditRunConfig, summary *RunSummary) bool {
+	if !artifactMatchesFilter(constants.DetectionArtifactName.String(), cfg.artifactFilter) ||
+		hasThreatDetectionArtifact(cfg.outputDir) {
+		return false
+	}
+	if len(cfg.artifactFilter) == 0 {
+		if _, found := readDetectionUsageResult(cfg.outputDir); found {
+			return false
+		}
+	}
+	for _, job := range summary.JobDetails {
+		if normalizeJobName(job.Name) == string(constants.DetectionJobName) {
+			return true
+		}
+	}
+	return false
 }
 
 func processedRunFromSummary(summary *RunSummary, runOutputDir string) ProcessedRun {
+	backfillWorkQueueReport(&summary.WorkQueue, runOutputDir)
+	if summary.Ledger == nil {
+		if activity, err := loadUsageActivitySummary(runOutputDir); err == nil && activity != nil {
+			summary.Ledger = activity.Ledger
+		}
+	}
+	gatewaySteeringEvents := summary.GatewaySteeringEvents
+	if len(gatewaySteeringEvents) == 0 {
+		if events, err := extractGatewaySteeringEvents(runOutputDir); err == nil && len(events) > 0 {
+			gatewaySteeringEvents = events
+		}
+	}
 	processedRun := ProcessedRun{
 		Run:                     summary.Run,
 		AwContext:               summary.AwContext,
@@ -201,9 +263,15 @@ func processedRunFromSummary(summary *RunSummary, runOutputDir string) Processed
 		MissingData:             summary.MissingData,
 		Noops:                   summary.Noops,
 		MCPFailures:             summary.MCPFailures,
+		SkillActivations:        summary.SkillActivations,
+		GatewaySteeringEvents:   gatewaySteeringEvents,
 		TokenUsage:              summary.TokenUsage,
+		ModelRouting:            summary.ModelRouting,
 		SafeOutputs:             summary.SafeOutputs,
 		WorkingSet:              summary.WorkingSet,
+		Ledger:                  summary.Ledger,
+		WorkQueue:               summary.WorkQueue,
+		Friction:                summary.Friction,
 		GitHubRateLimitUsage:    summary.GitHubRateLimitUsage,
 		JobDetails:              summary.JobDetails,
 	}
@@ -278,7 +346,7 @@ func downloadAuditArtifactsIfNeeded(ctx context.Context, cfg auditRunConfig, run
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Run: %s (Status: %s, Conclusion: %s)", run.WorkflowName, run.Status, run.Conclusion)))
 	}
 	auditLog.Printf("Downloading artifacts for run %d", cfg.runID)
-	err := downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: cfg.runID, outputDir: cfg.outputDir, verbose: cfg.verbose, owner: cfg.owner, repo: cfg.repo, hostname: cfg.hostname, artifactFilter: cfg.artifactFilter})
+	err := downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: cfg.runID, outputDir: cfg.outputDir, verbose: cfg.verbose, owner: cfg.owner, repo: cfg.repo, hostname: cfg.hostname, artifactFilter: cfg.artifactFilter, includeWorkQueue: cfg.includeWorkQueue})
 	if err == nil || errors.Is(err, ErrNoArtifacts) {
 		downloadLegacyEvalsArtifactIfNeeded(ctx, cfg)
 		if errors.Is(err, ErrNoArtifacts) {

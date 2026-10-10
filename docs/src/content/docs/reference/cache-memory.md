@@ -29,6 +29,16 @@ tools:
     allowed-extensions: [".json", ".txt", ".md"]  # Restrict file types (default: .json, .jsonl, .txt, .md, .csv)
     validation:
       timeout-minutes: 1
+      json-schemas:
+        - file: index.json
+          schema:
+            type: object
+            required: [entries]
+            additionalProperties: false
+            properties:
+              entries:
+                type: array
+                items: { type: string }
       script: |
         const index = JSON.parse(fs.readFileSync(path.join(memoryRoot, "index.json"), "utf8"));
         if (!Array.isArray(index.entries)) throw new Error("index.json entries must be an array");
@@ -56,7 +66,13 @@ When a cache is restored for agent execution, gh-aw also strips execute bits fro
 
 ### Custom validation
 
-Use `validation.script` for domain-specific constraints such as schema checks, cross-file uniqueness, or timestamp policies. The script is a JavaScript body executed with Node.js over the complete configured cache-memory directory after agent execution and before the cache is saved. When threat detection is enabled, the validator also runs again in the `update_cache_memory` job before `actions/cache/save`.
+Use `validation.json-schemas` for required JSON/JSONL structure checks. Each declaration has an inline schema and may have a relative `file` path or glob (`*` matches within a path segment; `**` spans segments). If `file` is omitted, the schema applies to every eligible `.json` and `.jsonl` file in the memory directory, excluding `.git`; omit `format` too so the format is inferred for each file. Otherwise, paths must match the configured `allowed-extensions` policy and exist in the candidate; globs must match at least one file, and every match is validated. JSON must contain one non-empty document. JSONL validates each record independently, accepts LF/CRLF and an optional final newline, permits an existing empty file, and rejects blank physical lines or malformed records with a line number. Validation does not rewrite data. Schemas run after filtering and configured normalization, before any optional `validation.script`, and before cache save; when threat detection is enabled, they also run in the `update_cache_memory` job before `actions/cache/save`.
+
+The file format is inferred from each matched file's `.json` or `.jsonl` extension (case-insensitive), so a glob may match both formats. Optional `format: json` or `format: jsonl` overrides inference and is required for other extensions.
+
+The supported vocabulary is limited to `type` (including type lists and `null`), primitive `enum`, `required`, nested `properties`, `additionalProperties: false`, object-schema `items`, and standalone `oneOf`/`anyOf`, with a maximum nesting depth of 32 and no sibling constraints beside alternatives. Numeric enum integers must be exactly representable by JavaScript, and values checked against numeric enums must not lose precision during JSON parsing. This is not full JSON Schema: `$ref`, `const`, schema `format`, `pattern`, numeric/string/array bounds, and `uniqueItems` are rejected. Use `validation.script` for domain-specific constraints such as cross-file uniqueness, positive-ID checks, or timestamp policies.
+
+The optional JavaScript body is executed with Node.js over the complete configured cache-memory directory after agent execution and before the cache is saved. When threat detection is enabled, it also runs again in the `update_cache_memory` job before `actions/cache/save`. Schemas always run first when both mechanisms are configured.
 
 Available globals are Node.js `fs` and `path`, plus `memoryRoot`/`memoryDir`, `memoryId`, and `memoryKind` (`"cache"`). The working directory is the cache root. Environment variables available to the validator are intentionally limited to basic runner paths plus `GH_AW_MEMORY_ROOT`, `GH_AW_MEMORY_DIR`, `GH_AW_MEMORY_ID`, and `GH_AW_MEMORY_KIND`; GitHub tokens and write credentials are not passed to the validator subprocess. Network access follows the workflow runner's normal network policy. The default timeout is 1 minute and may be set with `validation.timeout-minutes` (1-5 minutes).
 
@@ -92,15 +108,15 @@ MCP servers can persist temporary state by reading and writing files under `/tmp
 
 ## Behavior
 
-GitHub Actions cache evicts unused entries after 7 days and provides a 10GB per-repository limit with LRU eviction. `retention-days` controls the retention of the uploaded artifact (1-90 days); it does not extend the cache lifetime.
+GitHub Actions cache evicts unused entries after 7 days and provides a 10GB per-repository limit with LRU eviction. `retention-days` controls only uploaded artifact retention (1-90 days); it does not extend cache lifetime. The repository-wide [artifact retention policy](/gh-aw/reference/compiler-enterprise-environment-controls/#artifact-retention) overrides this per-cache artifact setting when configured.
 
-Cache memory is branch-scoped. Runs restore from caches on the same branch and can also fall back to the default branch. On a non-default branch, the first restore often comes from the default branch; later saves then create a branch-local cache lineage.
+Cache memory is branch-scoped: runs restore from the same branch first, then can fall back to the default branch. On a non-default branch, the first restore often comes from the default branch; later saves create a branch-local cache lineage.
 
-The compiler strips `${{ github.run_id }}` from restore keys so each run can fall back to earlier runs, and for `scope: repo` it adds a broader restore key for cross-workflow sharing within the same branch scope. Custom user-supplied keys automatically append `-${{ github.run_id }}` when needed.
+The compiler strips `${{ github.run_id }}` from restore keys so each run can fall back to earlier runs. For `scope: repo`, it also adds a broader restore key for cross-workflow sharing within the same branch scope. Custom user-supplied keys automatically append `-${{ github.run_id }}` when needed.
 
 ## Best Practices
 
-Use cache-memory for short-lived, branch-local state. Prefer scheduled runs on the default branch when a workflow depends on warmed caches, and use descriptive file names, hierarchical keys such as `project-${{ github.repository_owner }}-${{ github.workflow }}`, and the narrowest practical scope. Monitor total cache growth within the 10GB repository limit.
+Use cache-memory for short-lived, branch-local state. Prefer scheduled runs on the default branch when a workflow depends on warmed caches. Use descriptive file names, hierarchical keys such as `project-${{ github.repository_owner }}-${{ github.workflow }}`, and the narrowest practical scope, then monitor total cache growth within the 10GB repository limit.
 
 ## Comparison with Repo Memory
 
@@ -123,7 +139,7 @@ The [agentic maintenance](/gh-aw/reference/ephemerals/#cache-memory-cleanup) wor
 
 If files are not persisting, check cache key consistency and the restore/save log messages. For file access issues, create subdirectories first, verify permissions, and use absolute paths. If cache growth becomes a problem, clear old entries periodically or use time-based keys for auto-expiration.
 
-When an agent calls `missing_data` with `reason: `cache_memory_miss``, the conclusion handler automatically opens a failure issue that points to a likely cache path problem. Verify that the prompt uses the correct path (`/tmp/gh-aw/cache-memory/` by default or `/tmp/gh-aw/cache-memory-{id}/` for named caches) and that the cache key stays consistent across runs.
+When an agent calls `missing_data` with `reason: "cache_memory_miss"`, the conclusion handler automatically opens a failure issue that points to a likely cache path problem. Verify that the prompt uses the correct path (`/tmp/gh-aw/cache-memory/` by default or `/tmp/gh-aw/cache-memory-{id}/` for named caches) and that the cache key stays consistent across runs.
 
 ## Integrity-Aware Caching
 
@@ -155,7 +171,4 @@ See [Grumpy Code Reviewer](https://github.com/github/gh-aw/blob/main/.github/wor
 
 ## Learn More
 
-- [Repo Memory](/gh-aw/reference/repo-memory/) - Git branch-based persistent storage with unlimited retention
-- [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration guide
-- [Safe Outputs](/gh-aw/reference/safe-outputs/) - Output processing and automation
-- [GitHub Actions Cache Documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows) - Official GitHub cache documentation
+See [Repo Memory](/gh-aw/reference/repo-memory/) for git branch-based persistent storage with unlimited retention, [Frontmatter](/gh-aw/reference/frontmatter/) for the full configuration model, and [Safe Outputs](/gh-aw/reference/safe-outputs/) for output processing and automation. For cache mechanics, refer to the [GitHub Actions cache documentation](https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows).

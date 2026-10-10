@@ -17,10 +17,6 @@
       "import": "github/gh-aw/.github/workflows/shared/deepseek-harness.md"
     },
     {
-      "id": "custom",
-      "import": "github/gh-aw/.github/workflows/shared/genaiscript.md"
-    },
-    {
       "id": "goose",
       "import": "github/gh-aw/.github/workflows/shared/goose.md"
     },
@@ -30,7 +26,7 @@
     },
     {
       "id": "pydantic-ai",
-      "import": "pydantic/pydantic-ai-harness/gh-aw/pydantic.md"
+      "import": "pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md"
     },
     {
       "id": "opencode",

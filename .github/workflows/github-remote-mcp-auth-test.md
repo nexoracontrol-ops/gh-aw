@@ -12,7 +12,7 @@ permissions:
 
 
   copilot-requests: write
-model: copilot/gpt-5.3-codex
+model: copilot/gpt-5.6-luna
 engine:
   id: codex
   model-provider: github
@@ -215,9 +215,6 @@ jobs:
           echo "Raw GitHub remote MCP handshake succeeded with $tool_count tools available."
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # GitHub Remote MCP Authentication Test

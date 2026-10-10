@@ -16,7 +16,7 @@ permissions:
 engine:
   id: codex
   model-provider: github
-model: copilot/gpt-5.3-codex
+model: copilot/gpt-5.6-terra
 strict: true
 timeout-minutes: 35
 max-turns: 60
@@ -125,7 +125,7 @@ jobs:
           fi
           cat "$BUNDLE/candidates.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload PureLock bundle
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: purelock-bundle-${{ github.run_id }}
           path: |
@@ -143,7 +143,7 @@ steps:
       # causes setup-go's tar extraction to fail on existing files.
       cache: false
   - name: Download PureLock bundle
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       name: purelock-bundle-${{ github.run_id }}
       path: /tmp/gh-aw/purelock
@@ -162,9 +162,6 @@ safe-outputs:
     max-patch-files: 8
   upload-code-coverage:
   noop:
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: candidate_selected
     question: Did the agent select one pure function from the precomputed candidate list, skipping functions already recorded in cache memory?

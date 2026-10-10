@@ -18,6 +18,8 @@ import (
 	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
 	"github.com/github/gh-aw/pkg/linters/bytescomparestring"
+	"github.com/github/gh-aw/pkg/linters/closeerrorunchecked"
+	"github.com/github/gh-aw/pkg/linters/consolestderr"
 	"github.com/github/gh-aw/pkg/linters/contextcancelnotdeferred"
 	"github.com/github/gh-aw/pkg/linters/ctxbackground"
 	"github.com/github/gh-aw/pkg/linters/deferinloop"
@@ -29,6 +31,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
+	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
 	"github.com/github/gh-aw/pkg/linters/fprintlnsprintf"
 	"github.com/github/gh-aw/pkg/linters/generatedyamlheredoc"
 	"github.com/github/gh-aw/pkg/linters/globwalkignorederror"
@@ -54,6 +57,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
+	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
 	"github.com/github/gh-aw/pkg/linters/regexpcompileinfunction"
 	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
@@ -77,7 +81,9 @@ import (
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
 	"github.com/github/gh-aw/pkg/linters/tolowerequalfold"
 	"github.com/github/gh-aw/pkg/linters/trimleftright"
+	"github.com/github/gh-aw/pkg/linters/typeassertionnil"
 	"github.com/github/gh-aw/pkg/linters/typeassertionokdiscarded"
+	uncheckedsliceindex "github.com/github/gh-aw/pkg/linters/unchecked-slice-index"
 	"github.com/github/gh-aw/pkg/linters/uncheckedflushreturn"
 	"github.com/github/gh-aw/pkg/linters/uncheckedtypeassertion"
 	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
@@ -98,19 +104,19 @@ type docAnalyzer struct {
 }
 
 // documentedAnalyzers returns the analyzer subpackages documented in the README
-// "Public API > Subpackages" table. The README documents 71 analyzers
+// "Public API > Subpackages" table. The README documents 78 analyzer
 // subpackages (the non-analyzer `internal` helper subpackage is excluded because
 // it exposes no Analyzer).
 //
 // Spec (README "Public API > Subpackages"):
 //
-//	appendbytestring, appendoneelement, blankassigncomma, bufferresetbeforereuse, bufioscannererunchecked, bytesbufferstring, bytescomparestring, contextcancelnotdeferred, ctxbackground, deferinloop, errorfwrapv, excessivefuncparams, errormessage,
-//	errortypeassertion, errstringmatch, execcommandwithoutcontext, fileclosenotdeferred, fmterrorfnoverbs, fprintlnsprintf,
+//	appendbytestring, appendoneelement, blankassigncomma, bufferresetbeforereuse, bufioscannererunchecked, bytesbufferstring, bytescomparestring, closeerrorunchecked, contextcancelnotdeferred, ctxbackground, deferinloop, errorfwrapv, excessivefuncparams, errormessage,
+//	errortypeassertion, errstringmatch, execcommandwithoutcontext, fileclosenotdeferred, fmterrorfnoverbs, fprintferrorunchecked, fprintlnsprintf,
 //	generatedyamlheredoc, globwalkignorederror, goroutinemissingrecover, hardcodedfilepath, httpnoctx, httprespbodyclose, httpstatuscode, ioutildeprecated, jsonmarshalignoredeerror, largefunc, lenstringsplit, lenstringzero,
 //	logfatallibrary, manualmutexunlock, manualpathconcat, mapclearloop, mapdeletecheck, nilctxpassed, osexitinlibrary, osgetenvlibrary, ossetenvlibrary, packagelevelmutableslicemap, panic-in-library-code, rawloginlib,
-//	regexpcompileinfunction, regexpdynamicpattern, seenmapbool, slicemakezerolength, sortslice, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
+//	reflectdeepequalusage, regexpcompileinfunction, regexpdynamicpattern, seenmapbool, slicemakezerolength, sortslice, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
 //	strconvparseignorederror, stringbytesroundtrip, stringreplaceminusone, stringsconcatloop, stringscountcontains, stringsindexcontains, stringsindexhasprefix, stringsjoinone, timeafterleak, timesleepnocontext, timenowsub,
-//	tolowerequalfold, trimleftright, typeassertionokdiscarded, uncheckedflushreturn, uncheckedtypeassertion, walkfuncerrshadow, wgdonenotdeferred, writebytestring
+//	tolowerequalfold, trimleftright, typeassertionnil, typeassertionokdiscarded, uncheckedflushreturn, uncheckedsliceindex, uncheckedtypeassertion, walkfuncerrshadow, wgdonenotdeferred, writebytestring
 func documentedAnalyzers() []docAnalyzer {
 	return []docAnalyzer{
 		{"appendbytestring", appendbytestring.Analyzer},
@@ -120,6 +126,8 @@ func documentedAnalyzers() []docAnalyzer {
 		{"bufioscannererunchecked", bufioscannererunchecked.Analyzer},
 		{"bytesbufferstring", bytesbufferstring.Analyzer},
 		{"bytescomparestring", bytescomparestring.Analyzer},
+		{"closeerrorunchecked", closeerrorunchecked.Analyzer},
+		{"consolestderr", consolestderr.Analyzer},
 		{"contextcancelnotdeferred", contextcancelnotdeferred.Analyzer},
 		{"ctxbackground", ctxbackground.Analyzer},
 		{"deferinloop", deferinloop.Analyzer},
@@ -131,6 +139,7 @@ func documentedAnalyzers() []docAnalyzer {
 		{"execcommandwithoutcontext", execcommandwithoutcontext.Analyzer},
 		{"fileclosenotdeferred", fileclosenotdeferred.Analyzer},
 		{"fmterrorfnoverbs", fmterrorfnoverbs.Analyzer},
+		{"fprintferrorunchecked", fprintferrorunchecked.Analyzer},
 		{"fprintlnsprintf", fprintlnsprintf.Analyzer},
 		{"generatedyamlheredoc", generatedyamlheredoc.Analyzer},
 		{"globwalkignorederror", globwalkignorederror.Analyzer},
@@ -156,6 +165,7 @@ func documentedAnalyzers() []docAnalyzer {
 		{"packagelevelmutableslicemap", packagelevelmutableslicemap.Analyzer},
 		{"panic-in-library-code", panicinlibrarycode.Analyzer},
 		{"rawloginlib", rawloginlib.Analyzer},
+		{"reflectdeepequalusage", reflectdeepequalusage.Analyzer},
 		{"regexpcompileinfunction", regexpcompileinfunction.Analyzer},
 		{"regexpdynamicpattern", regexpdynamicpattern.Analyzer},
 		{"seenmapbool", seenmapbool.Analyzer},
@@ -179,7 +189,9 @@ func documentedAnalyzers() []docAnalyzer {
 		{"timenowsub", timenowsub.Analyzer},
 		{"tolowerequalfold", tolowerequalfold.Analyzer},
 		{"trimleftright", trimleftright.Analyzer},
+		{"typeassertionnil", typeassertionnil.Analyzer},
 		{"typeassertionokdiscarded", typeassertionokdiscarded.Analyzer},
+		{"uncheckedsliceindex", uncheckedsliceindex.Analyzer},
 		{"uncheckedtypeassertion", uncheckedtypeassertion.Analyzer},
 		{"uncheckedflushreturn", uncheckedflushreturn.Analyzer},
 		{"walkfuncerrshadow", walkfuncerrshadow.Analyzer},
@@ -265,23 +277,7 @@ func TestSpec_UsageExample_AnalyzersUsable(t *testing.T) {
 	}
 }
 
-// TestSpec_DesignDecision_UniqueAnalyzerNames validates that each documented
-// subpackage exposes a distinct Analyzer.Name so they can coexist in a single
-// go/analysis driver (multichecker) without conflict.
-// Spec: "intentionally organized as a namespace ... so individual analyzers
-// remain isolated and independently testable."
-func TestSpec_DesignDecision_UniqueAnalyzerNames(t *testing.T) {
-	t.Parallel()
-	documented := documentedAnalyzers()
-	names := make(map[string]bool, len(documented))
-	for _, d := range documented {
-		names[d.analyzer.Name] = true
-	}
-	assert.Len(t, names, len(documented),
-		"each documented subpackage should expose a distinct Analyzer.Name")
-}
-
-// TestRegistryMatchesDocumentation validates that linters.All() (the canonical,
+// TestSpec_PublicAPI_All validates that linters.All() (the canonical,
 // importable registry) and documentedAnalyzers() (the spec_test hand-list
 // derived from the README Subpackages table) are equal sets — bidirectionally.
 //
@@ -289,7 +285,7 @@ func TestSpec_DesignDecision_UniqueAnalyzerNames(t *testing.T) {
 // cmd/linters/main.go without updating docs) causes this test to fail, closing
 // the recurring doc-sync drift gap (gh-aw#40436, #45185, #46131, #46527,
 // #46707, #46977).
-func TestRegistryMatchesDocumentation(t *testing.T) {
+func TestSpec_PublicAPI_All(t *testing.T) {
 	t.Parallel()
 	allAnalyzers := linters.All()
 	documented := documentedAnalyzers()

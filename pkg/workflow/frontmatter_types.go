@@ -23,7 +23,7 @@ type RunnerConfig struct {
 
 // RuntimeConfig represents the configuration for a single runtime
 type RuntimeConfig struct {
-	Version           string `json:"version,omitempty"`             // Version of the runtime (e.g., "20" for Node, "3.11" for Python)
+	Version           string `json:"version,omitempty"`             // Version of the runtime (e.g., "24" for Node, "3.11" for Python)
 	If                string `json:"if,omitempty"`                  // Optional GitHub Actions if condition (e.g., "hashFiles('go.mod') != ''")
 	ActionRepo        string `json:"action-repo,omitempty"`         // Override the GitHub Actions repository (e.g., "actions/setup-node")
 	ActionVersion     string `json:"action-version,omitempty"`      // Override the action version (e.g., "v4")
@@ -365,6 +365,7 @@ type FrontmatterConfig struct {
 	MaxTurnCacheMisses          *int32                       `json:"max-turn-cache-misses,omitempty"`
 	MaxDailyAICredits           *TemplatableInt32            `json:"max-daily-ai-credits,omitempty"`
 	MaxToolDenials              *TemplatableInt32            `json:"max-tool-denials,omitempty"`
+	MaxToolCalls                *TemplatableInt32            `json:"max-tool-calls,omitempty"`
 	Strict                      *bool                        `json:"strict,omitempty"`  // Pointer to distinguish unset from false
 	Private                     *bool                        `json:"private,omitempty"` // If true, workflow cannot be added to other repositories
 	Labels                      []string                     `json:"labels,omitempty"`

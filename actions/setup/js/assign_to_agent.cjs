@@ -3,7 +3,7 @@
 
 const { AGENT_LOGIN_NAMES, getAgentLogins, getAvailableAgentLogins, findAgent, getIssueDetails, getPullRequestDetails, assignAgentToIssue, generatePermissionErrorSummary, resolveReasoningEffort } = require("./assign_agent_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
+const { resolveTarget, isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { generateStagedPreview } = require("./staged_preview.cjs");
 const { isTemporaryId, normalizeTemporaryId, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 const { sleep } = require("./error_recovery.cjs");
@@ -11,6 +11,7 @@ const { parseAllowedRepos, validateRepo, resolveTargetRepoConfig, resolveAndVali
 const { resolvePullRequestRepo } = require("./pr_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
+const { getPromptPath, renderTemplateFromFile } = require("./messages_core.cjs");
 
 /**
  * Create a dedicated GitHub client for assign-to-agent operations.
@@ -32,6 +33,24 @@ async function createAssignToAgentGitHubClient(config) {
   }
   core.info("Using dedicated github client for assign-to-agent operations");
   return global.getOctokit(token);
+}
+
+/**
+ * Add credential guidance only after an assignment attempt fails.
+ * @param {Object} config
+ * @param {string} errorMessage
+ * @returns {string}
+ */
+function describeAssignmentCredentialFailure(config, errorMessage) {
+  const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
+  const source = config["github-token"]
+    ? "the configured assign-to-agent credential"
+    : process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN
+      ? "GH_AW_ASSIGN_TO_AGENT_TOKEN (GH_AW_AGENT_TOKEN, GH_AW_GITHUB_TOKEN, or GITHUB_TOKEN)"
+      : "the step-level GitHub token";
+  const remedy = renderTemplateFromFile(getPromptPath("copilot_assignment_credential_remedy.md"), {}).trim();
+  const installationToken = typeof token === "string" && token.startsWith("ghs_") ? " The selected credential is a GitHub App installation token." : "";
+  return `${errorMessage}. Agent assignment credential source: ${source}.${installationToken} ${remedy}`;
 }
 
 /**
@@ -168,6 +187,7 @@ async function main(config = {}) {
           .map(a => a.trim())
           .filter(Boolean)
     : null;
+  const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const allowedPullRequestRepos = parseAllowedRepos(config["allowed-pull-request-repos"]);
 
@@ -184,6 +204,7 @@ async function main(config = {}) {
   core.info(`Target configuration: ${targetConfig}`);
   core.info(`Max count: ${maxCount}`);
   core.info(`Issue intent enabled: ${issueIntentEnabled}`);
+  if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
   if (ignoreIfError) core.info("Ignore-if-error mode enabled: Will not fail if agent assignment encounters auth or availability errors");
   if (allowedAgents) core.info(`Allowed agents: ${allowedAgents.join(", ")}`);
   core.info(`Default target repo: ${defaultTargetRepo}`);
@@ -269,7 +290,8 @@ async function main(config = {}) {
     const customInstructions = defaultCustomInstructions || null;
 
     // Validate that both issue_number and pull_number are not specified simultaneously
-    if (message.issue_number != null && message.pull_number != null) {
+    // (only relevant when the model-provided identifiers are actually used, i.e. target: "*")
+    if (targetConfig === "*" && message.issue_number != null && message.pull_number != null) {
       const error = "Cannot specify both issue_number and pull_number in the same assign_to_agent item";
       core.error(error);
       allResults.push({ issue_number: message.issue_number, pull_number: message.pull_number, agent: agentName, owner: null, repo: null, success: false, error });
@@ -278,7 +300,7 @@ async function main(config = {}) {
 
     // Defer if issue_number is a temporary ID that hasn't been resolved yet
     // Strip leading '#' so both 'aw_abc1' and '#aw_abc1' (canonical validator form) are handled
-    if (message.issue_number != null) {
+    if (targetConfig === "*" && message.issue_number != null) {
       const issueNumStr = String(message.issue_number).trim();
       if (isTemporaryId(issueNumStr)) {
         const normalized = normalizeTemporaryId(issueNumStr);
@@ -301,7 +323,7 @@ async function main(config = {}) {
     let itemForTarget = message;
 
     // Resolve temporary ID in issue_number to real issue number
-    if (message.issue_number != null) {
+    if (targetConfig === "*" && message.issue_number != null) {
       const resolvedTarget = resolveRepoIssueTarget(message.issue_number, temporaryIdMap, effectiveOwner, effectiveRepo);
       if (!resolvedTarget.resolved) {
         const error = resolvedTarget.errorMessage || `Failed to resolve issue target: ${message.issue_number}`;
@@ -316,10 +338,6 @@ async function main(config = {}) {
         core.info(`Resolved temporary issue id to ${effectiveOwner}/${effectiveRepo}#${resolvedTarget.resolved.number}`);
       }
     }
-
-    // Determine effective target configuration
-    const hasExplicitTarget = itemForTarget.issue_number != null || itemForTarget.pull_number != null;
-    const effectiveTarget = hasExplicitTarget ? "*" : targetConfig;
 
     const basePullRequestRepoSlug = pullRequestOwner && pullRequestRepo ? `${pullRequestOwner}/${pullRequestRepo}` : `${effectiveOwner}/${effectiveRepo}`;
 
@@ -364,7 +382,7 @@ async function main(config = {}) {
 
     // Resolve the target issue or pull request number from context
     const targetResult = resolveTarget({
-      targetConfig: effectiveTarget,
+      targetConfig,
       item: itemForTarget,
       context,
       itemType: "assign_to_agent",
@@ -479,6 +497,9 @@ async function main(config = {}) {
         return { success: true };
       }
 
+      const finalFilterResult = await checkRequiredFilter(githubClient, { owner: effectiveOwner, repo: effectiveRepo }, number, requiredLabels, "", "assign_to_agent");
+      if (finalFilterResult) return finalFilterResult;
+
       core.info(`Assigning ${agentName} coding agent to ${type} #${number}...`);
       if (model) core.info(`Using model: ${model}`);
       if (customAgent) core.info(`Using custom agent: ${customAgent}`);
@@ -509,10 +530,11 @@ async function main(config = {}) {
       return { success: true };
     } catch (error) {
       let errorMessage = getErrorMessage(error);
+      const isPullRequestError = error && typeof error === "object" && error.isPullRequest;
 
       // When the agent specified an issue_number that turns out to be a PR, skip
       // silently without posting a comment — error comments on PRs are confusing.
-      if (/** @type {any} */ error.isPullRequest) {
+      if (isPullRequestError) {
         core.warning(`Skipping assign_to_agent for #${number}: target is a pull request, not an issue.`);
         allResults.push({
           issue_number: issueNumber,
@@ -528,8 +550,13 @@ async function main(config = {}) {
         return { success: false, skipped: true, error: errorMessage };
       }
 
-      const isAuthError = ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
+      const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+      const isAuthError = status === 401 || ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
       const isAvailabilityError = errorMessage.includes("coding agent is not available for this repository");
+      if (isAuthError || errorMessage === `Failed to assign ${agentName} via REST`) {
+        if (status === 401 && !errorMessage.includes("Bad credentials")) errorMessage = `Bad credentials (HTTP 401): ${errorMessage}`;
+        errorMessage = describeAssignmentCredentialFailure(config, errorMessage);
+      }
 
       if (ignoreIfError && (isAuthError || isAvailabilityError)) {
         const errorType = isAuthError ? "authentication/permission" : "agent availability";

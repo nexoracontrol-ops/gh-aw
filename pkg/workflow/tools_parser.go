@@ -79,9 +79,9 @@ func parseCommaSeparatedOrNewlineList(s string) []string {
 
 // toAnySlice converts a []string to []any for storage in a map[string]any.
 func toAnySlice(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
+	out := make([]any, 0, len(ss))
+	for _, s := range ss {
+		out = append(out, s)
 	}
 	return out
 }
@@ -101,6 +101,8 @@ var knownTools = map[string]struct{}{
 	"drive-memory":      {},
 	"comment-memory":    {},
 	"repo-memory":       {},
+	"ledger":            {},
+	"work-queue":        {},
 	"safety-prompt":     {},
 	"timeout":           {},
 	"startup-timeout":   {},
@@ -161,6 +163,14 @@ func NewTools(toolsMap map[string]any) *Tools { //nolint:largefunc // Existing t
 	}
 	if val, exists := toolsMap["repo-memory"]; exists {
 		tools.RepoMemory = parseRepoMemoryTool(val)
+	}
+	if val, exists := toolsMap["ledger"]; exists {
+		ledger, err := parseLedgerToolConfig(val)
+		if err != nil {
+			tools.ledgerParseErr = err
+		} else {
+			tools.Ledger = ledger
+		}
 	}
 	if val, exists := toolsMap["timeout"]; exists {
 		tools.Timeout = parseTimeoutTool(val)

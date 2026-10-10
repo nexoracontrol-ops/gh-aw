@@ -18,11 +18,22 @@ func (c *Compiler) SetContext(ctx context.Context) {
 	c.ctx = ctx
 }
 
+// SetModelPricingResolver configures pricing lookup for models absent from workflow frontmatter.
+func (c *Compiler) SetModelPricingResolver(resolver func(ctx context.Context, provider, model string) (map[string]float64, bool)) {
+	c.modelPricingResolver = resolver
+}
+
 // SetRequireDocker configures whether Docker must be available for container image validation.
 // When true, validation fails with an error if Docker is not installed or the daemon is not running.
 // When false (default), validation is silently skipped when Docker is unavailable.
 func (c *Compiler) SetRequireDocker(require bool) {
 	c.requireDocker = require
+}
+
+// SetRequireSelfHostedRunners configures whether every generated job must select
+// a self-hosted runner.
+func (c *Compiler) SetRequireSelfHostedRunners(require bool) {
+	c.requireSelfHosted = require
 }
 
 // SetQuiet configures whether to suppress success messages (for interactive mode)
@@ -74,6 +85,17 @@ func (c *Compiler) SetApprove(approve bool) {
 // SetForceStaged configures whether safe-outputs should always compile in staged mode.
 func (c *Compiler) SetForceStaged(force bool) {
 	c.forceStaged = force
+}
+
+// SetDryRun stages safe outputs and disables compiler-managed GitHub mutations.
+func (c *Compiler) SetDryRun(enabled bool) {
+	c.dryRun = enabled
+}
+
+// SetEnvironmentOverride replaces the environment on every generated job.
+// An empty name disables the override.
+func (c *Compiler) SetEnvironmentOverride(name string) {
+	c.environmentOverride = name
 }
 
 // SetFileTracker sets the file tracker for tracking created files
@@ -179,6 +201,17 @@ func (c *Compiler) IncrementWarningCount() {
 	c.warningCount++
 }
 
+// IncrementExperimentalWarningCount records a feature notice without changing its visibility.
+func (c *Compiler) IncrementExperimentalWarningCount() {
+	c.warningCount++
+	c.experimentalWarnings++
+}
+
+// GetExperimentalWarningCount returns only built-in experimental-feature notices.
+func (c *Compiler) GetExperimentalWarningCount() int {
+	return c.experimentalWarnings
+}
+
 // SetConfiguredModelValidator configures optional validation against an external active model inventory.
 func (c *Compiler) SetConfiguredModelValidator(validator func(data *WorkflowData) []string) {
 	c.configuredModelValidator = validator
@@ -192,6 +225,7 @@ func (c *Compiler) GetWarningCount() int {
 // ResetWarningCount resets the warning counter to zero
 func (c *Compiler) ResetWarningCount() {
 	c.warningCount = 0
+	c.experimentalWarnings = 0
 }
 
 // SetWorkflowIdentifier sets the identifier for the current workflow being compiled

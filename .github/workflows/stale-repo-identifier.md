@@ -23,7 +23,7 @@ concurrency:
   job-discriminator: ${{ inputs.organization || github.run_id }}
 
 engine: pi
-model: copilot/auto
+model: copilot/gpt-5.6-luna
 strict: true
 timeout-minutes: 45
 
@@ -90,7 +90,7 @@ env:
 steps:
   - name: Run stale-repos
     id: stale-repos
-    uses: github/stale-repos@v9.0.18
+    uses: github/stale-repos@v9.0.19
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ORGANIZATION: ${{ env.ORGANIZATION }}

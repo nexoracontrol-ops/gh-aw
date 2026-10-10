@@ -12,8 +12,8 @@ max-daily-ai-credits: 10000
 timeout-minutes: 10
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.3-codex
+  model-provider: github
+model: copilot/gpt-6.1-sol
 strict: false
 permissions:
   pull-requests: read
@@ -47,9 +47,6 @@ jobs:
 imports:
   - shared/otlp.md
   - shared/graders.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
 evals:

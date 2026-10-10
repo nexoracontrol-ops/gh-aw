@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 const (
@@ -79,17 +80,17 @@ func injectComponentExecutionStarted(step GitHubActionStep, component, filePath 
 	}
 
 	insertIndex := -1
-	for i := runIndex + 1; i < len(step); i++ {
-		if strings.HasPrefix(strings.TrimSpace(step[i]), "GH_AW_AWF_ENGINE_NAME=") {
-			insertIndex = i
+	for offset, line := range step[runIndex+1:] {
+		if strings.HasPrefix(strings.TrimSpace(line), "GH_AW_AWF_ENGINE_NAME=") {
+			insertIndex = runIndex + 1 + offset
 			break
 		}
 	}
 	if insertIndex < 0 {
 		insertIndex = runIndex + 1
-		for insertIndex < len(step) {
-			trimmed := strings.TrimSpace(step[insertIndex])
-			if trimmed == "set -o pipefail" || strings.HasPrefix(trimmed, "trap 'gh_aw_exit_code=") {
+		for _, line := range step[insertIndex:] {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "set -o pipefail" || trimmed == "gh_aw_exit_code=0" || strings.HasPrefix(trimmed, "trap 'gh_aw_exit_code=") {
 				insertIndex++
 				continue
 			}
@@ -98,7 +99,7 @@ func injectComponentExecutionStarted(step GitHubActionStep, component, filePath 
 	}
 
 	startedLines := componentExecutionEvidenceShellLines(component, "started", filePath)
-	injected := make(GitHubActionStep, 0, len(step)+len(startedLines))
+	injected := make(GitHubActionStep, 0, typeutil.SafeAllocationCapacity(len(step), len(startedLines)))
 	injected = append(injected, step[:insertIndex]...)
 	for _, line := range startedLines {
 		injected = append(injected, "          "+line)
@@ -169,9 +170,9 @@ func (c *Compiler) generateLogParsing(yaml *strings.Builder, data *WorkflowData,
 
 	yaml.WriteString("      - name: Parse agent logs for step summary\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        env:\n")
-	fmt.Fprintf(yaml, "          GH_AW_AGENT_OUTPUT: %s\n", logFileForParsing)
+	fmt.Fprintf(yaml, "          GH_AW_AGENT_OUTPUT: %s\n", logFileForParsing) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	// GH_AW_SAFE_OUTPUTS lets the log parser detect safe-output entries written by the agent
 	// so it can downgrade a "no structured log entries" failure to a warning when the agent
 	// demonstrably completed (e.g. emitted a noop). Without this, runs where the container
@@ -197,7 +198,7 @@ func (c *Compiler) generateMCPScriptsLogParsing(yaml *strings.Builder, data *Wor
 
 	yaml.WriteString("      - name: Parse MCP Scripts logs for step summary\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 
@@ -215,8 +216,8 @@ func (c *Compiler) generateMCPGatewayLogParsing(yaml *strings.Builder, data *Wor
 
 	yaml.WriteString("      - name: Parse MCP Gateway logs for step summary\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        id: %s\n", constants.ParseMCPGatewayStepID)
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        id: %s\n", constants.ParseMCPGatewayStepID)                     //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 
@@ -240,7 +241,7 @@ func (c *Compiler) generateObservabilitySummary(yaml *strings.Builder, data *Wor
 
 	yaml.WriteString("      - name: Generate observability summary\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -254,7 +255,7 @@ func (c *Compiler) generateObservabilitySummary(yaml *strings.Builder, data *Wor
 // OTEL_EXPORTER_OTLP_ENDPOINT env var into workflowData.Env, which is the authoritative
 // result of OTLP detection after all frontmatter (main + imports) has been processed.
 func isOTLPEnabled(data *WorkflowData) bool {
-	if data == nil {
+	if data == nil || data.DryRun {
 		return false
 	}
 	return strings.Contains(data.Env, "OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -289,14 +290,15 @@ func (c *Compiler) generateStopMCPGateway(yaml *strings.Builder, data *WorkflowD
 // This prevents downstream safe_outputs and conclusion jobs from receiving an ENOENT error
 // when loading the agent output file, making it easier to surface the real engine failure
 // reason (e.g. quota exceeded) instead of an unhelpful file-not-found message.
-func (c *Compiler) generateAgentOutputPlaceholderStep(yaml *strings.Builder) {
+func (c *Compiler) generateAgentOutputPlaceholderStep(yaml *strings.Builder, data *WorkflowData) {
 	compilerYamlLog.Print("Generating agent output placeholder step")
 
+	outputPath := constants.TmpGhAwDir + "/agent_output.json"
 	yaml.WriteString("      - name: Write agent output placeholder if missing\n")
 	yaml.WriteString("        if: always()\n")
 	yaml.WriteString("        run: |\n")
-	yaml.WriteString("          if [ ! -f /tmp/gh-aw/agent_output.json ]; then\n")
-	yaml.WriteString("            echo '{\"items\":[]}' > /tmp/gh-aw/agent_output.json\n")
+	yaml.WriteString("          if [ ! -f " + outputPath + " ]; then\n")
+	yaml.WriteString("            echo '{\"items\":[]}' > " + outputPath + "\n")
 	yaml.WriteString("          fi\n")
 }
 
@@ -304,26 +306,42 @@ func (c *Compiler) generateAgentOutputPlaceholderStep(yaml *strings.Builder) {
 // file to the real $GITHUB_STEP_SUMMARY. This runs after secret redaction so the content
 // is already sanitised before being published to the workflow step summary.
 // The step is a no-op when the file is empty (agent wrote nothing).
-func (c *Compiler) generateAgentStepSummaryAppend(yaml *strings.Builder) {
+func (c *Compiler) generateAgentStepSummaryAppend(yaml *strings.Builder, data *WorkflowData) {
 	compilerYamlLog.Print("Generating agent step summary append step")
 
 	yaml.WriteString("      - name: Append agent step summary\n")
 	yaml.WriteString("        if: always()\n")
+	if isArcDindTopology(data) {
+		yaml.WriteString("        env:\n")
+		yaml.WriteString("          GH_AW_TMP_DIR: ${{ runner.temp }}/gh-aw\n")
+	}
 	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/append_agent_step_summary.sh\"\n")
 }
 
 // generateTokenUsageSummary generates a step that parses the firewall proxy's
 // token-usage.jsonl and appends a markdown table to $GITHUB_STEP_SUMMARY.
-// The step also writes aggregated token totals to /tmp/gh-aw/agent_usage.json
+// The step also writes aggregated token totals to gh-aw/agent_usage.json
 // so they are bundled in the agent artifact for third-party tools.
 func (c *Compiler) generateTokenUsageSummary(yaml *strings.Builder, data *WorkflowData) {
 	compilerYamlLog.Print("Generating token usage summary step")
 
 	yaml.WriteString("      - name: Parse token usage for step summary\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        id: %s\n", constants.ParseTokenUsageStepID)
+	fmt.Fprintf(yaml, "        id: %s\n", constants.ParseTokenUsageStepID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        continue-on-error: true\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	if isArcDindTopology(data) || isModelRoutingEnabled(data) {
+		yaml.WriteString("        env:\n")
+	}
+	if isArcDindTopology(data) {
+		yaml.WriteString("          GH_AW_TMP_DIR: ${{ runner.temp }}/gh-aw\n")
+	}
+	if isModelRoutingEnabled(data) {
+		yaml.WriteString("          GH_AW_MODEL_ROUTING_ENABLED: \"true\"\n")
+		if data.EngineConfig != nil {
+			fmt.Fprintf(yaml, "          GH_AW_ENGINE_ID: %q\n", data.EngineConfig.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		}
+	}
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -337,7 +355,7 @@ func (c *Compiler) generateTokenUsageSummary(yaml *strings.Builder, data *Workfl
 //
 // The /reflect endpoint (served by the AWF api-proxy sidecar on port 10000) returns the
 // list of configured LLM providers together with their available model lists. The harness
-// fetches this data from inside the AWF container and writes it to /tmp/gh-aw/awf-reflect.json
+// fetches this data from inside the AWF container and writes it to /tmp/gh-aw/agent/awf-reflect.json
 // so this step can include it in the summary after the agent has completed.
 func (c *Compiler) generateAWFReflectSummary(yaml *strings.Builder, data *WorkflowData) {
 	compilerYamlLog.Print("Generating AWF reflect summary step")
@@ -345,7 +363,7 @@ func (c *Compiler) generateAWFReflectSummary(yaml *strings.Builder, data *Workfl
 	yaml.WriteString("      - name: Print AWF reflect summary\n")
 	yaml.WriteString("        if: always()\n")
 	yaml.WriteString("        continue-on-error: true\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -369,27 +387,27 @@ func (c *Compiler) generateDetectAgentErrorsStep(yaml *strings.Builder, data *Wo
 
 	yaml.WriteString("      - name: Detect agent errors\n")
 	yaml.WriteString("        if: always()\n")
-	fmt.Fprintf(yaml, "        id: %s\n", constants.DetectAgentErrorsStepID)
+	fmt.Fprintf(yaml, "        id: %s\n", constants.DetectAgentErrorsStepID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        continue-on-error: true\n")
 	// The engine step outcome and its timeout-minutes budget allow the detection script to
 	// recognize a GitHub Actions step-level timeout ("The action '...' has timed out after N
 	// minutes."), which kills the engine without leaving a timeout signature in the agent log.
 	yaml.WriteString("        env:\n")
 	yaml.WriteString("          GH_AW_AGENTIC_EXECUTION_OUTCOME: ${{ steps.agentic_execution.outcome }}\n")
-	fmt.Fprintf(yaml, "          GH_AW_ENGINE_STEP_TIMEOUT_MINUTES: %s\n", resolveStepTimeoutValue(data))
+	fmt.Fprintf(yaml, "          GH_AW_ENGINE_STEP_TIMEOUT_MINUTES: %s\n", resolveStepTimeoutValue(data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	// Engines that write their own internal tracing/diagnostic logs to files (rather than
 	// stdout/stderr) can surface a directory here; the detection script tails the most recently
 	// modified log file under it into the step log when the execution step failed, so a bare
 	// non-zero exit with no console output still has diagnosable content.
 	if internalLogsDir := engine.GetInternalLogsDir(); internalLogsDir != "" {
-		fmt.Fprintf(yaml, "          GH_AW_ENGINE_INTERNAL_LOGS_DIR: %s\n", internalLogsDir)
+		fmt.Fprintf(yaml, "          GH_AW_ENGINE_INTERNAL_LOGS_DIR: %s\n", internalLogsDir) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
 	yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-	fmt.Fprintf(yaml, "            const { main } = require('%s/%s.cjs');\n", SetupActionDestination, scriptId)
+	fmt.Fprintf(yaml, "            const { main } = require('%s/%s.cjs');\n", SetupActionDestination, scriptId) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString("            await main();\n")
 }
 
@@ -458,6 +476,18 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 		}
 
 		pluginInstallSteps := pluginInstaller.GetPluginInstallationSteps(data)
+		for i, ref := range data.PluginReferences {
+			if ref.GitHubApp == nil {
+				continue
+			}
+			stepID := pluginAppTokenStepID(i)
+			for _, step := range pluginInstallSteps {
+				if strings.Contains(strings.Join(step, "\n"), "id: "+stepID+"\n") {
+					c.recordGeneratedWildcardAppTokenStep("agent", ref.GitHubApp, stepID)
+					break
+				}
+			}
+		}
 		compilerYamlLog.Printf("Adding %d plugin installation steps for %s", len(pluginInstallSteps), engine.GetID())
 		for _, step := range pluginInstallSteps {
 			for _, line := range step {
@@ -489,7 +519,9 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	}
 
 	// Add GitHub MCP lockdown detection step if needed
-	c.generateGitHubMCPLockdownDetectionStep(yaml, data)
+	if err := c.generateGitHubMCPLockdownDetectionStep(yaml, data); err != nil {
+		return nil, err
+	}
 
 	// Add step to parse blocked-users and approval-labels guard variables into JSON arrays
 	c.generateParseGuardVarsStep(yaml, data)
@@ -504,16 +536,19 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// Restore agent config folders from the base branch snapshot in the activation artifact.
 	// The activation job saved these before the PR checkout ran, so this step overwrites any
 	// PR-branch-injected files (e.g. forked skill/instruction files) with trusted base content.
-	// The .github/mcp.json file is also removed since it may come from the PR branch.
+	// The .mcp.json file is also removed since it may come from the PR branch.
 	// The folder and file lists match those used in the save step (derived from engine registry).
 	//
 	// IMPORTANT: This must run BEFORE pre-agent-steps (below) so that APM-restored skills
 	// placed in .github/skills/ by pre-agent-steps are not clobbered by this restore.
-	if ShouldGeneratePRCheckoutStep(data) {
+	hasPRCheckout := ShouldGeneratePRCheckoutStep(data)
+	restoreFromActivation := dynamicWorkflowsEnabled(engine, data.EngineConfig) && canRestoreAgentConfigFolders(data)
+	if hasPRCheckout || restoreFromActivation {
 		folders, files := resolveAgentManifestPaths(c.engineRegistry, data)
 		generateRestoreBaseGitHubFoldersStep(yaml,
 			folders,
 			files,
+			hasPRCheckout,
 		)
 		generateRestoreAmbientFoldersStep(yaml, data)
 	}
@@ -537,9 +572,25 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// dependencies that the gateway may reference when it starts.
 	c.generatePreAgentSteps(yaml, data)
 
+	for _, step := range generateNVXRuntimeSetupSteps(data) {
+		for _, line := range step {
+			yaml.WriteString(line)
+			yaml.WriteByte('\n')
+		}
+	}
+
 	// Add MCP setup
 	if err := c.generateMCPSetup(yaml, data.Tools, engine, data); err != nil {
 		return nil, fmt.Errorf("MCP setup could not be generated, expected valid tool configuration in the 'tools' section: %w", err)
+	}
+
+	if installer, ok := engine.(PostConfigPluginInstallationProvider); ok {
+		for _, step := range installer.GetPostConfigPluginInstallationSteps(data) {
+			for _, line := range step {
+				yaml.WriteString(line)
+				yaml.WriteByte('\n')
+			}
+		}
 	}
 
 	// Mount MCP servers as CLI tools (runs after gateway is started)
@@ -589,25 +640,23 @@ func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowDa
 		}
 	}
 
-	// Start CLI proxy on the host before AWF execution. When features.cli-proxy is enabled,
+	generateModelRoutingConversationStep(yaml, data)
+
+	// Start CLI proxy on the host before AWF execution. When tools.github.mode is gh-proxy,
 	// the compiler starts a difc-proxy container on the host that AWF's cli-proxy sidecar
 	// connects to via host.docker.internal:18443.
 	c.generateStartCliProxyStep(yaml, data)
 
-	// Refresh sbx credentials immediately before AWF execution. Docker Hub OAuth
-	// tokens obtained during the daemon-setup step can expire between workflow steps,
-	// causing "user is not authenticated to Docker" errors when AWF calls `sbx create`.
-	if isDockerSbxRuntime(data) {
-		refreshStep := generateDockerSbxCredentialRefreshStep()
-		for _, line := range refreshStep {
-			yaml.WriteString(line)
-			yaml.WriteString("\n")
-		}
-	}
-
 	// Add AI execution step using the agentic engine
 	compilerYamlLog.Printf("Generating engine execution steps for %s", engine.GetID())
 	c.generateEngineExecutionSteps(yaml, data, engine, logFileFull)
+
+	if step := generateNVXRuntimeCleanupStep(data); step != nil {
+		for _, line := range step {
+			yaml.WriteString(line)
+			yaml.WriteByte('\n')
+		}
+	}
 
 	// Stop CLI proxy after AWF execution (always runs to ensure cleanup)
 	c.generateStopCliProxyStep(yaml, data)
@@ -657,18 +706,34 @@ func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowDa
 	// The MCP gateway is always enabled, even when agent sandbox is disabled
 	c.generateStopMCPGateway(yaml, data)
 
+	if isWorkQueueEnabled(data) {
+		yaml.WriteString("      - name: Collect work queue intents\n")
+		yaml.WriteString("        if: always()\n")
+		fmt.Fprintf(yaml, "        uses: %s\n", c.getActionPin("actions/github-script")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		yaml.WriteString("        with:\n")
+		yaml.WriteString("          script: |\n")
+		yaml.WriteString("            const { main } = require('${{ runner.temp }}/gh-aw/actions/collect_work_queue_intents.cjs');\n")
+		yaml.WriteString("            main({ core });\n")
+	}
+
 	// Add secret redaction step BEFORE any artifact uploads
 	// This ensures all artifacts are scanned for secrets before being uploaded
-	c.generateSecretRedactionStep(yaml, yaml.String(), data)
+	if hasSafeJobArtifactPaths(data) || isWorkQueueEnabled(data) {
+		c.generateTrackedSecretRedactionStep(yaml, yaml.String(), data)
+	} else {
+		c.generateSecretRedactionStep(yaml, yaml.String(), data)
+	}
 
 	// Append the agent step summary to the real $GITHUB_STEP_SUMMARY after secrets are redacted.
 	// The agent writes its GITHUB_STEP_SUMMARY content to AgentStepSummaryPath (a file inside
 	// /tmp/gh-aw/ that is reachable in both AWF sandbox and non-sandbox modes).
 	// secret redaction already scanned this file, so it is safe to append.
-	c.generateAgentStepSummaryAppend(yaml)
+	c.generateAgentStepSummaryAppend(yaml, data)
 
 	// Add output collection step only if safe-outputs feature is used (GH_AW_SAFE_OUTPUTS functionality)
 	if data.SafeOutputs != nil {
+		// Merge redacted ledger audit entries before the safe-output file is copied and ingested.
+		c.generateLedgerAuditMergeStep(yaml, data)
 		if err := c.generateOutputCollectionStep(yaml, data); err != nil {
 			return nil, "", err
 		}

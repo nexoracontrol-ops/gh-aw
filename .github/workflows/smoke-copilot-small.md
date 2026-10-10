@@ -24,6 +24,9 @@ imports:
   - shared/smoke-test-brevity.md
   - shared/reporting.md
   - shared/playwright-title-test.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: copilot-events
 tools:
   bash:
     - "*"
@@ -40,7 +43,6 @@ features:
   gh-aw-detection: false
 sandbox:
   agent:
-    runtime: cloud-hypervisor
     id: awf
 ---
 

@@ -15,11 +15,10 @@ permissions:
   copilot-requests: write
 engine:
   id: codex
-model: copilot/gpt-5.3-codex
+model: openai/gpt-5.6-luna
 strict: true
 sandbox:
   agent:
-    runtime: cloud-hypervisor
     id: awf
 timeout-minutes: 5
 network: {}

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/testutil"
 )
 
 // chdirToRepoRoot changes the working directory to the repository root for
@@ -104,11 +105,7 @@ func TestWorkflowStatus_JSONMarshaling(t *testing.T) {
 
 // TestStatusCommand_JSONOutputValidation tests that the status command with --json flag returns valid JSON
 func TestStatusCommand_JSONOutputValidation(t *testing.T) {
-	// Skip if the binary doesn't exist
-	binaryPath := "../../gh-aw"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Skip("Skipping test: gh-aw binary not found. Run 'make build' first.")
-	}
+	binaryPath := testutil.RequireGhAwBinary(t)
 
 	// Get the current directory for proper path resolution
 	originalDir, err := os.Getwd()
@@ -124,7 +121,7 @@ func TestStatusCommand_JSONOutputValidation(t *testing.T) {
 	defer os.Chdir(originalDir)
 
 	// Run the status command with --json flag
-	cmd := exec.Command(filepath.Join(originalDir, binaryPath), "status", "--json")
+	cmd := exec.Command(binaryPath, "status", "--json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -181,11 +178,7 @@ func TestStatusCommand_JSONOutputValidation(t *testing.T) {
 
 // TestStatusCommand_JSONOutputWithPattern tests that status --json works with a pattern filter
 func TestStatusCommand_JSONOutputWithPattern(t *testing.T) {
-	// Skip if the binary doesn't exist
-	binaryPath := "../../gh-aw"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Skip("Skipping test: gh-aw binary not found. Run 'make build' first.")
-	}
+	binaryPath := testutil.RequireGhAwBinary(t)
 
 	// Get the current directory for proper path resolution
 	originalDir, err := os.Getwd()
@@ -201,7 +194,7 @@ func TestStatusCommand_JSONOutputWithPattern(t *testing.T) {
 	defer os.Chdir(originalDir)
 
 	// Run the status command with --json flag and pattern
-	cmd := exec.Command(filepath.Join(originalDir, binaryPath), "status", "smoke", "--json")
+	cmd := exec.Command(binaryPath, "status", "smoke", "--json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -236,11 +229,7 @@ func TestStatusCommand_JSONOutputWithPattern(t *testing.T) {
 
 // TestStatusCommand_JSONOutputIncludesOnField tests that the "on" field is included in JSON output
 func TestStatusCommand_JSONOutputIncludesOnField(t *testing.T) {
-	// Skip if the binary doesn't exist
-	binaryPath := "../../gh-aw"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Skip("Skipping test: gh-aw binary not found. Run 'make build' first.")
-	}
+	binaryPath := testutil.RequireGhAwBinary(t)
 
 	// Get the current directory for proper path resolution
 	originalDir, err := os.Getwd()
@@ -256,7 +245,7 @@ func TestStatusCommand_JSONOutputIncludesOnField(t *testing.T) {
 	defer os.Chdir(originalDir)
 
 	// Run the status command with --json flag
-	cmd := exec.Command(filepath.Join(originalDir, binaryPath), "status", "--json")
+	cmd := exec.Command(binaryPath, "status", "--json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -296,7 +285,7 @@ func TestStatusCommand_JSONOutputIncludesOnField(t *testing.T) {
 	}
 }
 
-// TestWorkflowStatus_ConsoleRendering tests that WorkflowStatus uses console.RenderStruct correctly
+// TestWorkflowStatus_ConsoleRendering tests that WorkflowStatus uses console.RenderStructStdout correctly
 func TestWorkflowStatus_ConsoleRendering(t *testing.T) {
 	t.Parallel()
 	// Create test data
@@ -321,8 +310,8 @@ func TestWorkflowStatus_ConsoleRendering(t *testing.T) {
 		},
 	}
 
-	// Render using console.RenderStruct
-	output := console.RenderStruct(statuses)
+	// Render using console.RenderStructStdout
+	output := console.RenderStructStdout(statuses)
 
 	// Verify the output contains table headers from console tags
 	expectedHeaders := []string{"workflow", "engine", "compiled"}
@@ -529,8 +518,8 @@ func TestWorkflowStatus_ConsoleRenderingWithRunStatus(t *testing.T) {
 		},
 	}
 
-	// Render using console.RenderStruct
-	output := console.RenderStruct(statuses)
+	// Render using console.RenderStructStdout
+	output := console.RenderStructStdout(statuses)
 
 	// Verify the output contains run status headers
 	expectedHeaders := []string{"workflow", "engine", "compiled", "status", "conclusion"}

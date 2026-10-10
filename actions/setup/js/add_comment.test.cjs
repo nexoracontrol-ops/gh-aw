@@ -1,5 +1,5 @@
 // @ts-check
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -283,7 +283,7 @@ describe("add_comment", () => {
       expect(result.error).toBeTruthy();
     });
 
-    it("should use explicit item_number even with triggering target", async () => {
+    it("should ignore explicit item_number with triggering target", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       /** @type {any} */
@@ -310,8 +310,8 @@ describe("add_comment", () => {
       const result = await handler(message, {});
 
       expect(result.success).toBe(true);
-      expect(capturedIssueNumber).toBe(777);
-      expect(result.itemNumber).toBe(777);
+      expect(capturedIssueNumber).toBe(8535);
+      expect(result.itemNumber).toBe(8535);
     });
 
     it("should resolve from context when item_number is not provided", async () => {
@@ -416,40 +416,62 @@ describe("add_comment", () => {
       expect(capturedRepo).toBe("other-repo");
     });
 
-    it("should return skipped (not failed) when target is 'triggering' but running in schedule context", async () => {
+    it("does not reuse default-repo mention aliases for a cross-repo comment", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const collaboratorLookups = [];
+      let postedBody;
+      mockGithub.rest.repos = {
+        listCollaborators: async params => {
+          collaboratorLookups.push(params);
+          return { data: [] };
+        },
+      };
+      mockGithub.rest.issues.createComment = async params => {
+        postedBody = params.body;
+        return { data: { id: 12345, html_url: "https://github.com/target-org/target-repo/issues/5#issuecomment-12345" } };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({
+        "target-repo": "*", target: "*",
+        mentions: { allowContext: false, allowed: ["target-user"] },
+        allowedMentionAliases: ["workflow-user"]
+      }); })()`);
+      const result = await handler({ type: "add_comment", repo: "target-org/target-repo", item_number: 5, body: "Hi @workflow-user and @target-user" }, {});
+
+      expect(result.success).toBe(true);
+      expect(postedBody).toContain("`@workflow-user` and @target-user");
+      expect(collaboratorLookups).toEqual([expect.objectContaining({ owner: "target-org", repo: "target-repo" })]);
+    });
+
+    it.each([
+      ["schedule", { target: "triggering" }],
+      ["repository_dispatch", {}],
+      ["workflow_dispatch", {}],
+    ])("should fail when triggering target has no issue/PR context in %s", async (eventName, config) => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      let infoCalls = [];
-      let warningCalls = [];
-      mockCore.info = msg => {
-        infoCalls.push(msg);
-      };
+      const warningCalls = [];
       mockCore.warning = msg => {
         warningCalls.push(msg);
       };
 
-      // Simulate a schedule run — no issue or PR in context
-      mockContext.eventName = "schedule";
+      mockContext.eventName = eventName;
       mockContext.payload = {};
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify(config)}); })()`);
 
       const message = {
         type: "add_comment",
-        body: "Status comment from scheduled run",
+        body: "Status comment",
       };
 
       const result = await handler(message, {});
 
-      // Should be skipped, not failed — schedule runs have no triggering issue/PR
       expect(result.success).toBe(false);
-      expect(result.skipped).toBe(true);
-      expect(result.error).toContain("triggering");
-
-      // Should use core.info, not core.warning, since this is an expected non-failure skip
-      const skipInfo = infoCalls.find(msg => msg.includes("triggering"));
-      expect(skipInfo).toBeTruthy();
-      expect(warningCalls.filter(msg => msg.includes("triggering")).length).toBe(0);
+      expect(result.skipped).not.toBe(true);
+      expect(result.error).toContain('target "triggering"');
+      expect(result.error).toContain('target to "*"');
+      expect(warningCalls).toContain(result.error);
     });
 
     it("should reply inline to triggering PR review comment when item_number is not provided", async () => {
@@ -545,7 +567,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1055,7 +1077,7 @@ describe("add_comment", () => {
         throw err;
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       // Explicit item_number targeting a different discussion (via 404 fallback)
       const message = {
@@ -1117,7 +1139,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1179,7 +1201,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1302,7 +1324,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1364,7 +1386,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1997,7 +2019,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2198,7 +2220,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2257,7 +2279,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2292,7 +2314,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2315,7 +2337,7 @@ describe("add_comment", () => {
     it("should defer when temporary ID is not yet resolved", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2348,7 +2370,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2370,7 +2392,7 @@ describe("add_comment", () => {
     it("should handle invalid temporary ID format", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2439,7 +2461,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2472,7 +2494,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2495,7 +2517,7 @@ describe("add_comment", () => {
     it("should defer when issue_number has unresolved temporary ID", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2514,45 +2536,68 @@ describe("add_comment", () => {
   });
 
   describe("sanitization preserves markers", () => {
-    it("should preserve tracker ID markers after sanitization", async () => {
-      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+    describe("PR comment tracker attribution", () => {
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
 
-      // Setup environment
-      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
-      process.env.GH_AW_TRACKER_ID = "test-tracker-123";
+      it.each([
+        { footer: undefined, trackerId: "test-tracker-123" },
+        { footer: false, trackerId: "test-tracker-123" },
+        { footer: undefined, trackerId: undefined },
+        { footer: false, trackerId: undefined },
+      ])("should preserve sanitized PR content with footer=$footer and trackerId=$trackerId", async ({ footer, trackerId }) => {
+        const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      /** @type {any} */
-      let capturedBody = null;
-      mockGithub.rest.issues.createComment = async params => {
-        capturedBody = params.body;
-        return {
-          data: {
-            id: 12345,
-            html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345",
-          },
+        vi.stubEnv("GH_AW_WORKFLOW_NAME", "Test Workflow");
+        vi.stubEnv("GH_AW_TRACKER_ID", trackerId);
+
+        /** @type {any} */
+        let capturedRequest = null;
+        mockGithub.rest.issues.createComment = async params => {
+          capturedRequest = params;
+          return {
+            data: {
+              id: 12345,
+              html_url: "https://github.com/owner/repo/pull/8535#issuecomment-12345",
+            },
+          };
         };
-      };
 
-      // Execute the handler
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+        // Execute the handler
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify({ footer })}); })()`);
 
-      const message = {
-        type: "add_comment",
-        body: "User content with <script>alert('xss')</script> attempt",
-      };
+        const message = {
+          type: "add_comment",
+          body: "User content with <b>safe HTML</b> and <script>alert('xss')</script> attempt",
+        };
 
-      const result = await handler(message, {});
+        const result = await handler(message, {});
 
-      expect(result.success).toBe(true);
-      expect(capturedBody).toBeDefined();
-      // Verify tracker ID is present (not removed by sanitization)
-      expect(capturedBody).toContain("<!-- gh-aw-tracker-id: test-tracker-123 -->");
-      // Verify script tags were sanitized (converted to safe format)
-      expect(capturedBody).not.toContain("<script>");
-      expect(capturedBody).toContain("(script)"); // Tags converted to parentheses
-
-      delete process.env.GH_AW_WORKFLOW_NAME;
-      delete process.env.GH_AW_TRACKER_ID;
+        expect(result.success).toBe(true);
+        expect(capturedRequest).toEqual(
+          expect.objectContaining({
+            owner: "owner",
+            repo: "repo",
+            issue_number: 8535,
+          })
+        );
+        const { body } = capturedRequest;
+        expect(body).toContain("User content with <b>safe HTML</b>");
+        if (trackerId) {
+          expect(body).toContain("\n\n<!-- gh-aw-tracker-id: test-tracker-123 -->");
+        } else {
+          expect(body).not.toContain("gh-aw-tracker-id");
+        }
+        if (footer === false) {
+          expect(body).not.toContain("> Generated by");
+        } else {
+          expect(body).toContain("> Generated by");
+        }
+        // Verify script tags were sanitized (converted to safe format)
+        expect(body).not.toContain("<script>");
+        expect(body).toContain("(script)"); // Tags converted to parentheses
+      });
     });
 
     it("should preserve workflow footer after sanitization", async () => {
@@ -3079,7 +3124,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -3124,7 +3169,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",

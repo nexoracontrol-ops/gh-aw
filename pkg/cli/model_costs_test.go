@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +11,92 @@ import (
 
 	"github.com/github/gh-aw/pkg/modelsdev"
 )
+
+func TestNewModelPricingEntries(t *testing.T) {
+	t.Parallel()
+	var catalog modelsCatalogData
+	require.NoError(t, json.Unmarshal(modelsJSON, &catalog))
+
+	for _, tt := range []struct {
+		provider, model                      string
+		input, output, cacheRead, cacheWrite float64
+	}{
+		{"anthropic", "claude-opus-5-5", 4e-6, 20e-6, 0.2e-6, 5e-6},
+		{"anthropic", "claude-sonnet-5-5", 2e-6, 10e-6, 0.2e-6, 2.5e-6},
+		{"github-copilot", "claude-haiku-5.5", 0.1e-6, 0.5e-6, 0.01e-6, 0.125e-6},
+		{"github-copilot", "claude-opus-5.5", 4e-6, 20e-6, 0.2e-6, 5e-6},
+		{"github-copilot", "claude-sonnet-5.5", 2e-6, 10e-6, 0.1e-6, 2.5e-6},
+		{"github-copilot", "gpt-5-mini", 0.25e-6, 2e-6, 0.025e-6, 0},
+		{"github-copilot", "gpt-5.3-codex", 1.75e-6, 14e-6, 0.175e-6, 0},
+		{"github-copilot", "gpt-5.4-mini", 0.75e-6, 4.5e-6, 0.075e-6, 0},
+		{"github-copilot", "gpt-6-sol", 2e-6, 10e-6, 0.2e-6, 2.5e-6},
+		{"github-copilot", "gpt-6-luna", 0.1e-6, 0.5e-6, 0.01e-6, 0.125e-6},
+		{"github-copilot", "gpt-6.1-sol", 2e-6, 10e-6, 0.1e-6, 2.5e-6},
+		{"github-copilot", "gpt-5.6-terra", 2e-6, 12e-6, 0.2e-6, 2.5e-6},
+		{"github-copilot", "gpt-5.6-luna", 0.2e-6, 1.2e-6, 0.02e-6, 0.25e-6},
+		{"openai", "gpt-6-sol", 2e-6, 10e-6, 0.2e-6, 2.5e-6},
+		{"openai", "gpt-6-luna", 0.1e-6, 0.5e-6, 0.01e-6, 0.125e-6},
+		{"openai", "gpt-6.1-sol", 2e-6, 10e-6, 0.1e-6, 2.5e-6},
+		{"openai", "gpt-5.6-terra", 2e-6, 12e-6, 0.2e-6, 2.5e-6},
+		{"openai", "gpt-5.6-luna", 0.2e-6, 1.2e-6, 0.02e-6, 0.25e-6},
+	} {
+		t.Run(tt.provider+"/"+tt.model, func(t *testing.T) {
+			t.Parallel()
+			entry, exists := catalog.Providers[tt.provider].Models[tt.model]
+			require.True(t, exists, "missing catalog entry")
+			pricing, ok := findModelPricing(tt.provider, tt.model)
+			require.True(t, ok)
+			assert.InDelta(t, tt.input, pricing["input"], 1e-12)
+			assert.InDelta(t, tt.output, pricing["output"], 1e-12)
+			assert.InDelta(t, tt.cacheRead, pricing["cache_read"], 1e-12)
+			assert.InDelta(t, tt.cacheWrite, pricing["cache_write"], 1e-12)
+			assert.NotEmpty(t, entry.Cost)
+		})
+	}
+}
+
+func TestFindExactModelPricing(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		provider, model string
+		found           bool
+	}{
+		{"openai", "gpt-6.1-sol", true},
+		{"openai", "gpt-6-1-sol", true},
+		{"copilot", "gpt-6.1-sol", true},
+		{"copilot", "gpt-6-1-sol?effort=high", true},
+		{"copilot", "gpt-6-1-sol", true},
+		{"github-copilot", " GPT-6.1-SOL ", true},
+		{"openai", "gpt-6.1-sol?effort=high", true},
+		{"copilot", "gpt-6.1-sol?temperature=0.2", true},
+		{"openai", "GPT_6_1_SOL", true},
+		{"copilot", "gpt_6.1_sol", true},
+		{"openai", "GPT_6.1_SOL?effort=high", true},
+		{"anthropic", "gpt-6.1-sol", false},
+		{"anthropic", "gpt-6-1-sol", false},
+		{"anthropic", "GPT_6_1_SOL?effort=high", false},
+		{"openai", "gpt-6.1-sol-unknown", false},
+		{"openai", "gpt-6-1-sol-unknown", false},
+		{"openai", "gpt_6.1_sol_unknown?effort=high", false},
+		{"openai", "gpt-6.1-sol*", false},
+		{"openai", "gpt-99", false},
+		{"copilot", "auto", false},
+		{"copilot", "auto?effort=high", false},
+		{"", "gpt-6.1-sol", false},
+	} {
+		t.Run(tt.provider+"/"+tt.model, func(t *testing.T) {
+			t.Parallel()
+			pricing, found := findExactModelPricing(tt.provider, tt.model)
+			require.Equal(t, tt.found, found)
+			if found {
+				require.InDelta(t, 2e-6, pricing["input"], 1e-15)
+				require.InDelta(t, 10e-6, pricing["output"], 1e-15)
+			} else {
+				require.Nil(t, pricing)
+			}
+		})
+	}
+}
 
 func TestFindModelPricing(t *testing.T) {
 	t.Parallel()
@@ -47,21 +134,24 @@ func TestFindGPT6AstraPricing(t *testing.T) {
 			assert.InDelta(t, 0.00001, pricing["input"], 1e-12)
 			assert.InDelta(t, 0.00005, pricing["output"], 1e-12)
 			assert.InDelta(t, 0.000001, pricing["cache_read"], 1e-12)
-			if provider == "github-copilot" {
-				assert.InDelta(t, 0.0000125, pricing["cache_write"], 1e-12)
-			}
+			assert.InDelta(t, 0.0000125, pricing["cache_write"], 1e-12)
 		})
 	}
 }
 
 func TestFindGPT56SolPricing(t *testing.T) {
 	t.Parallel()
-	pricing, ok := findModelPricing("github-copilot", "gpt-5.6-sol")
-	require.True(t, ok)
-	assert.InDelta(t, 0.000004, pricing["input"], 1e-12)
-	assert.InDelta(t, 0.00002, pricing["output"], 1e-12)
-	assert.InDelta(t, 0.0000004, pricing["cache_read"], 1e-12)
-	assert.InDelta(t, 0.000005, pricing["cache_write"], 1e-12)
+	for _, provider := range []string{"github-copilot", "openai"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+			pricing, ok := findModelPricing(provider, "gpt-5.6-sol")
+			require.True(t, ok)
+			assert.InDelta(t, 0.000004, pricing["input"], 1e-12)
+			assert.InDelta(t, 0.00002, pricing["output"], 1e-12)
+			assert.InDelta(t, 0.0000004, pricing["cache_read"], 1e-12)
+			assert.InDelta(t, 0.000005, pricing["cache_write"], 1e-12)
+		})
+	}
 }
 
 func TestFindClaudeFable51Pricing(t *testing.T) {
@@ -88,13 +178,18 @@ func TestFindGrok45CacheReadPricing(t *testing.T) {
 	assert.InDelta(t, 0.0000005, pricing["cache_read"], 1e-12)
 }
 
-func TestFindGrok46Pricing(t *testing.T) {
+func TestFindLatestGrokPricing(t *testing.T) {
 	t.Parallel()
-	pricing, ok := findModelPricing("github-copilot", "grok-4.6")
-	require.True(t, ok)
-	assert.InDelta(t, 0.000002, pricing["input"], 1e-12)
-	assert.InDelta(t, 0.000006, pricing["output"], 1e-12)
-	assert.InDelta(t, 0.0000005, pricing["cache_read"], 1e-12)
+	for _, model := range []string{"grok-4.6", "grok-4.7"} {
+		t.Run(model, func(t *testing.T) {
+			t.Parallel()
+			pricing, ok := findModelPricing("github-copilot", model)
+			require.True(t, ok)
+			assert.InDelta(t, 0.000002, pricing["input"], 1e-12)
+			assert.InDelta(t, 0.000006, pricing["output"], 1e-12)
+			assert.InDelta(t, 0.0000005, pricing["cache_read"], 1e-12)
+		})
+	}
 }
 
 func TestFindGemini37FlashPricing(t *testing.T) {

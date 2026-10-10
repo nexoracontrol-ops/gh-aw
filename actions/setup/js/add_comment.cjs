@@ -25,6 +25,7 @@ const { createDiscussionComment, resolveTopLevelDiscussionCommentId } = require(
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { isPayloadUserBot } = require("./resolve_mentions.cjs");
+const { getMentionsGithubClient, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
@@ -610,9 +611,8 @@ async function main(config = {}) {
       commentIdToReuse = allowedCommentId.commentId;
     }
 
-    // Check if item_number or issue_number was explicitly provided in the message.
-    // item_number takes precedence over issue_number when both are present.
-    // pr-number is accepted as an alias for item_number for robustness.
+    // Track whether the configured target selected an explicit item rather than the
+    // triggering context. This controls reply and retry behavior later in the handler.
     /** @type {{ success: boolean, number?: number | null, deferred?: boolean, error?: string }} */
     let itemTargetResult = { success: true, number: null };
     if (hasExplicitCommentId) {
@@ -641,22 +641,10 @@ async function main(config = {}) {
         };
       }
     } else {
-      itemTargetResult = resolveSafeOutputIssueTarget({ message, tempIdMap: temporaryIdMap, repoParts, handlerType: HANDLER_TYPE, aliases: ["item_number", "issue_number", "pr-number"] });
-      if (!itemTargetResult.success) return itemTargetResult;
-    }
-
-    if (itemTargetResult.number != null) {
-      itemNumber = itemTargetResult.number;
-      core.info(`Using explicitly provided target number (item_number/issue_number/pr-number): #${itemNumber}`);
-    } else if (!hasExplicitCommentId) {
-      // Check if this is a discussion context
       const isDiscussionContext = effectiveContext.eventName === "discussion" || effectiveContext.eventName === "discussion_comment";
-
-      if (isDiscussionContext) {
-        // For discussions, always use the discussion context
+      if (commentTarget === "triggering" && isDiscussionContext) {
         isDiscussion = true;
         itemNumber = effectiveContext.payload?.discussion?.number;
-
         if (!itemNumber) {
           core.warning("Discussion context detected but no discussion number found");
           return {
@@ -664,13 +652,20 @@ async function main(config = {}) {
             error: "No discussion number available",
           };
         }
-
         core.info(`Using discussion context: #${itemNumber}`);
       } else {
-        // For issues/PRs, use the resolveTarget helper which respects target configuration
+        let targetItem = message;
+        if (commentTarget === "*") {
+          itemTargetResult = resolveSafeOutputIssueTarget({ message, tempIdMap: temporaryIdMap, repoParts, handlerType: HANDLER_TYPE, aliases: ["item_number", "issue_number", "pr-number"] });
+          if (!itemTargetResult.success) return itemTargetResult;
+          if (itemTargetResult.number != null) {
+            targetItem = { ...message, item_number: itemTargetResult.number };
+          }
+        }
+
         const targetResult = resolveTarget({
           targetConfig: commentTarget,
-          item: message,
+          item: targetItem,
           context: effectiveContext,
           itemType: "add_comment",
           supportsPR: true, // add_comment supports both issues and PRs
@@ -678,26 +673,9 @@ async function main(config = {}) {
         });
 
         if (!targetResult.success) {
-          if (targetResult.shouldFail) {
-            const hasExplicitWildcardTargetField = WILDCARD_TARGET_FIELDS.some(field => message[field] != null);
-            const missingWildcardTarget = commentTarget === "*" && !hasExplicitWildcardTargetField;
-            if (missingWildcardTarget) {
-              core.info(targetResult.error);
-              return {
-                success: false,
-                skipped: true,
-                reasonCode: "NO_CONTEXT",
-                reason: "No target context available",
-                error: targetResult.error,
-              };
-            }
-            core.warning(targetResult.error);
-            return {
-              success: false,
-              error: targetResult.error,
-            };
-          } else {
-            // No triggering context (e.g. schedule run) — silently skip rather than fail
+          const hasExplicitWildcardTargetField = WILDCARD_TARGET_FIELDS.some(field => message[field] != null);
+          const missingWildcardTarget = commentTarget === "*" && !hasExplicitWildcardTargetField;
+          if (missingWildcardTarget) {
             core.info(targetResult.error);
             return {
               success: false,
@@ -707,9 +685,17 @@ async function main(config = {}) {
               error: targetResult.error,
             };
           }
+          const error = targetResult.shouldFail
+            ? targetResult.error
+            : 'Cannot resolve add_comment target "triggering" without an issue, pull request, or discussion context; set safe-outputs.add-comment.target to "*" and provide an item_number';
+          core.warning(error);
+          return { success: false, error };
         }
 
         itemNumber = targetResult.number;
+        if (commentTarget !== "triggering") {
+          itemTargetResult = { success: true, number: itemNumber };
+        }
         core.info(`Resolved target ${targetResult.contextType} #${itemNumber} (target config: ${commentTarget})`);
       }
     }
@@ -767,7 +753,8 @@ async function main(config = {}) {
         if (itemTargetResult.number != null || hasExplicitCommentId) {
           // Explicit item_number/issue_number: fetch the issue/PR to get its author
           try {
-            const { data: issueData } = await githubClient.rest.issues.get({
+            const mentionsGithubClient = getMentionsGithubClient(githubClient);
+            const { data: issueData } = await mentionsGithubClient.rest.issues.get({
               owner: repoParts.owner,
               repo: repoParts.repo,
               issue_number: itemNumber,
@@ -794,7 +781,8 @@ async function main(config = {}) {
         }
       }
     }
-    const allowedMentionAliases = deduplicateCaseInsensitive([...parentAuthors, ...preResolvedMentionAliases, ...configuredMentionAliases]);
+    const itemMentionAliases = await resolveMentionsForItem(effectiveContext, githubClient, core, config.mentions, preResolvedMentionAliases, defaultTargetRepo, repoResult);
+    const allowedMentionAliases = deduplicateCaseInsensitive([...parentAuthors, ...itemMentionAliases, ...configuredMentionAliases]);
 
     if (allowedMentionAliases.length > 0) {
       core.info(`[MENTIONS] Allowing aliases in comment: ${allowedMentionAliases.join(", ")}`);

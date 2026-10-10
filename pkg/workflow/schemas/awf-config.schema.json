@@ -10,6 +10,17 @@
       "type": "string",
       "description": "JSON Schema URL for IDE validation and autocomplete."
     },
+    "experimental": {
+      "type": "object",
+      "description": "Explicit opt-ins for experimental AWF features.",
+      "additionalProperties": false,
+      "properties": {
+        "modelRouting": {
+          "type": "boolean",
+          "description": "Experimental opt-in for task-level model routing. Must be true when apiProxy.routing is configured; without apiProxy.routing, routing remains inactive."
+        }
+      }
+    },
     "network": {
       "type": "object",
       "description": "Network egress configuration.",
@@ -48,10 +59,6 @@
         "isolation": {
           "type": "boolean",
           "description": "Experimental: enforce egress via Docker network topology (an internal network with no internet route plus a dual-homed Squid proxy) instead of host iptables. Requires no sudo/NET_ADMIN, so it works inside ARC/Kubernetes DinD runners. Not yet supported together with dnsOverHttps or enableHostAccess. Maps to the --network-isolation CLI flag."
-        },
-        "verifySbxEgress": {
-          "type": "boolean",
-          "description": "Fail before agent startup unless Docker sbx blocks a direct request made with all proxy environment variables removed. Intended for orchestrators that start the sbx daemon with DOCKER_SANDBOXES_PROXY chained to AWF Squid. Maps to --verify-sbx-egress."
         },
         "topologyAttach": {
           "type": "array",
@@ -97,7 +104,7 @@
               }
             ]
           },
-          "description": "Guest-visible absolute paths that may be writable. When present, existing writable host bind mounts are made read-only outside these paths. An empty array makes all non-internal host bind mounts read-only. Paths must exist and cannot use glob patterns. This option is supported by the Docker and gVisor compose runtimes and by the Cloud Hypervisor microVM runtime; it is rejected with the sbx runtime and with Docker-in-Docker agent execution."
+          "description": "Guest-visible absolute paths that may be writable. When present, existing writable host bind mounts are made read-only outside these paths. An empty array makes all non-internal host bind mounts read-only. Paths must exist and cannot use glob patterns. This option is supported by the Docker and Cloud Hypervisor runtimes; it is rejected with Docker-in-Docker agent execution."
         }
       }
     },
@@ -127,6 +134,18 @@
           "type": "string",
           "enum": ["5m", "1h"],
           "description": "TTL for Anthropic cache tail optimization. Only applies when anthropicAutoCache is enabled. Allowed values: \"5m\" or \"1h\"."
+        },
+        "hostedWeb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "claude": {
+              "$ref": "#/$defs/hostedWebPolicy"
+            },
+            "codex": {
+              "$ref": "#/$defs/hostedWebPolicy"
+            }
+          }
         },
         "maxEffectiveTokens": {
           "type": "integer",
@@ -236,6 +255,15 @@
             }
           }
         },
+        "fallbackModels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Ordered list of concrete model IDs to retry with when the requested model fails with a model-specific error: upstream 5xx, a connection error/timeout before any response, or a 400/404 reporting the model as unsupported, not found, or not accessible. 401, 403, and 429 responses never trigger a fallback. The API proxy rewrites the request's model (body 'model' field, or the Gemini '/models/<model>:' path segment), and records the model that actually served the request in token-usage logs ('model' plus a 'model_fallback' object). A redundant '<provider>/' prefix is stripped. Each fallback model must pass the same model-policy and budget guards as the requested model."
+        },
         "modelRouter": {
           "type": "object",
           "description": "Model-router settings for Copilot-compatible BYOK upstreams.",
@@ -248,6 +276,45 @@
             "baseUrl": {
               "type": "string",
               "description": "Router base URL for Copilot BYOK upstream traffic (maps to COPILOT_PROVIDER_BASE_URL)."
+            }
+          }
+        },
+        "routing": {
+          "type": "object",
+          "description": "Opt-in task-level model routing configuration prepared by a trusted workflow compiler.",
+          "additionalProperties": false,
+          "required": ["objective", "task"],
+          "properties": {
+            "candidateModels": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "objective": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["goal", "mode"],
+              "properties": {
+                "goal": {
+                  "type": "string",
+                  "enum": ["cost", "cost-speed"]
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": ["economy", "balanced", "robust", "auto"]
+                }
+              }
+            },
+            "task": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["conversationFile"],
+              "properties": {
+                "conversationFile": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
             }
           }
         },
@@ -558,6 +625,11 @@
       "description": "Container and Docker configuration.",
       "additionalProperties": false,
       "properties": {
+        "containerRuntime": {
+          "type": "string",
+          "enum": ["docker", "gvisor", "sbx", "cloud-hypervisor", "nvx"],
+          "description": "Runtime for the primary agent, independent of enclave executor runtimes. The nvx runtime selects the explicit Linux x86_64 KVM one-shot microVM preview."
+        },
         "memoryLimit": {
           "type": "string",
           "description": "Docker memory limit for the agent container (e.g. \"4g\", \"512m\"). Uses Docker memory limit syntax."
@@ -597,6 +669,9 @@
               "$ref": "#/$defs/digestPinnedImage"
             },
             "apiProxy": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "router": {
               "$ref": "#/$defs/digestPinnedImage"
             },
             "cliProxy": {
@@ -665,11 +740,6 @@
             "pattern": "^/[^:]+:/[^:]+(:(ro|rw))?$"
           },
           "description": "Custom volume mounts for the agent container. Format: \"/host_path:/container_path[:ro|rw]\" (both paths must be absolute). In chroot mode, container paths are automatically prefixed with /host."
-        },
-        "containerRuntime": {
-          "type": "string",
-          "enum": ["gvisor", "sbx", "cloud-hypervisor"],
-          "description": "Runtime for the primary agent. \"gvisor\" uses runsc in Docker Compose. \"sbx\" uses a Docker sbx microVM. \"cloud-hypervisor\" selects the explicit Linux/KVM Cloud Hypervisor v53.0 workload preview (GitHub-hosted Ubuntu x86_64 KVM runners only). Infrastructure containers always use the default runc runtime."
         }
       },
       "allOf": [
@@ -700,13 +770,13 @@
     },
     "cloudHypervisor": {
       "type": "object",
-      "description": "Cloud Hypervisor v53.0 microVM preview configuration. Requires either container.containerRuntime: \"cloud-hypervisor\" or enclaves[].runtime: \"cloud-hypervisor\", plus previewEnabled, to execute workloads; supported only on GitHub-hosted Ubuntu x86_64 KVM runners.",
+      "description": "Cloud Hypervisor v53.0 microVM preview configuration. Requires the --container-runtime cloud-hypervisor CLI flag (or enclaves[].runtime: \"cloud-hypervisor\"), plus previewEnabled, to execute workloads; supported only on GitHub-hosted Ubuntu x86_64 KVM runners.",
       "additionalProperties": false,
       "properties": {
         "previewEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable the Cloud Hypervisor v53.0 workload-execution preview. Requires either container.containerRuntime: \"cloud-hypervisor\" or enclaves[].runtime: \"cloud-hypervisor\", plus a GitHub-hosted Ubuntu x86_64 KVM runner."
+          "description": "Enable the Cloud Hypervisor v53.0 workload-execution preview. Requires the --container-runtime cloud-hypervisor CLI flag (or enclaves[].runtime: \"cloud-hypervisor\"), plus a GitHub-hosted Ubuntu x86_64 KVM runner."
         },
         "mountPolicy": {
           "type": "string",
@@ -787,6 +857,69 @@
               "$ref": "#/$defs/sha256Digest"
             }
           }
+        }
+      }
+    },
+    "nvx": {
+      "type": "object",
+      "description": "NVX preview one-shot microVM configuration. Requires container.containerRuntime: \"nvx\" and explicit preview opt-in; supported only on Linux x86_64 KVM hosts.",
+      "additionalProperties": false,
+      "properties": {
+        "previewEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mountPolicy": {
+          "type": "string",
+          "enum": ["workspace-only", "workspace-and-tool-cache"],
+          "default": "workspace-only"
+        },
+        "layerPath": {
+          "type": "string",
+          "description": "Absolute path to the workload-specific guest distro layer."
+        },
+        "artifactManifestPath": {
+          "type": "string",
+          "description": "Absolute path to the AWF release artifact manifest."
+        },
+        "artifactManifestBundlePath": {
+          "type": "string",
+          "description": "Absolute path to the offline manifest Sigstore attestation bundle."
+        },
+        "signerWorkflow": {
+          "type": "string",
+          "description": "Expected trusted workflow identity that signed the artifact manifest."
+        },
+        "openvmmPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested OpenVMM binary."
+        },
+        "kernelPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested guest kernel."
+        },
+        "initramfsPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested guest initramfs."
+        },
+        "memoryMib": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 512
+        },
+        "memoryMaxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 536870912
+        },
+        "pidsMax": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 128
+        },
+        "scratchBytes": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -933,6 +1066,16 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum number of bytes transferred per minute."
+        },
+        "maxGithubApiPointsRest": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum GitHub REST API secondary-rate-limit points allowed per AWF run. Requires security.difcProxy.host."
+        },
+        "maxGithubApiPointsGraphql": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum GitHub GraphQL API secondary-rate-limit points allowed per AWF run. Requires security.difcProxy.host."
         }
       }
     },
@@ -1334,7 +1477,7 @@
           },
           "runtime": {
             "type": "string",
-            "enum": ["docker", "gvisor", "sbx", "cloud-hypervisor"],
+            "enum": ["docker", "cloud-hypervisor"],
             "default": "docker",
             "description": "Trusted enclave executor runtime. cloud-hypervisor is reserved behind the ADR 0002 implementation gates and currently fails closed before execution."
           },
@@ -1400,6 +1543,65 @@
     }
   },
   "$defs": {
+    "hostedWebPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allowedDomains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+          }
+        },
+        "blockedDomains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+          }
+        },
+        "maxUses": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "not": {
+        "required": ["allowedDomains", "blockedDomains"]
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": { "const": false }
+          },
+          "not": {
+            "anyOf": [{ "required": ["allowedDomains"] }, { "required": ["blockedDomains"] }, { "required": ["maxUses"] }]
+          }
+        },
+        {
+          "properties": {
+            "enabled": { "const": true }
+          },
+          "required": ["allowedDomains"]
+        },
+        {
+          "properties": {
+            "enabled": { "const": true }
+          },
+          "required": ["blockedDomains"]
+        }
+      ]
+    },
     "digestPinnedImage": {
       "type": "string",
       "pattern": "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+(?::[0-9]{1,5})?|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?:[0-9]{1,5}|localhost)/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[a-f0-9]{64}$",
@@ -1523,6 +1725,31 @@
             "type": "object",
             "not": {
               "required": ["stagingImage"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["apiProxy"],
+        "properties": {
+          "apiProxy": {
+            "type": "object",
+            "required": ["routing"]
+          }
+        }
+      },
+      "then": {
+        "required": ["experimental"],
+        "properties": {
+          "experimental": {
+            "type": "object",
+            "required": ["modelRouting"],
+            "properties": {
+              "modelRouting": {
+                "const": true
+              }
             }
           }
         }

@@ -37,6 +37,16 @@ func TestCopilotEngineComputeToolArguments(t *testing.T) {
 			expected: []string{"--allow-all-tools"},
 		},
 		{
+			name: "bash with wildcard under network restrictions",
+			tools: map[string]any{
+				"bash": []any{"*"},
+			},
+			workflowData: &WorkflowData{
+				NetworkPermissions: &NetworkPermissions{Allowed: []string{"example.com"}},
+			},
+			expected: []string{"--allow-tool", "shell"},
+		},
+		{
 			name: "bash with nil (all commands allowed)",
 			tools: map[string]any{
 				"bash": nil,
@@ -175,11 +185,36 @@ func TestCopilotEngineComputeToolArguments(t *testing.T) {
 			expected: []string{"--allow-tool", "github"},
 		},
 		{
-			name: "web-fetch tool",
+			name: "native web-fetch tool is unavailable",
 			tools: map[string]any{
 				"web-fetch": nil,
 			},
-			expected: []string{"--allow-tool", "web_fetch"},
+			expected: []string{},
+		},
+		{
+			name: "SDK custom web-fetch tool",
+			tools: map[string]any{
+				"web-fetch": nil,
+			},
+			workflowData: &WorkflowData{EngineConfig: &EngineConfig{CopilotSDK: true}},
+			expected:     []string{"--allow-tool", "web_fetch"},
+		},
+		{
+			name: "native web-search tool is unavailable",
+			tools: map[string]any{
+				"web-search": nil,
+			},
+			expected: []string{},
+		},
+		{
+			name: "web-search tool with older pinned Copilot CLI",
+			tools: map[string]any{
+				"web-search": nil,
+			},
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{Version: "1.0.86"},
+			},
+			expected: []string{},
 		},
 		{
 			name: "github tool with multiple allowed tools sorted",

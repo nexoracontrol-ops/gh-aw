@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -9,6 +10,51 @@ import (
 )
 
 var mcpRendererBuiltinLog = logger.New("workflow:mcp_renderer_builtin")
+
+const workQueueMCPServerEntrypoint = "${RUNNER_TEMP}/gh-aw/actions/work_queue_mcp_server.cjs"
+
+// RenderWorkQueueMCP mounts the activation snapshot read-only; only participants
+// receive a writable intent directory. The server has no Git client or credentials.
+func (r *MCPConfigRendererUnified) RenderWorkQueueMCP(yaml *strings.Builder, workflowData *WorkflowData) {
+	image := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, workflowData)
+	serverName := "work-queue"
+	role := workQueueRuntimeRole(workflowData)
+	mounts := []string{constants.DefaultGhAwMount, constants.WorkQueueSnapshotMount}
+	if role != "observer" {
+		mounts = append(mounts, constants.WorkQueueFinishIntentMount)
+	}
+
+	if r.options.Format == "toml" {
+		yaml.WriteString("          \n")
+		yaml.WriteString("          [mcp_servers." + serverName + "]\n")
+		yaml.WriteString("          container = \"" + image + "\"\n")
+		yaml.WriteString("          mounts = [\"" + strings.Join(mounts, "\", \"") + "\"]\n")
+		yaml.WriteString("          env_vars = [\"RUNNER_TEMP\"]\n")
+		fmt.Fprintf(yaml, "          env = { GH_AW_WORK_QUEUE_ROLE = %q }\n", role) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		yaml.WriteString("          entrypoint = \"node\"\n")
+		yaml.WriteString("          entrypointArgs = [\"" + workQueueMCPServerEntrypoint + "\"]\n")
+		return
+	}
+
+	yaml.WriteString("              \"" + serverName + "\": {\n")
+	if r.options.IncludeCopilotFields {
+		yaml.WriteString("                \"type\": \"stdio\",\n")
+		yaml.WriteString("                \"tools\": [\"" + strings.Join(workQueueMCPToolNames(workflowData), "\", \"") + "\"],\n")
+	}
+	yaml.WriteString("                \"container\": \"" + image + "\",\n")
+	yaml.WriteString("                \"mounts\": [\"" + strings.Join(mounts, "\", \"") + "\"],\n")
+	yaml.WriteString("                \"env\": {\n")
+	yaml.WriteString("                  \"RUNNER_TEMP\": \"\\${RUNNER_TEMP}\",\n")
+	fmt.Fprintf(yaml, "                  \"GH_AW_WORK_QUEUE_ROLE\": %q\n", role) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	yaml.WriteString("                },\n")
+	yaml.WriteString("                \"entrypoint\": \"node\",\n")
+	yaml.WriteString("                \"entrypointArgs\": [\"" + workQueueMCPServerEntrypoint + "\"]\n")
+	if r.options.IsLast {
+		yaml.WriteString("              }\n")
+	} else {
+		yaml.WriteString("              },\n")
+	}
+}
 
 // RenderSafeOutputsMCP generates the Safe Outputs MCP server configuration
 func (r *MCPConfigRendererUnified) RenderSafeOutputsMCP(yaml *strings.Builder, workflowData *WorkflowData) {
@@ -23,6 +69,69 @@ func (r *MCPConfigRendererUnified) RenderSafeOutputsMCP(yaml *strings.Builder, w
 	renderSafeOutputsMCPConfigWithOptions(yaml, r.options.IsLast, r.options.IncludeCopilotFields, workflowData)
 }
 
+// RenderLedgerMCP registers the ledger server in the existing gh-aw node MCP container.
+func (r *MCPConfigRendererUnified) RenderLedgerMCP(yaml *strings.Builder, workflowData *WorkflowData) {
+	image := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, workflowData)
+	if r.options.Format == "toml" {
+		yaml.WriteString("          \n")
+		yaml.WriteString("          [mcp_servers.ledger]\n")
+		yaml.WriteString("          container = \"" + image + "\"\n")
+		yaml.WriteString("          mounts = [\"" + constants.DefaultWorkspaceMount + "\", \"" + constants.DefaultGhAwMount + "\", \"" + constants.DefaultTmpGhAwMount + "\"]\n")
+		yaml.WriteString("          entrypoint = \"node\"\n")
+		yaml.WriteString("          entrypointArgs = [\"${RUNNER_TEMP}/gh-aw/actions/ledger_mcp_server.cjs\"]\n")
+		names := []string{"GH_AW_MEMORY_DIR", "GITHUB_RUN_ID", "GITHUB_WORKSPACE", "RUNNER_TEMP"}
+		names = append(names, ledgerMCPConfiguredEnvNames(workflowData)...)
+		yaml.WriteString("          env_vars = [\"" + strings.Join(names, "\", \"") + "\"]\n")
+		return
+	}
+	yaml.WriteString("              \"ledger\": {\n")
+	if r.options.IncludeCopilotFields {
+		yaml.WriteString("                \"type\": \"stdio\",\n")
+	}
+	yaml.WriteString("                \"container\": \"" + image + "\",\n")
+	yaml.WriteString("                \"mounts\": [\"" + constants.DefaultWorkspaceMount + "\", \"" + constants.DefaultGhAwMount + "\", \"" + constants.DefaultTmpGhAwMount + "\"],\n")
+	yaml.WriteString("                \"entrypoint\": \"node\",\n")
+	yaml.WriteString("                \"entrypointArgs\": [\"${RUNNER_TEMP}/gh-aw/actions/ledger_mcp_server.cjs\"],\n")
+	yaml.WriteString("                \"env\": {\n")
+	yaml.WriteString("                  \"GH_AW_MEMORY_DIR\": \"\\${GH_AW_MEMORY_DIR}\",\n")
+	yaml.WriteString("                  \"GITHUB_WORKSPACE\": \"\\${GITHUB_WORKSPACE}\",\n")
+	for _, name := range ledgerMCPConfiguredEnvNames(workflowData) {
+		yaml.WriteString("                  \"" + name + "\": \"\\${" + name + "}\",\n")
+	}
+	yaml.WriteString("                  \"GITHUB_RUN_ID\": \"\\${GITHUB_RUN_ID}\"\n")
+	yaml.WriteString("                }\n")
+	if r.options.IsLast {
+		yaml.WriteString("              }\n")
+	} else {
+		yaml.WriteString("              },\n")
+	}
+
+}
+
+func ledgerMCPConfiguredEnvNames(workflowData *WorkflowData) []string {
+	memory := workflowData.RepoMemoryConfig.ledgerEntry()
+	if memory == nil {
+		return nil
+	}
+	names := []string{}
+	if memory.Ledger.Schema != "" {
+		names = append(names, "GH_AW_LEDGER_SCHEMA")
+	}
+	if memory.Ledger.MaxShards > 0 {
+		names = append(names, "GH_AW_LEDGER_MAX_SHARDS")
+	}
+	if memory.Ledger.MaxSegmentKB > 0 {
+		names = append(names, "GH_AW_LEDGER_MAX_SEGMENT_KB")
+	}
+	if memory.Ledger.MaxRecordKB > 0 {
+		names = append(names, "GH_AW_LEDGER_MAX_RECORD_KB")
+	}
+	if memory.Ledger.MaxPatchKB > 0 {
+		names = append(names, "GH_AW_LEDGER_MAX_PATCH_KB")
+	}
+	return names
+}
+
 // renderSafeOutputsTOML generates Safe Outputs MCP configuration in TOML format
 // Uses containerized stdio transport in the gh-aw-node image, overriding the container's
 // default entrypoint to run the stdio MCP server script.
@@ -31,7 +140,12 @@ func (r *MCPConfigRendererUnified) renderSafeOutputsTOML(yaml *strings.Builder, 
 	yaml.WriteString("          \n")
 	yaml.WriteString("          [mcp_servers." + constants.SafeOutputsMCPServerID.String() + "]\n")
 	yaml.WriteString("          container = \"" + containerImage + "\"\n")
-	yaml.WriteString("          mounts = [\"" + constants.DefaultWorkspaceMount + "\", \"" + constants.DefaultSafeOutputsMount + "\", \"" + constants.DefaultTmpGhAwMount + "\"]\n")
+	mounts := []string{constants.DefaultWorkspaceMount, constants.DefaultSafeOutputsMount, constants.DefaultTmpGhAwMount}
+	if isWorkQueueEnabled(workflowData) {
+		mounts = append(mounts, constants.WorkQueueSnapshotMount)
+		fmt.Fprintf(yaml, "          env = { GH_AW_WORK_QUEUE_ENABLED = \"true\", GH_AW_WORK_QUEUE_ROLE = %q }\n", workQueueRuntimeRole(workflowData)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	}
+	yaml.WriteString("          mounts = [\"" + strings.Join(mounts, "\", \"") + "\"]\n")
 	yaml.WriteString("          args = [\"-w\", \"$GITHUB_WORKSPACE\"]\n")
 	yaml.WriteString("          entrypoint = \"sh\"\n")
 	yaml.WriteString("          entrypointArgs = [\"-c\", \"sh ${RUNNER_TEMP}/gh-aw/safeoutputs/start_safe_outputs_mcp.sh\"]\n")
@@ -51,9 +165,9 @@ func (r *MCPConfigRendererUnified) renderSafeOutputsTOML(yaml *strings.Builder, 
 	if workflowData != nil {
 		safeOutputsEnvVars = append(safeOutputsEnvVars, sliceutil.SortedKeys(workflowData.SafeOutputsInputEnvVars)...)
 	}
-	quoted := make([]string, len(safeOutputsEnvVars))
-	for i, v := range safeOutputsEnvVars {
-		quoted[i] = "\"" + v + "\""
+	quoted := make([]string, 0, len(safeOutputsEnvVars))
+	for _, v := range safeOutputsEnvVars {
+		quoted = append(quoted, "\""+v+"\"")
 	}
 	yaml.WriteString("          env_vars = [" + strings.Join(quoted, ", ") + "]\n")
 
@@ -203,7 +317,11 @@ func renderSafeOutputsMCPConfigWithOptions(yaml *strings.Builder, isLast bool, i
 		yaml.WriteString("                \"type\": \"stdio\",\n")
 	}
 	yaml.WriteString("                \"container\": \"" + containerImage + "\",\n")
-	yaml.WriteString("                \"mounts\": [\"" + constants.DefaultWorkspaceMount + "\", \"" + constants.DefaultSafeOutputsMount + "\", \"" + constants.DefaultTmpGhAwMount + "\"],\n")
+	mounts := []string{constants.DefaultWorkspaceMount, constants.DefaultSafeOutputsMount, constants.DefaultTmpGhAwMount}
+	if isWorkQueueEnabled(workflowData) {
+		mounts = append(mounts, constants.WorkQueueSnapshotMount)
+	}
+	yaml.WriteString("                \"mounts\": [\"" + strings.Join(mounts, "\", \"") + "\"],\n")
 	yaml.WriteString("                \"args\": [\"-w\", \"\\${GITHUB_WORKSPACE}\"],\n")
 	yaml.WriteString("                \"entrypoint\": \"sh\",\n")
 	yaml.WriteString("                \"entrypointArgs\": [\"-c\", \"sh ${RUNNER_TEMP}/gh-aw/safeoutputs/start_safe_outputs_mcp.sh\"],\n")
@@ -237,6 +355,18 @@ func renderSafeOutputsMCPConfigWithOptions(yaml *strings.Builder, isLast bool, i
 		{"GITHUB_TOKEN", "GITHUB_TOKEN", false},
 		{"GITHUB_WORKSPACE", "GITHUB_WORKSPACE", false},
 		{"RUNNER_TEMP", "RUNNER_TEMP", false},
+	}
+	if isWorkQueueEnabled(workflowData) {
+		envVars = append(envVars, struct {
+			name      string
+			value     string
+			isLiteral bool
+		}{"GH_AW_WORK_QUEUE_ENABLED", "true", true})
+		envVars = append(envVars, struct {
+			name      string
+			value     string
+			isLiteral bool
+		}{"GH_AW_WORK_QUEUE_ROLE", workQueueRuntimeRole(workflowData), true})
 	}
 
 	// Append GH_AW_INPUT_* vars referenced by the safe-outputs config so the nested

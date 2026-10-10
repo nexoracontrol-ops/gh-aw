@@ -25,7 +25,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: claude
 strict: true
 network:
   allowed:
@@ -35,11 +35,11 @@ imports:
   - shared/reporting.md
 tools:
   bash:
-    - "git status"
-    - "git log *"
-    - "git branch *"
-    - "git remote *"
-    - "echo *"
+    - "git status:*"
+    - "git log:*"
+    - "git branch:*"
+    - "git remote:*"
+    - "echo:*"
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   add-comment:
@@ -56,7 +56,6 @@ features:
   gh-aw-detection: false
 sandbox:
   agent:
-    runtime: cloud-hypervisor
     id: awf
 ---
 

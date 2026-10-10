@@ -9,6 +9,14 @@ import (
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
+func workQueueMCPToolNames(data *WorkflowData) []string {
+	tools := []string{"work_queue_read", "work_queue_explain"}
+	if workQueueRuntimeRole(data) != "observer" {
+		tools = append(tools, "work_queue_submit", "work_queue_dispatch_next", "work_queue_claim_finish")
+	}
+	return tools
+}
+
 func collectMCPServersForManifest(data *WorkflowData) []GHAWManifestMCPServer {
 	if data == nil {
 		return []GHAWManifestMCPServer{}
@@ -40,6 +48,10 @@ func collectMCPServersForManifest(data *WorkflowData) []GHAWManifestMCPServer {
 			add(constants.AgenticWorkflowsMCPServerID.String(), []string{"*"})
 		case "safe-outputs":
 			add(constants.SafeOutputsMCPServerID.String(), collectSafeOutputsManifestTools(data.SafeOutputs))
+		case "ledger":
+			add("ledger", []string{"ledger_append", "ledger_get", "ledger_query", "ledger_status"})
+		case "work-queue":
+			add(toolName, workQueueMCPToolNames(data))
 		case "mcp-scripts":
 			add(constants.MCPScriptsMCPServerID.String(), sliceutil.SortedKeys(data.MCPScripts.Tools))
 		case enclaveMCPServerName:
@@ -72,7 +84,10 @@ func collectGitHubMCPManifestTools(toolValue any) []string {
 		return githubConfig.Allowed.ToStringSlice()
 	}
 
-	githubTool, _ := toolValue.(map[string]any)
+	githubTool, ok := toolValue.(map[string]any)
+	if !ok {
+		githubTool = nil
+	}
 	defaultTools := constants.DefaultGitHubToolsLocal
 	if getGitHubType(githubTool) == GitHubMCPModeRemote {
 		defaultTools = constants.DefaultGitHubToolsRemote

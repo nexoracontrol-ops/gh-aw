@@ -11,9 +11,10 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -29,6 +30,9 @@ const (
 	defaultRepoMemoryMaxPatchSize = 10240
 	// maxRepoMemoryPatchSize is the maximum allowed value for max-patch-size (1MB).
 	maxRepoMemoryPatchSize = 1048576
+	// pushRepoMemoryTimeoutMinutes bounds the retry loop (about two minutes of
+	// capped jittered backoff) plus git/network overhead.
+	pushRepoMemoryTimeoutMinutes = 10
 )
 
 // Pre-compiled regexes for performance (avoid recompilation in hot paths)
@@ -58,6 +62,23 @@ type RepoMemoryEntry struct {
 	Wiki              bool                    `yaml:"wiki,omitempty"`               // use the GitHub Wiki git repository instead of the regular repo
 	FormatJSON        bool                    `yaml:"format-json,omitempty"`        // pretty-print all .json files before committing (default: false)
 	Validation        *MemoryValidationConfig `yaml:"validation,omitempty"`         // optional custom JavaScript validation hook
+	Ledger            *RepoMemoryLedgerConfig `yaml:"ledger,omitempty"`             // optional ledger projection
+}
+
+// RepoMemoryLedgerConfig enables the ledger projection for this memory.
+type RepoMemoryLedgerConfig struct {
+	Schema       string                            `yaml:"schema,omitempty"`
+	MaxShards    int                               `yaml:"max-shards,omitempty"`
+	MaxSegmentKB int                               `yaml:"max-segment-kb,omitempty"`
+	MaxRecordKB  int                               `yaml:"max-record-kb,omitempty"`
+	MaxPatchKB   int                               `yaml:"max-patch-kb,omitempty"`
+	Compaction   *RepoMemoryLedgerCompactionConfig `yaml:"compaction,omitempty"`
+}
+
+// RepoMemoryLedgerCompactionConfig bounds deterministic ledger compaction.
+type RepoMemoryLedgerCompactionConfig struct {
+	MinSegments int `yaml:"min-segments,omitempty" json:"minSegments"`
+	MaxSegments int `yaml:"max-segments,omitempty" json:"maxSegments"`
 }
 
 // RepoMemoryToolConfig represents the configuration for repo-memory in tools
@@ -104,9 +125,17 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 		if err != nil {
 			return nil, err
 		}
+		ledgerEnabled := false
+		for _, memory := range memories {
+			ledgerEnabled = ledgerEnabled || memory.Ledger != nil
+		}
+		if ledgerEnabled && len(memories) != 1 {
+			return nil, errors.New("tools.repo-memory.ledger requires exactly one repo-memory entry")
+		}
 		config.Memories = memories
 		return config, nil
 	}
+
 	if configMap, ok := repoMemoryValue.(map[string]any); ok {
 		if err := applyRepoMemoryBranchPrefix(configMap, config); err != nil {
 			return nil, err
@@ -119,6 +148,19 @@ func (c *Compiler) extractRepoMemoryConfig(toolsConfig *ToolsConfig, workflowID 
 		return config, nil
 	}
 	return nil, nil
+}
+
+func (config *RepoMemoryConfig) ledgerEntry() *RepoMemoryEntry {
+	if config == nil {
+		return nil
+	}
+	for _, memory := range config.Memories {
+		if memory.Ledger != nil {
+			entry := memory
+			return &entry
+		}
+	}
+	return nil
 }
 
 func newDefaultRepoMemoryEntry(workflowID, branchPrefix string) RepoMemoryEntry {
@@ -204,6 +246,31 @@ func parseRepoMemoryEntry(memoryMap map[string]any, workflowID, branchPrefix str
 		return RepoMemoryEntry{}, err
 	}
 	if err := applyRepoMemoryOptionalFields(&entry, memoryMap); err != nil {
+		return RepoMemoryEntry{}, err
+	}
+	if ledger, exists := memoryMap["ledger"]; exists {
+		config, err := parseRepoMemoryLedgerConfig(ledger)
+		if err != nil {
+			return RepoMemoryEntry{}, err
+		}
+		if !repoMemoryLedgerIDPattern.MatchString(entry.ID) {
+			return RepoMemoryEntry{}, errors.New("tools.repo-memory.ledger requires a memory id with only letters, numbers, hyphens or underscores")
+		}
+		hasJSONLExtension := false
+		for _, ext := range entry.AllowedExtensions {
+			hasJSONLExtension = hasJSONLExtension || strings.EqualFold(ext, ".jsonl")
+		}
+		if len(entry.AllowedExtensions) > 0 && !hasJSONLExtension {
+			return RepoMemoryEntry{}, errors.New("tools.repo-memory.ledger requires .jsonl in allowed-extensions to persist ledger records")
+		}
+		if len(entry.FileGlob) > 0 {
+			if !slices.Contains(entry.FileGlob, "ledger/shards/*.jsonl") {
+				entry.FileGlob = append(entry.FileGlob, "ledger/shards/*.jsonl")
+			}
+		}
+		entry.Ledger = config
+	}
+	if err := validateMemorySchemaTargets(entry.Validation, entry.AllowedExtensions, entry.FileGlob, "tools.repo-memory.validation"); err != nil {
 		return RepoMemoryEntry{}, err
 	}
 	finalizeRepoMemoryEntry(&entry, explicitBranchName)
@@ -361,9 +428,25 @@ func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowDa
 			memoryLabel = "wiki-memory"
 		}
 
-		generateRepoMemorySanitizeFilenamesStep(builder, memory, memoryDir, memoryLabel)
-		filterStepID := generateRepoMemoryFilterFilesStep(builder, memory, memoryDir, memoryLabel)
-		validationStepID := generateRepoMemoryCustomValidationStep(builder, memory, memoryDir, memoryLabel, filterStepID)
+		skipCondition := ""
+		if memory.Validation != nil {
+			checkID := memoryValidationStepID("check_repo_memory_baseline", memory.ID)
+			fmt.Fprintf(builder, "      - name: Check repo-memory baseline (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			fmt.Fprintf(builder, "        id: %s\n", checkID)                                  //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			builder.WriteString("        if: always()\n")
+			fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			builder.WriteString("        env:\n")
+			fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			fmt.Fprintf(builder, "          MEMORY_ID: %s\n", memory.ID)  //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			builder.WriteString("        with:\n")
+			builder.WriteString("          script: |\n")
+			builder.WriteString("            const { checkRepoMemoryBaseline } = require('${{ runner.temp }}/gh-aw/actions/validate_memory_step.cjs');\n")
+			builder.WriteString("            checkRepoMemoryBaseline(core);\n")
+			skipCondition = fmt.Sprintf("steps.%s.outputs.skip != 'true'", checkID)
+		}
+		generateRepoMemorySanitizeFilenamesStep(builder, memory, memoryDir, memoryLabel, skipCondition)
+		filterStepID := generateRepoMemoryFilterFilesStep(builder, memory, memoryDir, memoryLabel, skipCondition)
+		validationStepID := generateRepoMemoryCustomValidationStep(builder, memory, memoryDir, memoryLabel, filterStepID, skipCondition)
 		generateRepoMemoryUploadArtifactStep(builder, repoMemoryUploadStepParams{
 			memory:           memory,
 			memoryDir:        memoryDir,
@@ -372,6 +455,7 @@ func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowDa
 			prefix:           prefix,
 			filterStepID:     filterStepID,
 			validationStepID: validationStepID,
+			skipCondition:    skipCondition,
 			pinAction:        pinAction,
 		})
 	}
@@ -385,12 +469,12 @@ func generateRepoMemoryArtifactUpload(builder *strings.Builder, data *WorkflowDa
 // which causes the upload-artifact action to fail with a hard error.
 // The script uses git commands (git mv for tracked files, mv for untracked) since
 // repo-memory is backed by a git working tree.
-func generateRepoMemorySanitizeFilenamesStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel string) {
-	fmt.Fprintf(builder, "      - name: Sanitize %s filenames (%s)\n", memoryLabel, memory.ID)
-	builder.WriteString("        if: always()\n")
+func generateRepoMemorySanitizeFilenamesStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel, skipCondition string) {
+	fmt.Fprintf(builder, "      - name: Sanitize %s filenames (%s)\n", memoryLabel, memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "        if: always()%s\n", repoMemorySkipClause(skipCondition))      //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        continue-on-error: true\n")
 	builder.WriteString("        env:\n")
-	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
+	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/sanitize_repo_memory_filenames.sh\"\n")
 }
 
@@ -401,21 +485,21 @@ func generateRepoMemorySanitizeFilenamesStep(builder *strings.Builder, memory Re
 // downstream push all see the same effective file set.
 // It returns the step's ID (used to gate subsequent validation/upload steps on its
 // successful outcome), or "" when no filter is configured for this memory.
-func generateRepoMemoryFilterFilesStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel string) string {
+func generateRepoMemoryFilterFilesStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel, skipCondition string) string {
 	if len(memory.AllowedExtensions) == 0 && len(memory.FileGlob) == 0 {
 		return ""
 	}
 	filterStepID := repoMemoryFilterStepID(memory.ID)
-	allowedExtsJSON, _ := json.Marshal(memory.AllowedExtensions) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
-	fmt.Fprintf(builder, "      - name: Filter %s files (%s)\n", memoryLabel, memory.ID)
-	fmt.Fprintf(builder, "        id: %s\n", filterStepID)
-	builder.WriteString("        if: always()\n")
-	fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script"))
+	allowedExtsJSON, _ := json.Marshal(memory.AllowedExtensions)                          //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
+	fmt.Fprintf(builder, "      - name: Filter %s files (%s)\n", memoryLabel, memory.ID)  //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "        id: %s\n", filterStepID)                                //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "        if: always()%s\n", repoMemorySkipClause(skipCondition)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script"))     //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        env:\n")
-	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
-	fmt.Fprintf(builder, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON)
+	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)                 //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	if len(memory.FileGlob) > 0 {
-		fmt.Fprintf(builder, "          FILE_GLOB_FILTER: \"%s\"\n", strings.Join(memory.FileGlob, " "))
+		fmt.Fprintf(builder, "          FILE_GLOB_FILTER: \"%s\"\n", strings.Join(memory.FileGlob, " ")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
 	builder.WriteString("        with:\n")
 	builder.WriteString("          script: |\n")
@@ -429,24 +513,23 @@ func generateRepoMemoryFilterFilesStep(builder *strings.Builder, memory RepoMemo
 // skipped unless the filter step completed successfully, so a filter failure (e.g. an
 // fs error while removing ineligible files) can never result in the unfiltered directory
 // being validated.
-func generateRepoMemoryCustomValidationStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel, filterStepID string) string {
+func generateRepoMemoryCustomValidationStep(builder *strings.Builder, memory RepoMemoryEntry, memoryDir, memoryLabel, filterStepID, skipCondition string) string {
 	if memory.Validation == nil {
 		return ""
 	}
 	validationStepID := repoMemoryValidationStepID(memory.ID)
-	fmt.Fprintf(builder, "      - name: Validate %s domain content (%s)\n", memoryLabel, memory.ID)
-	fmt.Fprintf(builder, "        id: %s\n", validationStepID)
+	fmt.Fprintf(builder, "      - name: Validate %s domain content (%s)\n", memoryLabel, memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "        id: %s\n", validationStepID)                                      //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	if filterStepID != "" {
-		fmt.Fprintf(builder, "        if: always() && steps.%s.outcome == 'success'\n", filterStepID)
+		fmt.Fprintf(builder, "        if: always()%s && steps.%s.outcome == 'success'\n", repoMemorySkipClause(skipCondition), filterStepID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	} else {
-		builder.WriteString("        if: always()\n")
+		fmt.Fprintf(builder, "        if: always()%s\n", repoMemorySkipClause(skipCondition)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
-	fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script"))
+	fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        env:\n")
-	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
-	fmt.Fprintf(builder, "          MEMORY_ID: %s\n", memory.ID)
-	fmt.Fprintf(builder, "          VALIDATION_SCRIPT_B64: %s\n", memoryValidationScriptBase64(memory.Validation))
-	fmt.Fprintf(builder, "          VALIDATION_TIMEOUT_SECONDS: %d\n", memoryValidationTimeoutSeconds(memory.Validation))
+	fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "          MEMORY_ID: %s\n", memory.ID)  //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	appendMemoryValidationEnvironment(builder, memory.Validation)
 	if memory.FormatJSON {
 		builder.WriteString("          FORMAT_JSON: 'true'\n")
 	}
@@ -455,7 +538,7 @@ func generateRepoMemoryCustomValidationStep(builder *strings.Builder, memory Rep
 	builder.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
 	builder.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	builder.WriteString("            const { validateMemoryStep } = require('${{ runner.temp }}/gh-aw/actions/validate_memory_step.cjs');\n")
-	builder.WriteString("            validateMemoryStep(core, { kind: 'repo', formatJSON: process.env.FORMAT_JSON === 'true', requireValidationScript: true });\n")
+	builder.WriteString("            validateMemoryStep(core, { kind: 'repo', formatJSON: process.env.FORMAT_JSON === 'true', requireValidationScript: process.env.VALIDATION_SCRIPT_REQUIRED === 'true' });\n")
 	return validationStepID
 }
 
@@ -470,6 +553,7 @@ type repoMemoryUploadStepParams struct {
 	prefix           string
 	filterStepID     string
 	validationStepID string
+	skipCondition    string
 	pinAction        func(string) string
 }
 
@@ -478,8 +562,11 @@ type repoMemoryUploadStepParams struct {
 // when configured, so a filter or validation failure can never result in an unfiltered
 // or unvalidated directory being uploaded.
 func generateRepoMemoryUploadArtifactStep(builder *strings.Builder, p repoMemoryUploadStepParams) {
-	fmt.Fprintf(builder, "      - name: Upload %s artifact (%s)\n", p.memoryLabel, p.memory.ID)
+	fmt.Fprintf(builder, "      - name: Upload %s artifact (%s)\n", p.memoryLabel, p.memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	var conditions []string
+	if p.skipCondition != "" {
+		conditions = append(conditions, p.skipCondition)
+	}
 	if p.filterStepID != "" {
 		conditions = append(conditions, fmt.Sprintf("steps.%s.outcome == 'success'", p.filterStepID))
 	}
@@ -487,16 +574,23 @@ func generateRepoMemoryUploadArtifactStep(builder *strings.Builder, p repoMemory
 		conditions = append(conditions, fmt.Sprintf("steps.%s.outcome == 'success'", p.validationStepID))
 	}
 	if len(conditions) > 0 {
-		fmt.Fprintf(builder, "        if: always() && %s\n", strings.Join(conditions, " && "))
+		fmt.Fprintf(builder, "        if: always() && %s\n", strings.Join(conditions, " && ")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	} else {
 		builder.WriteString("        if: always()\n")
 	}
-	fmt.Fprintf(builder, "        uses: %s\n", p.pinAction("actions/upload-artifact"))
+	fmt.Fprintf(builder, "        uses: %s\n", p.pinAction("actions/upload-artifact")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        with:\n")
-	fmt.Fprintf(builder, "          name: %srepo-memory-%s\n", p.prefix, p.sanitizedID)
-	fmt.Fprintf(builder, "          path: %s\n", p.memoryDir)
+	fmt.Fprintf(builder, "          name: %srepo-memory-%s\n", p.prefix, p.sanitizedID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "          path: %s\n", p.memoryDir)                           //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("          retention-days: 1\n")
 	builder.WriteString("          if-no-files-found: ignore\n")
+}
+
+func repoMemorySkipClause(condition string) string {
+	if condition == "" {
+		return ""
+	}
+	return " && " + condition
 }
 
 func repoMemoryFilterStepID(memoryID string) string {
@@ -533,55 +627,48 @@ func generateRepoMemorySteps(builder *strings.Builder, data *WorkflowData) {
 
 		// Step 1: Clone the repo-memory branch
 		if memory.Wiki {
-			fmt.Fprintf(builder, "      - name: Clone wiki-memory branch (%s)\n", memory.ID)
+			fmt.Fprintf(builder, "      - name: Clone wiki-memory branch (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		} else {
-			fmt.Fprintf(builder, "      - name: Clone repo-memory branch (%s)\n", memory.ID)
+			fmt.Fprintf(builder, "      - name: Clone repo-memory branch (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		}
 		builder.WriteString("        env:\n")
 		builder.WriteString("          GH_TOKEN: ${{ github.token }}\n")
 		builder.WriteString("          GITHUB_SERVER_URL: ${{ github.server_url }}\n")
-		fmt.Fprintf(builder, "          BRANCH_NAME: %s\n", memory.BranchName)
-		fmt.Fprintf(builder, "          TARGET_REPO: %s\n", targetRepo)
-		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)
-		fmt.Fprintf(builder, "          CREATE_ORPHAN: %t\n", memory.CreateOrphan)
+		fmt.Fprintf(builder, "          BRANCH_NAME: %s\n", memory.BranchName)     //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(builder, "          TARGET_REPO: %s\n", targetRepo)            //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir)              //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(builder, "          CREATE_ORPHAN: %t\n", memory.CreateOrphan) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		builder.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clone_repo_memory_branch.sh\"\n")
 	}
 }
 
-// buildPushRepoMemoryConcurrencyGroup builds a concurrency group key that is scoped to the
-// specific (target-repo, branch) pairs being written by this push job.  Using the actual
-// write targets—rather than a single repo-wide key—ensures that workflows pushing to
-// different memory branches do not unnecessarily serialise or cancel each other.
-//
-// Key format: "push-repo-memory-${{ github.repository }}|<key1>[|<key2>…]"
-//
-// Each key component is percent-encoded (only `%` and `|` are encoded) before joining
-// with "|", so the separator is always unambiguous even if a user-supplied branch name
-// or target-repo contains a literal "|".  For memories that target a non-default
-// repository, the target repo is prepended to the branch name
-// (e.g., "other-owner%2Fother-repo:memory%2Fbranch" would be encoded if needed) so that
-// distinct targets produce distinct concurrency groups.  The branches are sorted for a
-// deterministic key regardless of the order memories are declared in the frontmatter.
-func buildPushRepoMemoryConcurrencyGroup(memories []RepoMemoryEntry) string {
-	branchKeys := make([]string, 0, len(memories))
-	for _, m := range memories {
-		key := encodeConcurrencyKeyPart(m.BranchName)
-		if m.TargetRepo != "" {
-			key = encodeConcurrencyKeyPart(m.TargetRepo) + ":" + key
-		}
-		branchKeys = append(branchKeys, key)
+func generateRepoMemoryBaselineValidationSteps(builder *strings.Builder, data *WorkflowData) {
+	if data.RepoMemoryConfig == nil || len(data.RepoMemoryConfig.Memories) == 0 {
+		return
 	}
-	sort.Strings(branchKeys)
-	return "push-repo-memory-${{ github.repository }}|" + strings.Join(branchKeys, "|")
+
+	for _, memory := range data.RepoMemoryConfig.Memories {
+		if memory.Validation == nil {
+			continue
+		}
+
+		memoryDir := constants.TmpRepoMemoryDir + memory.ID
+		fmt.Fprintf(builder, "      - name: Validate repo-memory baseline (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(builder, "        uses: %s\n", getActionPin("actions/github-script"))     //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		builder.WriteString("        env:\n")
+		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", memoryDir) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(builder, "          MEMORY_ID: %s\n", memory.ID)  //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		appendMemoryValidationEnvironment(builder, memory.Validation)
+		builder.WriteString("        with:\n")
+		builder.WriteString("          script: |\n")
+		builder.WriteString("            const { validateRepoMemoryBaseline } = require('${{ runner.temp }}/gh-aw/actions/validate_memory_step.cjs');\n")
+		builder.WriteString("            validateRepoMemoryBaseline(core);\n")
+	}
 }
 
-// encodeConcurrencyKeyPart percent-encodes the characters that would otherwise make the
-// concurrency group key ambiguous: "%" (to avoid double-encoding) and "|" (the separator).
-// All other characters are left as-is so the key remains human-readable in workflow UIs.
-func encodeConcurrencyKeyPart(s string) string {
-	s = strings.ReplaceAll(s, "%", "%25")
-	s = strings.ReplaceAll(s, "|", "%7C")
-	return s
+func generateRepoMemoryStepsForAgent(builder *strings.Builder, data *WorkflowData) {
+	generateRepoMemorySteps(builder, data)
+	generateRepoMemoryBaselineValidationSteps(builder, data)
 }
 
 // buildPushRepoMemoryJob creates a job that downloads repo-memory artifacts and pushes them to git branches
@@ -598,6 +685,8 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 	steps := c.buildPushRepoMemorySetupAndCheckoutSteps(data, setupActionRef)
 	_, hasConsolidatedSafeOutputsJob := c.jobManager.GetJob(string(constants.SafeOutputsJobName))
 	steps = append(steps, c.buildPushRepoMemoryDownloadSteps(data, hasConsolidatedSafeOutputsJob)...)
+	hasEvals := data.Evals != nil && data.Evals.HasEvals()
+	steps = append(steps, c.generateDailyAICRepoMemoryLedgerSteps(data, hasEvals)...)
 
 	useRequire := setupActionRef != ""
 	for _, memory := range data.RepoMemoryConfig.Memories {
@@ -611,20 +700,29 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 	if hasConsolidatedSafeOutputsJob {
 		jobNeeds = append(jobNeeds, string(constants.SafeOutputsJobName))
 	}
+	if hasEvals {
+		jobNeeds = append(jobNeeds, string(constants.EvalsJobName))
+	}
 	outputs := buildPushRepoMemoryOutputs(data.RepoMemoryConfig.Memories)
-	concurrencyGroup := buildPushRepoMemoryConcurrencyGroup(data.RepoMemoryConfig.Memories)
-	concurrency := c.indentYAMLLines(fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", concurrencyGroup), "    ")
+
+	// No job-level concurrency group is set here on purpose. GitHub Actions keeps at
+	// most one running and one pending job per concurrency group: when more than two
+	// runs sharing a memory branch finish close together, every additional pending job
+	// is cancelled and its memory writes are silently lost. Instead of serialising the
+	// pushes, the push script converges optimistically: createCommitOnBranch is a
+	// compare-and-swap on the expected head OID, and a rejected push re-reads the remote
+	// head, rebases with a JSONL merge=union policy and retries with exponential backoff.
 
 	return &Job{
-		Name:        pushRepoMemoryJobName,
-		DisplayName: "",
-		RunsOn:      c.formatFrameworkJobRunsOn(data),
-		If:          jobCondition,
-		Permissions: "permissions:\n      contents: write",
-		Concurrency: concurrency,
-		Needs:       jobNeeds,
-		Steps:       steps,
-		Outputs:     outputs,
+		Name:           pushRepoMemoryJobName,
+		DisplayName:    "",
+		RunsOn:         c.formatFrameworkJobRunsOn(data),
+		If:             jobCondition,
+		Permissions:    "permissions:\n      contents: write",
+		TimeoutMinutes: pushRepoMemoryTimeoutMinutes,
+		Needs:          jobNeeds,
+		Steps:          steps,
+		Outputs:        outputs,
 	}, nil
 }
 
@@ -635,11 +733,11 @@ func (c *Compiler) buildPushRepoMemorySetupAndCheckoutSteps(data *WorkflowData, 
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 		repoMemoryTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		repoMemoryParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, repoMemoryTraceID, repoMemoryParentSpanID)...)
+		steps = append(steps, c.generateSetupStepForJob("push_repo_memory", data, setupActionRef, SetupActionDestination, false, repoMemoryTraceID, repoMemoryParentSpanID, "")...)
 	}
 	var checkoutStep strings.Builder
 	checkoutStep.WriteString("      - name: Checkout repository\n")
-	fmt.Fprintf(&checkoutStep, "        uses: %s\n", getActionPin("actions/checkout"))
+	fmt.Fprintf(&checkoutStep, "        uses: %s\n", getActionPin("actions/checkout")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	checkoutStep.WriteString("        with:\n")
 	checkoutStep.WriteString("          persist-credentials: false\n")
 	checkoutStep.WriteString("          sparse-checkout: .\n")
@@ -665,15 +763,15 @@ func (c *Compiler) buildPushRepoMemoryDownloadSteps(data *WorkflowData, hasConso
 		sanitizedID := SanitizeWorkflowIDForCacheKey(memory.ID)
 		var step strings.Builder
 		if memory.Wiki {
-			fmt.Fprintf(&step, "      - name: Download wiki-memory artifact (%s)\n", memory.ID)
+			fmt.Fprintf(&step, "      - name: Download wiki-memory artifact (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		} else {
-			fmt.Fprintf(&step, "      - name: Download repo-memory artifact (%s)\n", memory.ID)
+			fmt.Fprintf(&step, "      - name: Download repo-memory artifact (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		}
-		fmt.Fprintf(&step, "        uses: %s\n", c.getActionPin("actions/download-artifact"))
+		fmt.Fprintf(&step, "        uses: %s\n", c.getActionPin("actions/download-artifact")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		step.WriteString("        continue-on-error: true\n")
 		step.WriteString("        with:\n")
-		fmt.Fprintf(&step, "          name: %srepo-memory-%s\n", repoMemoryPrefix, sanitizedID)
-		fmt.Fprintf(&step, "          path: /tmp/gh-aw/repo-memory/%s\n", memory.ID)
+		fmt.Fprintf(&step, "          name: %srepo-memory-%s\n", repoMemoryPrefix, sanitizedID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		fmt.Fprintf(&step, "          path: /tmp/gh-aw/repo-memory/%s\n", memory.ID)            //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		steps = append(steps, step.String())
 	}
 	return steps
@@ -695,37 +793,35 @@ func (c *Compiler) buildSinglePushRepoMemoryStep(data *WorkflowData, memory Repo
 	}
 	var step strings.Builder
 	if memory.Wiki {
-		fmt.Fprintf(&step, "      - name: Push wiki-memory changes (%s)\n", memory.ID)
+		fmt.Fprintf(&step, "      - name: Push wiki-memory changes (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	} else {
-		fmt.Fprintf(&step, "      - name: Push repo-memory changes (%s)\n", memory.ID)
+		fmt.Fprintf(&step, "      - name: Push repo-memory changes (%s)\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
-	fmt.Fprintf(&step, "        id: push_repo_memory_%s\n", memory.ID)
+	fmt.Fprintf(&step, "        id: push_repo_memory_%s\n", memory.ID) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	step.WriteString("        if: always()\n")
-	fmt.Fprintf(&step, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	fmt.Fprintf(&step, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	step.WriteString("        env:\n")
 	step.WriteString(buildRepoMemoryGitHubEnv(data, hasConsolidatedSafeOutputsJob))
-	fmt.Fprintf(&step, "          ARTIFACT_DIR: %s\n", artifactDir)
-	fmt.Fprintf(&step, "          MEMORY_ID: %s\n", memory.ID)
-	fmt.Fprintf(&step, "          TARGET_REPO: %s\n", targetRepo)
-	fmt.Fprintf(&step, "          BRANCH_NAME: %s\n", memory.BranchName)
+	fmt.Fprintf(&step, "          ARTIFACT_DIR: %s\n", artifactDir)      //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(&step, "          MEMORY_ID: %s\n", memory.ID)           //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(&step, "          TARGET_REPO: %s\n", targetRepo)        //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(&step, "          BRANCH_NAME: %s\n", memory.BranchName) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	if memory.Wiki {
-		fmt.Fprintf(&step, "          REPO_MEMORY_ALLOWED_REPOS: %s\n", targetRepo)
+		fmt.Fprintf(&step, "          REPO_MEMORY_ALLOWED_REPOS: %s\n", targetRepo) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
-	fmt.Fprintf(&step, "          MAX_FILE_SIZE: %d\n", memory.MaxFileSize)
-	fmt.Fprintf(&step, "          MAX_FILE_COUNT: %d\n", memory.MaxFileCount)
-	fmt.Fprintf(&step, "          MAX_PATCH_SIZE: %d\n", memory.MaxPatchSize)
-	allowedExtsJSON, _ := json.Marshal(memory.AllowedExtensions) //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
-	fmt.Fprintf(&step, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON)
+	fmt.Fprintf(&step, "          MAX_FILE_SIZE: %d\n", memory.MaxFileSize)     //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(&step, "          MAX_FILE_COUNT: %d\n", memory.MaxFileCount)   //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(&step, "          MAX_PATCH_SIZE: %d\n", memory.MaxPatchSize)   //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	allowedExtsJSON, _ := json.Marshal(memory.AllowedExtensions)                //nolint:jsonmarshalignoredeerror // marshaling a string slice cannot fail
+	fmt.Fprintf(&step, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	if fileGlobFilter != "" {
-		fmt.Fprintf(&step, "          FILE_GLOB_FILTER: \"%s\"\n", fileGlobFilter)
+		fmt.Fprintf(&step, "          FILE_GLOB_FILTER: \"%s\"\n", fileGlobFilter) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
 	if memory.FormatJSON {
 		step.WriteString("          FORMAT_JSON: 'true'\n")
 	}
-	if memory.Validation != nil {
-		fmt.Fprintf(&step, "          VALIDATION_SCRIPT_B64: %s\n", memoryValidationScriptBase64(memory.Validation))
-		fmt.Fprintf(&step, "          VALIDATION_TIMEOUT_SECONDS: %d\n", memoryValidationTimeoutSeconds(memory.Validation))
-	}
+	appendMemoryValidationEnvironment(&step, memory.Validation)
+	appendRepoMemoryLedgerLimitsEnv(&step, memory.Ledger)
 	step.WriteString("        with:\n")
 	step.WriteString("          script: |\n")
 	step.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -741,6 +837,20 @@ func (c *Compiler) buildSinglePushRepoMemoryStep(data *WorkflowData, memory Repo
 	return step.String()
 }
 
+func appendRepoMemoryLedgerLimitsEnv(step *strings.Builder, ledger *RepoMemoryLedgerConfig) {
+	if ledger != nil {
+		if ledger.MaxSegmentKB > 0 {
+			fmt.Fprintf(step, "          GH_AW_LEDGER_MAX_SEGMENT_KB: %d\n", ledger.MaxSegmentKB) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		}
+		if ledger.MaxRecordKB > 0 {
+			fmt.Fprintf(step, "          GH_AW_LEDGER_MAX_RECORD_KB: %d\n", ledger.MaxRecordKB) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		}
+		if ledger.MaxPatchKB > 0 {
+			fmt.Fprintf(step, "          GH_AW_LEDGER_MAX_PATCH_KB: %d\n", ledger.MaxPatchKB) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		}
+	}
+}
+
 func buildRepoMemoryGitHubEnv(data *WorkflowData, hasConsolidatedSafeOutputsJob bool) string {
 	env := "          GH_TOKEN: ${{ github.token }}\n" +
 		"          GITHUB_RUN_ID: ${{ github.run_id }}\n" +
@@ -753,18 +863,19 @@ func buildRepoMemoryGitHubEnv(data *WorkflowData, hasConsolidatedSafeOutputsJob 
 
 // buildPushRepoMemoryJobCondition computes the job condition and needs list.
 func (c *Compiler) buildPushRepoMemoryJobCondition(threatDetectionEnabled bool) (string, []string) {
-	agentSucceeded := BuildEquals(
+	agentCompleted := BuildNotEquals(
 		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.AgentJobName)),
-		BuildStringLiteral("success"),
+		BuildStringLiteral("skipped"),
 	)
 	notCancelled := &NotNode{Child: BuildFunctionCall("cancelled")}
 	jobNeeds := []string{string(constants.AgentJobName), string(constants.ActivationJobName)}
 	var jobCondition string
 	if threatDetectionEnabled {
-		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), buildDetectionPassedCondition()), agentSucceeded))
+		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), buildDetectionPassedCondition()), agentCompleted))
 		jobNeeds = append(jobNeeds, string(constants.DetectionJobName))
 	} else {
-		jobCondition = RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), agentSucceeded))
+		// Without a detection job, only cancellation prevents this cleanup job from running.
+		jobCondition = RenderCondition(BuildAnd(BuildFunctionCall("always"), notCancelled))
 	}
 	return jobCondition, jobNeeds
 }

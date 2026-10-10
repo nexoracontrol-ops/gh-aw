@@ -16,8 +16,12 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Service Ports
-engine: pi
-model: copilot/auto
+engine:
+  id: pi
+  fallback-models:
+    - copilot/gpt-5.4
+    - copilot/gpt-5.4-mini
+model: copilot/gpt-5.3-codex
 strict: true
 sandbox:
   agent:
@@ -54,6 +58,9 @@ imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
   - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: agent-stdio
 features:
   gh-aw-detection: false
 ---

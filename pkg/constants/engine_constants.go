@@ -22,6 +22,8 @@ const (
 	CodexEngine EngineName = "codex"
 	// GeminiEngine is the Google Gemini engine identifier
 	GeminiEngine EngineName = "gemini"
+	// AgyEngine is the experimental Google Antigravity CLI engine identifier.
+	AgyEngine EngineName = "agy"
 	// PiEngine is the Pi engine identifier
 	PiEngine EngineName = "pi"
 
@@ -34,7 +36,7 @@ const (
 // Deprecated: Use workflow.NewEngineCatalog(workflow.NewEngineRegistry()).IDs() for a
 // catalog-derived list. This slice is maintained for backward compatibility and must
 // stay in sync with the built-in engines registered in NewEngineCatalog.
-var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(PiEngine)}
+var AgenticEngines = []string{string(AgyEngine), string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(PiEngine)}
 
 // EngineOption represents a selectable AI engine with its display metadata and secret configuration
 type EngineOption struct {
@@ -81,18 +83,26 @@ var EngineOptions = []EngineOption{
 	},
 	{
 		Value:       string(GeminiEngine),
-		Label:       "Gemini",
-		Description: "Google Gemini CLI coding agent",
+		Label:       "Gemini (Deprecated)",
+		Description: "Deprecated Google Gemini CLI; use the experimental agy engine where supported",
 		SecretName:  GeminiAPIKey,
 		KeyURL:      "https://aistudio.google.com/app/apikey",
 		WhenNeeded:  "Gemini engine workflows",
+	},
+	{
+		Value:       string(AgyEngine),
+		Label:       "Google Antigravity CLI (Experimental)",
+		Description: "Experimental native Agy CLI with Gemini API-key authentication",
+		SecretName:  GeminiAPIKey,
+		KeyURL:      "https://aistudio.google.com/app/apikey",
+		WhenNeeded:  "Experimental Agy engine workflows (API key only)",
 	},
 	{
 		Value:              string(PiEngine),
 		Label:              "Pi",
 		Description:        "Pi AI coding agent",
 		SecretName:         CopilotGitHubToken,
-		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
+		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey, GeminiAPIKey},
 		KeyURL:             "https://github.com/settings/personal-access-tokens/new",
 		WhenNeeded:         "Pi engine workflows",
 	},
@@ -311,10 +321,9 @@ const (
 	// "auto" lets the Copilot API select the best available model automatically.
 	CopilotBYOKDefaultModel = "auto"
 
-	// CodexDefaultModel is the default model for the Codex agentic engine.
-	// Used as the fallback when no explicit model is configured and the
-	// GH_AW_MODEL_AGENT_CODEX / GH_AW_MODEL_DETECTION_CODEX variable is unset.
-	CodexDefaultModel = "gpt-5.4"
+	// CodexDefaultModel leaves model selection to explicit configuration or Codex itself.
+	// gh-aw must not introduce an unsanctioned terminal model into fallback chains.
+	CodexDefaultModel = ""
 
 	// AgentDefaultModel is the model display string returned for engines whose model is
 	// dynamically determined by the AI provider (e.g. Claude, Gemini, Pi).

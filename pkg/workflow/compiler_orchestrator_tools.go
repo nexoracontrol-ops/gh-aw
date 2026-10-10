@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/setutil"
@@ -37,6 +38,7 @@ type toolsProcessingResult struct {
 	safeOutputs           *SafeOutputsConfig
 	secretMasking         *SecretMaskingConfig
 	parsedFrontmatter     *FrontmatterConfig
+	subAgentModels        []parser.SubAgentModel
 	hasExplicitGitHubTool bool // true if tools.github was explicitly configured in frontmatter
 }
 
@@ -62,6 +64,9 @@ func (c *Compiler) resolveToolsAndConfig(result *parser.FrontmatterResult, markd
 	}
 	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
 	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
+	if safeOutputs != nil && safeOutputs.claimAdaptersParseError != nil {
+		return nil, safeOutputs.claimAdaptersParseError
+	}
 	secretMasking, err := c.resolveSecretMasking(result.Frontmatter, importsResult)
 	if err != nil {
 		return nil, err
@@ -112,6 +117,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		return nil, err
 	}
 	parsedFrontmatter := c.tryParseFrontmatterConfig(result.Frontmatter)
+	subAgentModels := parser.ExtractSubAgentModels(result.Markdown)
 
 	return &toolsProcessingResult{
 		tools:                 config.toolsData.tools,
@@ -135,6 +141,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		safeOutputs:           config.safeOutputs,
 		secretMasking:         config.secretMasking,
 		parsedFrontmatter:     parsedFrontmatter,
+		subAgentModels:        subAgentModels,
 		hasExplicitGitHubTool: config.toolsData.hasExplicitGitHubTool,
 	}, nil
 }
@@ -376,25 +383,56 @@ func (c *Compiler) warnDeprecatedAPMImports(frontmatter map[string]any) {
 }
 
 func (c *Compiler) adjustToolsForEngineCapabilities(frontmatter map[string]any, agenticEngine CodingAgentEngine, tools map[string]any) map[string]any {
-	if agenticEngine.GetCapabilities().ToolsAllowlist {
+	capabilities := agenticEngine.GetCapabilities()
+	// Engines without native MCP use CLI proxies, which retain their own tool configuration.
+	if capabilities.ToolsAllowlist || !capabilities.MCP {
+		return tools
+	}
+	// Agy's gateway enforces MCP configuration independently of its fixed
+	// native permission profile. Unsupported native restrictions fail below.
+	if agenticEngine.GetID() == string(constants.AgyEngine) {
 		return tools
 	}
 	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
 	c.IncrementWarningCount()
 	if _, hasTools := frontmatter["tools"]; hasTools {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())))
+		message := fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())
+		if _, hasQueue := tools["work-queue"]; hasQueue {
+			message = fmt.Sprintf("Native tool allow-list ignored for engine: %s; work-queue controls and CLI transport remain enabled", agenticEngine.GetID())
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(message))
 		c.IncrementWarningCount()
 	}
-	return map[string]any{"github": map[string]any{}}
+	// Queue assignment and CLI transport are framework controls, not native
+	// engine tool allow-list entries. Preserve them for dispatch-only workers.
+	fallback := map[string]any{"github": map[string]any{}}
+	if queue, ok := tools["work-queue"]; ok {
+		fallback["work-queue"] = queue
+	}
+	if proxy, ok := tools["cli-proxy"]; ok {
+		fallback["cli-proxy"] = proxy
+	}
+	return fallback
 }
 
 func (c *Compiler) validateEngineToolRequirements(frontmatter map[string]any, agenticEngine CodingAgentEngine, tools map[string]any) error {
+	if agenticEngine.GetID() == string(constants.AgyEngine) {
+		for _, name := range []string{"edit", "web-fetch", "web-search"} {
+			if disabled, ok := tools[name].(bool); ok && !disabled {
+				return fmt.Errorf("experimental agy cannot enforce tools.%s: false; its native permission profile enables tools inside the outer sandbox", name)
+			}
+		}
+	}
+	parsedTools := NewTools(tools)
+	if err := parsedTools.ParseError(); err != nil {
+		return err
+	}
 	validators := []func() error{
 		func() error { return c.validateMaxTurnsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateMaxContinuationsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateMaxToolDenialsSupport(frontmatter, agenticEngine) },
+		func() error { return c.validateMaxToolCallsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateUniversalLLMConsumerModel(frontmatter, agenticEngine) },
-		func() error { return c.validatePiEngineRequirements(NewTools(tools), agenticEngine) },
 		func() error { return c.validateBashCommandAllowlistSupport(tools, agenticEngine) },
 	}
 	for _, validator := range validators {
@@ -402,7 +440,7 @@ func (c *Compiler) validateEngineToolRequirements(frontmatter map[string]any, ag
 			return err
 		}
 	}
-	c.validateWebSearchSupport(tools, agenticEngine)
+	c.validateWebSearchSupport(frontmatter, tools, agenticEngine)
 	c.validateBareModeSupport(frontmatter, agenticEngine)
 	return nil
 }

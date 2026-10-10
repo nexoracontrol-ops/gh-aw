@@ -28,6 +28,9 @@ type buildMaintenanceWorkflowYAMLOptions struct {
 	compileGitHubToken  string
 	createCompilePR     bool
 	copilotOrgBilling   bool // all Copilot workflows use copilot-requests: write (GITHUB_TOKEN); COPILOT_GITHUB_TOKEN is not required
+	compactionLedgers   []LedgerConfig
+	hasWorkQueue        bool
+	hasCacheMemory      bool
 }
 
 // buildMaintenanceWorkflowYAML generates the complete YAML content for the
@@ -47,7 +50,9 @@ func buildMaintenanceWorkflowYAML(
 	yaml.WriteString(buildMaintenanceWorkflowHeaderYAML(opts))
 	yaml.WriteString(buildMaintenanceWorkflowTriggerYAML(opts, labelDisableJobEnabled, labelApplySafeOutputsJobEnabled, appliedRunURLDescription, appliedRunURLValue))
 	yaml.WriteString(buildMaintenanceCloseExpiredJobs(opts, setupActionRef))
-	yaml.WriteString(buildMaintenanceCleanupCacheJob(opts, setupActionRef))
+	if opts.hasCacheMemory {
+		yaml.WriteString(buildMaintenanceCleanupCacheJob(opts, setupActionRef))
+	}
 	yaml.WriteString(buildMaintenanceRunOperationJob(ctx, opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceUpdatePRBranchesJob(opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceApplySafeOutputsJob(opts, setupActionRef))
@@ -58,6 +63,14 @@ func buildMaintenanceWorkflowYAML(
 	yaml.WriteString(buildMaintenanceValidateWorkflowsJob(ctx, opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceLabelTriggeredJobs(opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceDevOnlyJobs(ctx, opts, setupActionRef))
+	ledgerJobs, err := buildMaintenanceLedgerCompactionJobs(opts, setupActionRef)
+	if err != nil {
+		return "", err
+	}
+	yaml.WriteString(ledgerJobs)
+	if opts.hasWorkQueue {
+		yaml.WriteString(buildMaintenanceWorkQueueCompactionJobs(opts, setupActionRef))
+	}
 	finalYAML, err := finalizeRunnerTempSafety(yaml.String())
 	if err != nil {
 		return "", fmt.Errorf("runner temp safety: %w", err)
@@ -79,8 +92,9 @@ func buildMaintenanceWorkflowHeaderYAML(opts buildMaintenanceWorkflowYAMLOptions
 	customInstructions := `This file defines the generated agentic maintenance workflow for this repository.
 It runs scheduled cleanup for expiring safe outputs and supports manual maintenance operations.
 
-This workflow is generated automatically when workflows use expiring safe outputs
-or when repository maintenance features are enabled in .github/workflows/aw.json.
+This workflow is generated automatically when workflows use expiring safe outputs,
+when workflows declare compaction-enabled ledgers (tools.ledger), or when repository
+maintenance features are enabled in .github/workflows/aw.json.
 
 To disable maintenance workflow generation, set in .github/workflows/aw.json:
   {"maintenance": false}
@@ -88,11 +102,15 @@ To disable maintenance workflow generation, set in .github/workflows/aw.json:
 Agentic maintenance docs:
   https://github.github.com/gh-aw/reference/ephemerals/#manual-maintenance-operations`
 
+	scheduleBasis := "based on minimum expires: " + strconv.Itoa(opts.minExpiresDays) + " days"
+	if opts.minExpiresDays <= 0 {
+		scheduleBasis = "for queue compaction"
+	}
 	return GenerateWorkflowHeader("", "pkg/workflow/maintenance_workflow.go", customInstructions) + `name: Agentic Maintenance
 
 on:
   schedule:
-    - cron: "` + opts.cronSchedule + `"  # ` + opts.scheduleDesc + ` (based on minimum expires: ` + strconv.Itoa(opts.minExpiresDays) + ` days)
+    - cron: "` + opts.cronSchedule + `"  # ` + opts.scheduleDesc + ` (` + scheduleBasis + `)
 `
 }
 
@@ -112,14 +130,34 @@ func buildMaintenanceWorkflowTriggerYAML(
 		maintenanceWorkflowYAMLLog.Print("Adding issues:labeled trigger for label-triggered maintenance jobs")
 		yaml.WriteString("  issues:\n    types: [labeled]\n")
 	}
-	yaml.WriteString(buildMaintenanceDispatchInputsYAML())
-	yaml.WriteString(buildMaintenanceWorkflowCallYAML(appliedRunURLDescription, appliedRunURLValue))
-	yaml.WriteString("\npermissions: {}\n\njobs:\n")
+	hasLedgers := len(opts.compactionLedgers) > 0
+	yaml.WriteString(buildMaintenanceDispatchInputsYAML(hasLedgers, opts.hasCacheMemory))
+	yaml.WriteString(buildMaintenanceWorkflowCallYAML(appliedRunURLDescription, appliedRunURLValue, hasLedgers, opts.hasCacheMemory, opts.maintenanceConfig))
+	yaml.WriteString("\n# Jobs request only the permissions needed for their individual maintenance operations.\npermissions: {}\n\n# Serialize maintenance runs to avoid overlapping writes to repository resources.\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.repository }}\n  cancel-in-progress: false\n\njobs:\n")
 	return yaml.String()
 }
 
+// maintenanceLedgerInputDescription documents the ledger input used by compact_ledger.
+const maintenanceLedgerInputDescription = "Ledger name to compact when operation is compact_ledger (empty compacts every due ledger)."
+
 // buildMaintenanceDispatchInputsYAML returns the workflow_dispatch trigger block.
-func buildMaintenanceDispatchInputsYAML() string {
+// When compaction-enabled ledgers exist, it adds the compact_ledger operation and a ledger input.
+func buildMaintenanceDispatchInputsYAML(hasLedgers, hasCacheMemory bool) string {
+	ledgerOption := ""
+	ledgerInput := ""
+	cacheOption := ""
+	if hasCacheMemory {
+		cacheOption = "          - 'clean_cache_memories'\n"
+	}
+	if hasLedgers {
+		ledgerOption = "          - '" + maintenanceCompactLedgerOperation + "'\n"
+		ledgerInput = `      ledger:
+        description: '` + maintenanceLedgerInputDescription + `'
+        required: false
+        type: string
+        default: ''
+`
+	}
 	return fmt.Sprintf(`  workflow_dispatch:
     inputs:
       operation:
@@ -137,24 +175,39 @@ func buildMaintenanceDispatchInputsYAML() string {
           - 'create_labels'
           - 'activity_report'
           - 'close_agentic_workflows_issues'
-          - 'clean_cache_memories'
-          - 'update_pull_request_branches'
+%[4]s          - 'update_pull_request_branches'
           - 'validate'
           - 'forecast'
-      run_url:
+%[2]s      run_url:
         description: 'Run URL or run ID to replay safe outputs from (e.g. https://github.com/owner/repo/actions/runs/12345 or 12345). Required when operation is safe_outputs.'
         required: false
         type: string
         default: ''
-`, maintenanceNoOperationValue)
+%[3]s`, maintenanceNoOperationValue, ledgerOption, ledgerInput, cacheOption)
 }
 
 // buildMaintenanceWorkflowCallYAML returns the workflow_call trigger block.
-func buildMaintenanceWorkflowCallYAML(appliedRunURLDescription, appliedRunURLValue string) string {
+func buildMaintenanceWorkflowCallYAML(appliedRunURLDescription, appliedRunURLValue string, hasLedgers, hasCacheMemory bool, config *MaintenanceConfig) string {
+	operations := "disable, enable, update, upgrade, safe_outputs, create_labels, activity_report, close_agentic_workflows_issues"
+	if hasCacheMemory {
+		operations += ", clean_cache_memories"
+	}
+	operations += ", update_pull_request_branches, validate, forecast"
+	completedOperation := maintenanceCompletedOperationExpression(hasLedgers, hasCacheMemory, config)
+	ledgerInput := ""
+	if hasLedgers {
+		operations += ", " + maintenanceCompactLedgerOperation
+		ledgerInput = `      ledger:
+        description: '` + maintenanceLedgerInputDescription + `'
+        required: false
+        type: string
+        default: ''
+`
+	}
 	return `  workflow_call:
     inputs:
       operation:
-        description: 'Optional maintenance operation to run (disable, enable, update, upgrade, safe_outputs, create_labels, activity_report, close_agentic_workflows_issues, clean_cache_memories, update_pull_request_branches, validate, forecast)'
+        description: 'Optional maintenance operation to run (` + operations + `)'
         required: false
         type: string
         default: ''
@@ -163,12 +216,43 @@ func buildMaintenanceWorkflowCallYAML(appliedRunURLDescription, appliedRunURLVal
         required: false
         type: string
         default: ''
-    outputs:
+` + ledgerInput + `    outputs:
       operation_completed:
         description: 'The maintenance operation that was completed (empty when none ran or a scheduled job ran)'
-        value: ${{ jobs.run_operation.outputs.operation || inputs.operation }}
+        value: ` + completedOperation + `
       applied_run_url:
         description: '` + appliedRunURLDescription + `'
         value: ` + appliedRunURLValue + `
 `
+}
+
+func maintenanceCompletedOperationExpression(hasLedgers, hasCacheMemory bool, config *MaintenanceConfig) string {
+	enabledOperations := []string{}
+	for _, operation := range []struct{ name, job string }{
+		{"safe_outputs", "apply_safe_outputs"},
+		{"create_labels", "create_labels"},
+		{"activity_report", "activity_report"},
+		{"close_agentic_workflows_issues", "close_agentic_workflows_issues"},
+		{"update_pull_request_branches", "update_pull_request_branches"},
+		{"validate", "validate_workflows"},
+		{"forecast", "forecast_report"},
+	} {
+		if !config.IsJobDisabled(operation.job) {
+			enabledOperations = append(enabledOperations, "inputs.operation == '"+operation.name+"'")
+		}
+	}
+	if hasCacheMemory && !config.IsJobDisabled("cleanup-cache-memory") {
+		enabledOperations = append(enabledOperations, "inputs.operation == 'clean_cache_memories'")
+	}
+	if hasLedgers {
+		enabledOperations = append(enabledOperations, "inputs.operation == '"+maintenanceCompactLedgerOperation+"'")
+	}
+	completion := "''"
+	if len(enabledOperations) > 0 {
+		completion = "(" + strings.Join(enabledOperations, " || ") + ") && inputs.operation || ''"
+	}
+	if !config.IsJobDisabled("run_operation") {
+		completion = "jobs.run_operation.outputs.operation || " + completion
+	}
+	return "${{ " + completion + " }}"
 }

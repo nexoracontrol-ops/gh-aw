@@ -1,10 +1,19 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { parseRequiredPermissions, parseAllowedBots, checkRepositoryPermission, checkBotStatus, isAllowedBot, isConfusedDeputyAttack } = require("./check_permissions_utils.cjs");
+const { parseRequiredPermissions, parseAllowedBots, canonicalizeBotIdentifier, checkRepositoryPermission, checkBotStatus, isAllowedBot, isConfusedDeputyAttack } = require("./check_permissions_utils.cjs");
 const { writeDenialSummary } = require("./pre_activation_summary.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { withRetry, isTransientError } = require("./error_recovery.cjs");
+
+function isCopilotPullRequestActor(eventName, actor) {
+  if (eventName !== "pull_request" && eventName !== "pull_request_target") {
+    return false;
+  }
+  const canonicalActor = canonicalizeBotIdentifier(actor);
+  const copilotBotNames = process.env.GH_AW_COPILOT_BOT_NAMES?.split(",").filter(Boolean) ?? [];
+  return copilotBotNames.some(name => canonicalizeBotIdentifier(name) === canonicalActor);
+}
 
 /**
  * Attempt to authorize the actor via the bots allowlist.
@@ -19,16 +28,19 @@ const { withRetry, isTransientError } = require("./error_recovery.cjs");
  * @param {string[]} allowedBots
  * @param {string} owner
  * @param {string} repo
+ * @param {{ installationCheckOptional?: boolean }} [options] - When `installationCheckOptional`
+ *   is true, an allowlisted bot is authorized even if the collaborator lookup does not report it
+ *   as installed. This is used for `repository_dispatch`, where GitHub App identities are not
+ *   listed as collaborators but sending the event already requires `contents: write` access.
  * @returns {Promise<{ handled: boolean }>}
  */
-async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo) {
+async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, options = {}) {
   if (allowedBots.length === 0 || !isAllowedBot(actorToValidate, allowedBots)) {
     return { handled: false };
   }
 
   core.info(`Actor '${actorToValidate}' matched the allowed bots list: ${allowedBots.join(", ")}`);
 
-  // Verify the bot is active/installed on the repository
   const botStatus = await checkBotStatus(actorToValidate, owner, repo);
 
   if (botStatus.isBot && botStatus.isActive) {
@@ -38,6 +50,15 @@ async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owne
     core.setOutput("user_permission", "bot");
     return { handled: true };
   } else if (botStatus.isBot && !botStatus.isActive) {
+    // Only bypass when the lookup conclusively reported "not a collaborator" (no error field).
+    // Transient failures (5xx, rate limiting) set `error` and must not grant authorization.
+    if (options.installationCheckOptional && botStatus.error === undefined) {
+      core.info(`✅ Bot '${actorToValidate}' is allowlisted and is not listed as a collaborator; authorizing because this event already requires write access to the repository`);
+      core.setOutput("is_team_member", "true");
+      core.setOutput("result", "authorized_bot");
+      core.setOutput("user_permission", "bot");
+      return { handled: true };
+    }
     const errorMessage = `Access denied: Bot '${actorToValidate}' is not active/installed on this repository`;
     core.warning(`Bot '${actorToValidate}' is in the allowed list but not active/installed on ${owner}/${repo}`);
     core.setOutput("is_team_member", "false");
@@ -225,7 +246,9 @@ async function main() {
     const authorPermission = await checkRepositoryPermission(pullRequestAuthor, owner, repo, requiredPermissions);
     if (authorPermission.authorized) {
       core.info(`PR author '${pullRequestAuthor}' is trusted; checking whether bot '${actorToValidate}' is active`);
-      const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo);
+      const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, {
+        installationCheckOptional: isCopilotPullRequestActor(eventName, actorToValidate),
+      });
       if (botResult.handled) {
         return;
       }
@@ -250,7 +273,13 @@ async function main() {
   }
 
   // For all other events, preserve confused-deputy validation before bot authorization.
-  const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo);
+  // GitHub App identities are not repository collaborators, so the installation lookup used by
+  // checkBotStatus reports them as inactive. On repository_dispatch the sender already needed
+  // `contents: write` on this repository to post the event, so an explicitly allowlisted App is
+  // authorized even when that lookup finds nothing.
+  const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, {
+    installationCheckOptional: eventName === "repository_dispatch" || isCopilotPullRequestActor(eventName, actorToValidate),
+  });
   if (botResult.handled) {
     return;
   }

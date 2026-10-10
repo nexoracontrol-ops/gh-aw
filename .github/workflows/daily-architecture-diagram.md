@@ -15,7 +15,7 @@ permissions:
   copilot-requests: write
 engine:
   id: codex
-model: copilot/gpt-5.3-codex
+model: openai/gpt-6-sol
 
 experiments:
   detail_level:
@@ -37,7 +37,6 @@ experiments:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   edit:

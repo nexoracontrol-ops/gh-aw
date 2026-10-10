@@ -19,12 +19,12 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Pydantic AI
-model: copilot/claude-sonnet-4-5
+model: copilot/auto
 engine:
   id: pydantic-ai
 strict: true
 imports:
-  - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@8e863b5b88c9e41e638f0dc416b8946135b584b7
+  - pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md@319d72ccf220427e59b9f4e61f17d7be52c90d68
   - shared/smoke-test-brevity.md
   - shared/reporting.md
 network:

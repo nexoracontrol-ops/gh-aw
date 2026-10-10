@@ -9,7 +9,7 @@ permissions:
   discussions: read
   issues: read
   pull-requests: read
-model: openai/gpt-5.3-codex
+model: openai/gpt-6.1-sol
 engine:
   id: codex
   model-provider: openai
@@ -282,9 +282,6 @@ pre-agent-steps:
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AWF_FETCH_FAILED_SOURCES"
         echo "AWF canonical source fetch failed; run marked degraded (non-fatal)"
       fi
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Schema Consistency Checker

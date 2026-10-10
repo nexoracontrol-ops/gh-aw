@@ -70,6 +70,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var mcpSetupGeneratorLog = logger.New("workflow:mcp_setup_generator")
@@ -109,12 +110,22 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 
 	// Collect all Docker images that will be used and generate download step
 	dockerImages := collectDockerImages(tools, workflowData, c.actionMode)
-	generateDownloadDockerImagesStep(yaml, dockerImages)
+	generateDownloadDockerImagesStep(yaml, dockerImages, dockerImagePullPolicy(workflowData))
 
 	// If no MCP tools, skip setup unless the engine still needs MCP gateway/config bootstrap.
 	// Codex with AWF firewall enabled requires MCP config generation to set its OpenAI proxy
 	// provider, even when no MCP tools are configured (e.g. threat-detection jobs).
 	needsSetupWithoutMCPTools := len(mcpTools) == 0 && engine.GetID() == "codex" && isFirewallEnabled(workflowData)
+	if codex, ok := engine.(*CodexEngine); ok {
+		step, err := codex.renderConfigurationStep(workflowData, mcpTools, len(mcpTools) == 0 && !needsSetupWithoutMCPTools)
+		if err != nil {
+			return err
+		}
+		for _, line := range step {
+			yaml.WriteString(line)
+			yaml.WriteByte('\n')
+		}
+	}
 	if len(mcpTools) == 0 && !needsSetupWithoutMCPTools {
 		mcpSetupGeneratorLog.Print("No MCP tools configured, skipping MCP setup")
 		return nil
@@ -143,12 +154,15 @@ func toolsWithEnclaveGitHubIssues(tools map[string]any, workflowData *WorkflowDa
 	if !enclaveGitHubDelegationEnabled(workflowData) {
 		return tools
 	}
-	updated := make(map[string]any, len(tools)+1)
+	updated := make(map[string]any, typeutil.SafeAllocationCapacity(len(tools), 1))
 	maps.Copy(updated, tools)
 	if githubToolRaw, hasGitHub := tools["github"]; hasGitHub && githubToolRaw == false {
 		return updated
 	}
-	githubTool, _ := tools["github"].(map[string]any)
+	githubTool, ok := tools["github"].(map[string]any)
+	if !ok {
+		githubTool = nil
+	}
 	githubConfig := make(map[string]any, len(githubTool))
 	maps.Copy(githubConfig, githubTool)
 	if allowed, ok := githubConfig["allowed"].([]any); ok {
@@ -192,7 +206,7 @@ func collectMCPTools(workflowData *WorkflowData) []string {
 			mcpSetupGeneratorLog.Print("Skipping GitHub MCP server registration: tools.github.mode is gh-proxy")
 			continue
 		}
-		if toolName == "github" || toolName == "cache-memory" || toolName == "agentic-workflows" {
+		if toolName == "github" || toolName == "cache-memory" || toolName == "agentic-workflows" || toolName == "work-queue" {
 			mcpTools = append(mcpTools, toolName)
 			continue
 		}
@@ -204,6 +218,9 @@ func collectMCPTools(workflowData *WorkflowData) []string {
 	}
 	if HasSafeOutputsEnabled(workflowData.SafeOutputs) {
 		mcpTools = append(mcpTools, "safe-outputs")
+	}
+	if workflowData.RepoMemoryConfig.ledgerEntry() != nil {
+		mcpTools = append(mcpTools, "ledger")
 	}
 	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
 		mcpTools = append(mcpTools, "mcp-scripts")

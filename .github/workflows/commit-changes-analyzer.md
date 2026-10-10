@@ -16,10 +16,10 @@ permissions:
   issues: read
   pull-requests: read
 max-turns: 100
-model: openai/gpt-5.3-codex
+model: copilot/gpt-5.6-luna
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
 tools:
   cli-proxy: true
   github:
@@ -46,9 +46,6 @@ evals:
     question: Did the agent analyze all repository changes since the specified commit and produce a comprehensive report?
   - id: discussion_created
     question: Was a discussion or report created summarizing the changes since the specified commit?
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Commit Changes Analyzer

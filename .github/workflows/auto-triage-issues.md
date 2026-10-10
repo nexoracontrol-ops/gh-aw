@@ -16,7 +16,7 @@ permissions:
   contents: read
   issues: read
   copilot-requests: write
-model: openai/gpt-5.3-codex
+model: openai/gpt-6-astra
 engine:
   id: codex
   model-provider: openai
@@ -64,6 +64,14 @@ steps:
 safe-outputs:
   add-labels:
     max: 10
+    item-schema:
+      type: object
+      required: [name, rationale, confidence]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        rationale: { type: string }
+        confidence: { type: string, enum: [HIGH, MEDIUM, LOW] }
   create-discussion:
     expires: 1d
     title-prefix: "[Auto-Triage] "
@@ -74,9 +82,6 @@ safe-outputs:
 timeout-minutes: 15
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: labels-applied
     question: Did the agent apply at least one label to an unlabeled issue, or correctly call noop when no unlabeled issues were found?
@@ -249,7 +254,10 @@ Use the `add_labels` tool with the following format:
 ```json
 {
   "type": "add_labels",
-  "labels": ["bug", "cli"],
+  "labels": [
+    {"name": "bug", "rationale": "The issue reports reproducible incorrect behavior.", "confidence": "HIGH"},
+    {"name": "cli", "rationale": "The report concerns a gh aw CLI command.", "confidence": "HIGH"}
+  ],
   "item_number": 12345
 }
 ```
@@ -259,7 +267,10 @@ For the triggering issue (on issue events), you can omit `item_number`:
 ```json
 {
   "type": "add_labels",
-  "labels": ["bug", "cli"]
+  "labels": [
+    {"name": "bug", "rationale": "The issue reports reproducible incorrect behavior.", "confidence": "HIGH"},
+    {"name": "cli", "rationale": "The report concerns a gh aw CLI command.", "confidence": "HIGH"}
+  ]
 }
 ```
 

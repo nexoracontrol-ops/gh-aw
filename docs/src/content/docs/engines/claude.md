@@ -7,7 +7,7 @@ description: Select and authenticate Claude Code as the AI engine for GitHub Age
 
 ## Selecting Claude Code as the AI engine
 
-To select Claude Code as the AI engine, with inference hosted and and billed through an Anthropic subscription, add this to the workflow frontmatter:
+To select Claude Code as the AI engine, with inference hosted and billed through an Anthropic subscription, add this to the workflow frontmatter:
 
 ```yaml
 engine: claude
@@ -20,6 +20,25 @@ To authenticate, either
 2. Use keyless [Anthropic Workload Identity Federation](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif).
 
 Claude subscription OAuth tokens such as `CLAUDE_CODE_OAUTH_TOKEN` are not supported.
+
+### GitHub Copilot inference
+
+Select a Copilot-hosted Anthropic model to run Claude Code with inference billed through GitHub Copilot:
+
+```aw wrap
+engine: claude
+model: copilot/claude-haiku-4.5
+permissions:
+  copilot-requests: write
+```
+
+`copilot-requests: write` authenticates inference with `${{ github.token }}`; no PAT, `COPILOT_GITHUB_TOKEN` secret, or `ANTHROPIC_API_KEY` is required. Without that permission, configure `COPILOT_GITHUB_TOKEN` instead. The default agent sandbox is required: AWF holds the GitHub credential, and Claude receives only a placeholder key and the reflected Copilot proxy endpoint.
+
+The `copilot/` prefix selects the provider and is removed from the model ID passed to Claude. An explicit `engine.model-provider` overrides provider selection. For a fully dynamic model expression whose provider cannot be inferred at compile time, set `engine.model-provider: github`.
+
+Claude uses its native Messages API, not the OpenAI Responses or Chat Completions API. Both `copilot/auto` and `auto` with `engine.model-provider: github` select an advertised Claude model from the configured Copilot gateway: newest Sonnet first, then Opus, then Haiku. Selection fails before inference if no supported Claude model is advertised; it never selects a GPT model or switches providers. Bare `auto` on the native Anthropic route uses Claude's `sonnet` alias. Model access, beta headers, and request features remain subject to GitHub Copilot API (CAPI) support.
+
+The [`smoke-claude-copilot` canary](https://github.com/github/gh-aw/blob/main/.github/workflows/smoke-claude-copilot.md) exercises native streaming inference, an MCP tool call, and inference after the tool result. Its host-side assertions require a real tool receipt containing an unpredictable nonce and a subsequent safe output echoing it, so precomputed tool calls cannot pass. Model fallback is disabled so an unsupported CAPI request cannot pass by silently selecting another model. Failures retain the Claude transcript and AWF proxy diagnostics; local compilation alone does not establish live CAPI compatibility.
 
 ## Example: scheduled repository report
 
@@ -52,7 +71,37 @@ Analyze the repository and create a concise daily status report covering:
 
 ## Capabilities and limitations
 
-Claude Code supports native web search, bare mode, top-level `max-turns`, and per-command bash allowlisting. It does not support Copilot-specific `max-continuations`, native `engine.agent` selection, or custom `engine.harness` scripts. See the [AI engine feature comparison](/gh-aw/reference/engines/#engine-feature-comparison).
+Claude Code supports native web search, bare mode, top-level `max-turns`, per-command bash pre-approval, and custom `engine.harness` scripts. It does not support Copilot-specific `max-continuations` or native `engine.agent` selection. See the [AI engine feature comparison](/gh-aw/reference/engines/#engine-feature-comparison).
+
+The default permission mode is `dontAsk`: actions requiring approval run only when pre-approved. Disabled Bash/web tools are removed, and `tools.edit: false` denies repository edits even with an explicit permission-mode override. Safe outputs do not independently grant file-write access. Sandbox and MCP gateway policies provide the isolation boundaries.
+
+Bare mode skips ambient discovery and restricts native tools to Bash, Edit, and Read in Claude Code 2.1.288. Workflow-declared skills load through the `gh-aw-workflow` plugin and can be explicitly invoked as `/gh-aw-workflow:<skill-name>`. Top-level pinned plugins continue to load explicitly. Do not rely on automatic Skill-tool invocation or subagent delegation in bare mode; use `bare: false` when the workflow needs those capabilities.
+
+Claude Code [dynamic workflows](https://code.claude.com/docs/en/workflows) are disabled by default in gh-aw. Set `engine.dynamic-workflows: true` to pre-approve the `Workflow` tool. They can run in the default headless (`claude -p`) mode when the prompt explicitly requests a saved workflow; the interactive keyword trigger does not work in headless mode. Their agents remain subject to the configured tool permissions. When dynamic workflows are disabled, engine configuration is restored only when PR checkout requires it. Save project scripts and any files their agents read under `.claude/workflows/`: the existing engine-config restoration snapshots the engine-declared `.claude/` directory recursively from the activation checkout and restores it from the activation artifact after the agent checkout, including when the PR checkout is disabled. For supporting files elsewhere in the repository, use `ambient-folders` to include them in the activation artifact. Dynamic workflows require ambient discovery; do not enable `engine.bare: true` for them.
+
+The built-in harness passes a short continuation prompt when resuming an interrupted session, preserving its session ID and prior work. It uses `CLAUDE_CODE_MAX_RETRIES: 0` to leave transient-error retries to the harness; `ANTHROPIC_MAX_RETRIES` does not control the Claude CLI retry loop.
+
+The repository's [`smoke-claude-dynamic` workflow](https://github.com/github/gh-aw/blob/main/.github/workflows/smoke-claude-dynamic.md) is a minimal end-to-end example. It explicitly enables dynamic workflows with `bare: false`, invokes a saved script with structured arguments, and verifies that the script and a nested hidden fixture match the trusted activation artifact. Its post-step checks native `Workflow` tool evidence and the returned result instead of accepting an agent's success claim.
+
+Unified session traces distinguish a successful background launch from workflow completion. The Claude adapter maps task lifecycle observations to engine-independent events (`dynamicWorkflows.task_started`, `dynamicWorkflows.task_progress`, `dynamicWorkflows.task_updated`, `dynamicWorkflows.task_notification`, and `dynamicWorkflows.background_tasks_changed`). These retain task/tool correlation and expose observed progress and completion status without publishing embedded workflow scripts or agent prompts. Task usage snapshots are shown separately, not added to the parent session's token totals.
+
+For an offline native-CLI compatibility check against an installed version, run the opt-in contract suite from `actions/setup/js`:
+
+```bash
+GH_AW_CLAUDE_TEST_CLI=/absolute/path/to/claude npm run test:js -- claude_cli_live.test.cjs
+```
+
+The suite uses synthetic prompts, an isolated home directory, and a loopback Anthropic-compatible server. It does not use real credentials or external inference.
+
+## Session trace mapping
+
+The Claude adapter maps native messages, thinking, tool calls/results, policy refusals, provider errors, and permission denials into the [unified agent session vocabulary](/gh-aw/specs/unified-agent-session-specification/). Images, documents, and opaque redacted thinking retain their structured content. Explicit tool failure or interruption signals take precedence over contradictory success fields; missing outcomes, duration, and exit codes remain unknown.
+
+Provider failures and API retries appear once as `session.result.errors`, with their native diagnostic metadata retained on the canonical event. Permission notices appear as `session.result.permissionDenials`, not assistant answers or inferred tool completions. Matching terminal denial snapshots reconcile with earlier observations by supplied tool and session identity; distinct notices and explicitly empty snapshots remain available.
+
+Mapped streaming envelopes and finalized SDK snapshots remain attached to canonical events rather than becoming duplicate `claude.*` records. The first finalized snapshot is retained even when block starts are missing or refusal is first identified in that snapshot. Streamed images, documents, and redacted thinking are enriched by finalized snapshots without emitting the same block again. Streamed refusal observations retain their partial flag until a finalized snapshot or message stop arrives. Unknown transport controls, estimated thinking-token notifications, and native dot-namespaced extensions remain separate evidence; estimated tokens do not become session accounting.
+
+The parser trace is persisted as `agent-session.jsonl`; conclusion projects essential payloads into `usage/aw_session.jsonl`. Older artifacts may contain only `agent-stdio.log`. The sampled successful and failed CI transcripts exercise native CLI shapes; streaming and structured-content regressions also use synthetic SDK/API records and do not establish live coverage for those features.
 
 ## Guided workflow authoring with Claude Code
 

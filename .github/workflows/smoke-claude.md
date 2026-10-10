@@ -28,6 +28,9 @@ max-turns: 100
 model: claude-sonnet-4-6
 engine:
   id: claude
+  fallback-models:
+    - anthropic/claude-haiku-4-5
+    - anthropic/claude-sonnet-5
   bare: true
 inlined-imports: true
 imports:
@@ -40,6 +43,9 @@ imports:
   - shared/smoke-test-brevity.md
   - shared/playwright-title-test.md
   - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: agent-stdio
 network:
   allowed:
     - defaults
@@ -54,7 +60,7 @@ sandbox:
   agent:
     config:
       filesystem:
-        allowWrite:
+        allow-write:
           - /tmp/gh-aw/agent
 tools:
   agentic-workflows:

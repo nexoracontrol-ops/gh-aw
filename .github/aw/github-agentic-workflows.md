@@ -26,6 +26,15 @@ Persona-lens view of the same facts as the canonical [Decision Matrix](triggers.
 | Designer | PR review is metadata/content-aware via GitHub reads only | Add `playwright` for screenshot/visual checks; add `cache-memory` when baselines or snapshot history are required |
 | Legal / Compliance | Policy/dependency review is repo-state and metadata driven | Add `cache-memory` when recurring audits need prior-run evidence/comparison state |
 
+## Replace Previous Results
+
+When a recurring digest or PR-reactive update is superseded by the newest result, prefer replacing the prior output instead of accumulating stale results:
+
+- For recurring issue digests, use `create-issue` with `close-older-issues: true`.
+- For rolling PR comments, use `add-comment` with `hide-older-comments: true`.
+
+Wait for the previous result when only one active issue or PR should exist; keep prior outputs when each result is intentionally distinct or history is required.
+
 ## File Format
 
 Agentic workflows are markdown files with YAML frontmatter.
@@ -151,12 +160,13 @@ For the full dependency-license/compliance review pattern (paths scoping, licens
 | Editing and recompilation rules | [workflow-editing.md](workflow-editing.md) |
 | Architectural and security constraints | [workflow-constraints.md](workflow-constraints.md) |
 | Common design patterns | [workflow-patterns.md](workflow-patterns.md) |
+| Git-backed work queue dispatchers, workers, and CLI inspection | [work-queue.md](work-queue.md) |
 | Frontmatter schema index | [syntax.md](syntax.md) |
 | Safe outputs index | [safe-outputs.md](safe-outputs.md) |
 | Trigger patterns | [triggers.md](triggers.md) |
 | Context expressions and `{{#if}}` templates | [context.md](context.md) |
 | Declarative engine configuration | [configure-agentic-engine.md](configure-agentic-engine.md) |
-| Agent runtime selection (Docker, gVisor, Docker sbx, Cloud Hypervisor, ARC DinD) | [agent-runtime-instructions.md](agent-runtime-instructions.md) |
+| Agent runtime selection (Docker, Cloud Hypervisor, ARC DinD) | [agent-runtime-instructions.md](agent-runtime-instructions.md) |
 | Private-repository enclaves (preview) | [enclaves.md](enclaves.md) |
 | CLI commands and MCP equivalents | [cli-commands.md](cli-commands.md) |
 | Network configuration | [network.md](network.md) |

@@ -27,6 +27,8 @@ type AuditOptions struct {
 	VariantFilter    string
 	RuntimeFilter    string
 	EvalsOnly        bool
+	Group            bool
+	NoBaseline       bool
 }
 
 type auditRunConfig struct {
@@ -41,10 +43,13 @@ type auditRunConfig struct {
 	jobID            int64
 	stepNumber       int
 	artifactFilter   []string
+	includeWorkQueue bool
 	experimentFilter string
 	variantFilter    string
 	runtimeFilter    string
 	evalsOnly        bool
+	group            bool
+	noBaseline       bool
 	// evalsArtifactRequested is true when evals were requested via --evals or
 	// explicit --artifacts evals, and is used to trigger legacy dedicated-evals
 	// fallback behavior for older runs.
@@ -67,12 +72,17 @@ type auditAnalysisResults struct {
 	noops                   []NoopReport
 	mcpFailures             []MCPFailureReport
 	skillActivations        []SkillActivation
+	gatewaySteeringEvents   []GatewaySteeringEvent
 	accessAnalysis          *DomainAnalysis
 	firewallAnalysis        *FirewallAnalysis
 	policyAnalysis          *PolicyAnalysis
 	mcpToolUsage            *MCPToolUsageData
 	tokenUsageSummary       *TokenUsageSummary
+	modelRouting            *ModelRoutingSummary
 	workingSet              *WorkingSetMetrics
+	ledger                  *LedgerActivity
+	workQueue               *WorkQueueReport
+	friction                *FrictionCostSummary
 	redactedDomainsAnalysis *RedactedDomainsAnalysis
 	rateLimitUsage          *GitHubRateLimitUsage
 	artifacts               []string

@@ -60,11 +60,12 @@ strict: false
 | --- | --- |
 | `docker` (default) | Default Docker runtime, rootless AWF, network isolation |
 | `docker-sudo-iptables` | Docker with privileged AWF, legacy `iptables` networking, and host/service access |
-| `gvisor` | **Deprecated:** gVisor with strict network isolation |
-| `docker-sbx` | **Deprecated:** KVM microVM; the compiler handles the required privileged setup |
 | `cloud-hypervisor` | Preview KVM runtime with its required privileged launcher |
+| `nvx` | Fail-closed preview NVX one-shot microVM; requires explicit configuration and a Linux x86_64 KVM host |
 
-Omitting `runtime` is equivalent to `runtime: docker`, which keeps the secure default. Prefer `docker`; `gvisor` and `docker-sbx` are deprecated and will be removed in a future release.
+Omitting `runtime` is equivalent to `runtime: docker`, which keeps the secure default.
+
+The `nvx` runtime never falls back to another runtime. It requires a workload-specific guest layer, the AWF release's provenance bundle and manifest, and all three security opt-ins. The compiler checks the host and verifies the offline attestation before starting AWF. See [Agent Runtime Selection](/gh-aw/reference/agent-runtimes/#nvx-preview) for the complete configuration and compatibility requirements.
 
 ```yaml wrap
 sandbox:
@@ -73,7 +74,7 @@ sandbox:
     allow-host-ports: [9000]
 ```
 
-The compiler derives every privilege the selected runtime needs, including the `sudo` used by the gVisor and Docker sbx installation steps. Unsupported combinations — such as `allow-host-ports` outside `docker-sudo-iptables`, or `runtime-install` outside `gvisor` and `docker-sbx` — fail at compile time. See [Agent Runtimes](/gh-aw/reference/agent-runtimes/) for runner prerequisites.
+The compiler derives every privilege the selected runtime needs. Unsupported combinations, such as `allow-host-ports` outside `docker-sudo-iptables`, fail at compile time. See [Agent Runtimes](/gh-aw/reference/agent-runtimes/) for runner prerequisites.
 
 ### MCP Gateway (Experimental)
 
@@ -242,18 +243,18 @@ sandbox:
     images:
       squid: registry.example.com/approved/squid:v0.28.4@sha256:<64-hex-digest>
       agent: registry.example.com/approved/agent:v0.28.4@sha256:<64-hex-digest>
-      apiProxy: registry.example.com/approved/api-proxy:v0.28.4@sha256:<64-hex-digest>
+      api-proxy: registry.example.com/approved/api-proxy:v0.28.4@sha256:<64-hex-digest>
 ```
 
 The compiler emits the manifest as `container.images` in the generated AWF configuration.
 
-Supported image roles: `squid`, `agent`, `apiProxy`, `cliProxy`, `buildTools`, `dohProxy`, `enclaveScript`, `enclaveAgent`, `enclaveMcpServer`, and `dindStaging`.
+Supported image roles: `squid`, `agent`, `api-proxy`, `cli-proxy`, `build-tools`, `doh-proxy`, `enclave-script`, `enclave-agent`, `enclave-mcp-server`, and `dind-staging`.
 
 Rules enforced at compile time:
 
 - Every value must be a literal, registry-qualified reference with both a tag and an immutable digest: `registry/repository:tag@sha256:<64 lowercase hex characters>`. Expressions (`${{ ... }}`), environment interpolation, and any other dynamic value are rejected, so no runtime input can influence an infrastructure image.
 - Unknown roles are rejected.
-- The manifest must cover every role required by the enabled features: `squid`, `agent`, and `apiProxy` are always required; `cliProxy` is required with [`tools.github.mode: gh-proxy`](/gh-aw/reference/tools/), the `integrity-reactions` feature, or raw `--difc-proxy-host` AWF arguments; `buildTools` is required with [`runner.topology: arc-dind`](/gh-aw/reference/self-hosted-runners/); `dohProxy` is required when legacy-security raw AWF arguments enable `--dns-over-https`; `dindStaging` is required when raw AWF arguments enable `--dind-pre-stage-dirs`, `--dind-stage-engine-binary-path`, or `--dind-stage-engine-binary-target-path`; `enclaveScript` and `enclaveAgent` are required for their corresponding [enclave](/gh-aw/experimental/enclaves/) executors, and `enclaveMcpServer` is required whenever any enclave is enabled. AWF fails closed rather than falling back to a default, so an incomplete manifest is a compile error.
+- The manifest must cover every role required by the enabled features: `squid`, `agent`, and `api-proxy` are always required; `cli-proxy` is required with [`tools.github.mode: gh-proxy`](/gh-aw/reference/tools/), the `integrity-reactions` feature, or raw `--difc-proxy-host` AWF arguments; `build-tools` is required with [`runner.topology: arc-dind`](/gh-aw/reference/self-hosted-runners/); `doh-proxy` is required when legacy-security raw AWF arguments enable `--dns-over-https`; `dind-staging` is required when raw AWF arguments enable `--dind-pre-stage-dirs`, `--dind-stage-engine-binary-path`, or `--dind-stage-engine-binary-target-path`; `enclave-script` and `enclave-agent` are required for their corresponding [enclave](/gh-aw/experimental/enclaves/) executors, and `enclave-mcp-server` is required whenever any enclave is enabled. AWF fails closed rather than falling back to a default, so an incomplete manifest is a compile error.
 - The manifest cannot be combined with controls that select a different effective image: SSL bump, per-enclave `image` overrides, and AWF arguments such as `--image-tag`, `--image-registry`, `--agent-image`, `--build-local`, `--sysroot-image`, and `--dind-staging-image`. The compiler-owned `container.imageTag` is suppressed when the manifest is set.
 
 Omit the field to keep AWF's default role references and gh-aw's existing digest-pin resolution.
@@ -275,18 +276,18 @@ sandbox:
   agent:
     targets:
       copilot:
-        extraHeaders:
+        extra-headers:
           x-openrouter-title: my-workflow
           http-referer: https://github.com/${{ github.repository }}
-        extraBodyFields:
+        extra-body-fields:
           custom-field: custom-value
-        sessionId: ${{ github.run_id }}
+        session-id: ${{ github.run_id }}
 ```
 
-Use this for OpenAI-compatible proxies and gateways that expect additional request metadata. `sessionId` is opt-in only; gh-aw does not derive it automatically.
+Use this for OpenAI-compatible proxies and gateways that expect additional request metadata. `session-id` is opt-in only; gh-aw does not derive it automatically.
 
 > [!NOTE]
-> Set `sessionId` only when your upstream expects a session identifier. Some strict OpenAI-compatible providers reject unknown `session_id` fields, so automatic injection would be unsafe.
+> Set `session-id` only when your upstream expects a session identifier. Some strict OpenAI-compatible providers reject unknown `session_id` fields, so automatic injection would be unsafe.
 
 #### Go cache paths in AWF (`GOMODCACHE` / `GOCACHE`)
 

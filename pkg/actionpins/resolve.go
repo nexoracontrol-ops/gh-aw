@@ -41,7 +41,7 @@ func recordPinResolutionFailure(ctx *PinContext, actionRepo, version string, err
 // ResolveActionPin returns the pinned action reference for a given action@version.
 // It consults ctx.Resolver first, then falls back to embedded pins.
 // If ctx is nil, only embedded pins are consulted.
-func ResolveActionPin(actionRepo, version string, ctx *PinContext) (string, error) {
+func ResolveActionPin(actionRepo, version string, ctx *PinContext) (result string, err error) {
 	if ctx == nil {
 		ctx = &PinContext{}
 	}
@@ -49,6 +49,13 @@ func ResolveActionPin(actionRepo, version string, ctx *PinContext) (string, erro
 
 	// Apply repository/version mapping from aw.json action_pins before resolution.
 	originalRepo, originalVersion := actionRepo, version
+	_, exactMapped, mappingErr := validateActionPinMapping(actionRepo, version, ctx)
+	if mappingErr != nil {
+		return "", mappingErr
+	}
+	if !exactMapped {
+		defer func() { result = applyActionPinPrefix(originalRepo, result, ctx) }()
+	}
 	actionRepo, version = applyActionPinMapping(actionRepo, version, ctx)
 	mapped := actionRepo != originalRepo || version != originalVersion
 
@@ -70,7 +77,10 @@ func ResolveActionPin(actionRepo, version string, ctx *PinContext) (string, erro
 
 	if isAlreadySHA {
 		actionPinsLog.Printf("SHA %s not found in hardcoded pins, returning as-is", version)
-		return FormatPinnedActionReference(actionRepo, version, version), nil
+		if label := ctx.SourceVersions[actionRepo+"@"+version]; label != "" {
+			return FormatPinnedActionReference(actionRepo, version, label), nil
+		}
+		return actionRepo + "@" + version, nil
 	}
 
 	cacheKey := FormatCacheKey(actionRepo, version)
@@ -79,11 +89,18 @@ func ResolveActionPin(actionRepo, version string, ctx *PinContext) (string, erro
 		errorType = ResolutionErrorTypeDynamicResolutionFailed
 	}
 	recordPinResolutionFailure(ctx, actionRepo, version, errorType)
+	return handleUnresolvedActionPin(actionRepo, version, originalRepo, originalVersion, exactMapped, cacheKey, ctx)
+}
+
+func handleUnresolvedActionPin(actionRepo, version, originalRepo, originalVersion string, exactMapped bool, cacheKey string, ctx *PinContext) (string, error) {
 	if ctx.EnforcePinned && !ctx.AllowActionRefs {
 		if ctx.Resolver != nil {
 			return "", fmt.Errorf("unable to pin action %s@%s: resolution failed", actionRepo, version)
 		}
 		return "", fmt.Errorf("unable to pin action %s@%s", actionRepo, version)
+	}
+	if exactMapped {
+		return "", fmt.Errorf("unable to resolve action pin mapping for %s@%s to %s@%s", originalRepo, originalVersion, actionRepo, version)
 	}
 
 	warningMsg := fmt.Sprintf("Unable to pin action %s@%s", actionRepo, version)
@@ -92,6 +109,14 @@ func ResolveActionPin(actionRepo, version string, ctx *PinContext) (string, erro
 	}
 	ctx.emitOnce(cacheKey, warningMsg, console.FormatWarningMessage)
 	return "", nil
+}
+
+func validateActionPinMapping(actionRepo, version string, ctx *PinContext) (string, bool, error) {
+	mappingValue, exactMapped := ctx.Mappings[FormatCacheKey(actionRepo, version)]
+	if exactMapped && (ExtractRepo(mappingValue) == "" || ExtractVersion(mappingValue) == "") {
+		return "", true, fmt.Errorf("invalid action pin mapping for %s@%s: target %q must be in owner/repo@ref format", actionRepo, version, mappingValue)
+	}
+	return mappingValue, exactMapped, nil
 }
 
 // ResolveGHESActionPin returns the GHES-compatible pin for repo, if one is required.
@@ -190,7 +215,7 @@ func resolveNonStrictHardcodedPin(actionRepo, version string, matchingPins []Act
 	if foundCompatible {
 		actionPinsLog.Printf("No exact match for version %s, using highest semver-compatible version: %s", version, selectedPin.Version)
 	} else {
-		selectedPin = matchingPins[0]
+		selectedPin = matchingPins[0] //nolint:uncheckedsliceindex // The caller returns before this function when no pins exist.
 		actionPinsLog.Printf("No exact match for version %s, no semver-compatible versions found, using highest available: %s", version, selectedPin.Version)
 	}
 
@@ -201,7 +226,7 @@ func resolveNonStrictHardcodedPin(actionRepo, version string, matchingPins []Act
 
 	actionPinsLog.Printf("Using version in non-strict mode: %s@%s (requested) → %s@%s (used)",
 		actionRepo, version, actionRepo, selectedPin.Version)
-	return formatPinnedActionWithResolution(actionRepo, selectedPin.SHA, version, selectedPin.Version)
+	return FormatPinnedActionReference(actionRepo, selectedPin.SHA, selectedPin.Version)
 }
 
 // ResolveLatestActionPin returns the pinned action reference for a given repository,
@@ -218,7 +243,7 @@ func ResolveLatestActionPin(repo string, ctx *PinContext) string {
 		return getLatestActionPinReference(repo)
 	}
 
-	latestVersion := pins[0].Version
+	latestVersion := pins[0].Version //nolint:uncheckedsliceindex // The empty case returns above.
 	pinnedRef, err := ResolveActionPin(repo, latestVersion, ctx)
 	if err != nil || pinnedRef == "" {
 		actionPinsLog.Printf("Resolution failed for repo=%s latest version=%s, falling back to embedded latest pin", repo, latestVersion)

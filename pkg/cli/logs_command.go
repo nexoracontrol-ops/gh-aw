@@ -59,7 +59,7 @@ const logsCommandExampleTemplate = `  # Basic usage
   %[1]s logs --engine claude           # Filter logs by claude engine
   %[1]s logs --engine codex            # Filter logs by codex engine
   %[1]s logs --engine copilot          # Filter logs by copilot engine
-  %[1]s logs --runtime gvisor          # Filter logs by sandbox agent runtime
+  %[1]s logs --runtime cloud-hypervisor # Filter logs by sandbox agent runtime
   %[1]s logs --firewall                # Filter logs with firewall enabled
   %[1]s logs --no-firewall             # Filter logs without firewall
   %[1]s logs --safe-output missing-tool     # Filter logs with missing-tool messages
@@ -241,6 +241,8 @@ func loadStdinLogsOptions(cmd *cobra.Command) (StdinLogsOptions, error) {
 		Verbose:           values.Verbose,
 		ToolGraph:         values.ToolGraph,
 		NoStaged:          values.NoStaged,
+		DryRun:            values.DryRun,
+		NoDryRun:          values.NoDryRun,
 		FirewallOnly:      values.FirewallOnly,
 		NoFirewall:        values.NoFirewall,
 		Parse:             values.Parse,
@@ -417,6 +419,8 @@ func loadCommonLogsOptions(cmd *cobra.Command) (LogsDownloadOptions, error) {
 		Verbose:               getBoolFlag(cmd, "verbose"),
 		ToolGraph:             getBoolFlag(cmd, "tool-graph"),
 		NoStaged:              getBoolFlag(cmd, "exclude-staged"),
+		DryRun:                getBoolFlag(cmd, "dry-run"),
+		NoDryRun:              getBoolFlag(cmd, "no-dry-run"),
 		FirewallOnly:          getBoolFlag(cmd, "firewall"),
 		NoFirewall:            getBoolFlag(cmd, "no-firewall"),
 		Parse:                 getBoolFlag(cmd, "parse"),
@@ -514,7 +518,11 @@ func validateLogsRuntime(runtime string) error {
 		return nil
 	}
 	logsCommandLog.Printf("Validating runtime parameter: %s", runtime)
-	validRuntimes := []string{string(workflow.AgentRuntimeGVisor), string(workflow.AgentRuntimeDockerSbx), string(workflow.AgentRuntimeCloudHypervisor)}
+	validRuntimes := []string{
+		string(workflow.AgentRuntimeDocker),
+		string(workflow.AgentRuntimeDockerSudoIptables),
+		string(workflow.AgentRuntimeCloudHypervisor),
+	}
 	if slices.Contains(validRuntimes, runtime) {
 		return nil
 	}
@@ -613,7 +621,7 @@ func addLogsCommandFlags(logsCmd *cobra.Command, validArtifactSets string) {
 	logsCmd.Flags().String("end-date", "", "Filter runs created before this date (YYYY-MM-DD or delta like -1d, -1w, -1mo)")
 	addOutputFlag(logsCmd, defaultLogsOutputDir)
 	addEngineFilterFlag(logsCmd)
-	logsCmd.Flags().String("runtime", "", "Filter to runs using a specific sandbox agent runtime (e.g., gvisor, docker-sbx, cloud-hypervisor)")
+	logsCmd.Flags().String("runtime", "", "Filter to runs using a specific sandbox agent runtime (e.g., cloud-hypervisor)")
 	logsCmd.Flags().String("ref", "", "Filter runs by branch or tag name (e.g., main, v1.0.0)")
 	logsCmd.Flags().Int64("before-run-id", 0, "Filter runs with database ID before this value (exclusive)")
 	logsCmd.Flags().Int64("after-run-id", 0, "Filter runs with database ID after this value (exclusive)")
@@ -621,6 +629,9 @@ func addLogsCommandFlags(logsCmd *cobra.Command, validArtifactSets string) {
 	addRepoFlag(logsCmd)
 	logsCmd.Flags().Bool("tool-graph", false, "Generate Mermaid tool sequence graph from agent logs")
 	logsCmd.Flags().Bool("exclude-staged", false, "Exclude workflow runs that executed in staged mode (safe outputs previewed but not applied)")
+	logsCmd.Flags().Bool("dry-run", false, "Filter to only dry-run workflow runs")
+	logsCmd.Flags().Bool("no-dry-run", false, "Exclude dry-run workflow runs (legacy metadata without dry_run counts as a normal run)")
+	logsCmd.MarkFlagsMutuallyExclusive("dry-run", "no-dry-run")
 	logsCmd.Flags().Bool("firewall", false, "Filter to only runs with firewall enabled")
 	logsCmd.Flags().Bool("no-firewall", false, "Filter to only runs without firewall enabled")
 	logsCmd.Flags().String("safe-output", "", "Filter to runs containing a specific safe output type (e.g., create-issue, missing-tool, missing-data, noop, report-incomplete)")

@@ -20,7 +20,7 @@ permissions:
   pull-requests: read
 engine:
   id: codex
-model: copilot/gpt-5.3-codex
+model: copilot/gpt-6-luna
 imports:
   - shared/otlp.md
 tools:
@@ -84,7 +84,6 @@ features:
   samples: true
 sandbox:
   agent:
-    runtime: cloud-hypervisor
     id: awf
 ---
 

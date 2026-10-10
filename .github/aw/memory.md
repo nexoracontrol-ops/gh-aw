@@ -20,6 +20,7 @@ For workflows that **persist state across runs** — deduplication, incremental 
 | Track a numeric metric and compare current vs. baseline (runs at least every 7 days) | `cache-memory` ✅ first choice |
 | Long-lived knowledge base visible in PRs and code reviews | `repo-memory` |
 | Baselines that must survive cache expiry (e.g. security findings, dedup lists) | `repo-memory` |
+| Bounded append-only structured event history and built-in current-state projections | Experimental `tools.ledger` |
 | Human-readable wiki pages for knowledge accumulation | `repo-memory` with `wiki: true` |
 | Persist notes/state inline on the triggering issue or PR | `comment-memory` |
 | Private-preview GitHub Drives backend (enrolled repos only) | `drive-memory` — see [drive-memory.md](drive-memory.md) |
@@ -95,18 +96,31 @@ tools:
 
 ### Custom validation
 
-For domain-specific constraints beyond `allowed-extensions` (schema checks, cross-file uniqueness, timestamp policies), add `validation.script` — a Node.js script body (globals: `fs`, `path`, `memoryRoot`, `memoryId`, `memoryKind`) run over the memory directory after agent execution and before persistence. Throwing, returning `false`, timing out, or exiting nonzero rejects the save. Default timeout 1 minute (`validation.timeout-minutes`, max 5). Same mechanism for `repo-memory`. See [cache-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/cache-memory.md#custom-validation) and [repo-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/repo-memory.md#custom-validation).
+Declare required per-file JSON and JSONL schemas with `validation.json-schemas`; this runs without a custom script for cache-memory, repo-memory, and drive-memory:
 
 ```yaml
 tools:
   cache-memory:
     validation:
+      json-schemas:
+        - file: state.json
+          schema:
+            type: object
+            required: [version, items]
+            additionalProperties: false
+            properties:
+              version: { enum: [1] }
+              items:
+                type: array
+                items: { type: string }
       timeout-minutes: 1
       script: |
-        const index = JSON.parse(fs.readFileSync(path.join(memoryRoot, "index.json"), "utf8"));
-        if (!Array.isArray(index.entries)) throw new Error("index.json entries must be an array");
+        if (memoryKind !== "cache") throw new Error("unexpected memory kind");
 ```
 
+Each declaration has an inline schema object and may have a relative `file` path or glob (using `*` within a path segment and `**` across segments). When `file` is omitted, the schema applies to every eligible `.json` and `.jsonl` file in the memory directory, excluding `.git`; the format is inferred for each file and `format` must also be omitted. Otherwise, the format is inferred from each matched file's `.json` or `.jsonl` extension (case-insensitive); optional `format: json` or `format: jsonl` overrides inference and is required for other extensions. A path must match configured file filters and exist; a glob must match at least one file, and every match is validated. JSON is one non-empty document; JSONL validates records individually, accepts LF/CRLF and an optional final newline, allows an existing empty file, and rejects blank lines or malformed records with physical line numbers. Schemas validate without coercion or rewriting and run after filtering/normalization, before an optional `validation.script`; schema and script failures both reject persistence.
+
+Supported schema keywords are `type` (including arrays of types and `null`), primitive `enum`, `required`, nested `properties`, `additionalProperties: false`, object-schema `items`, and standalone `oneOf`/`anyOf`, up to 32 levels. Numeric enum integers must be exactly representable by JavaScript, and values checked against numeric enums must not lose precision during JSON parsing. This is not full JSON Schema: `$ref`, `const`, `format`, patterns, bounds, `uniqueItems`, and other unsupported keywords are rejected. Use the optional Node.js script (globals: `fs`, `path`, `memoryRoot`, `memoryId`, `memoryKind`) for cross-file uniqueness, timestamps, positive-ID checks, and other domain rules. Its timeout defaults to 1 minute (`validation.timeout-minutes`, max 5). See [cache-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/cache-memory.md#custom-validation), [repo-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/repo-memory.md#custom-validation), and [drive-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/experimental/drive-memory.md#validation).
 ### Storage path
 
 - Single cache: `/tmp/gh-aw/cache-memory/`
@@ -205,6 +219,60 @@ tools:
 
 Compiler creates a separate `push_repo_memory` job with `contents: write`; main agent job stays read-only.
 
+### Structured event history: standalone ledger (experimental)
+
+Use the ledger for immutable, structured events when each run should add records
+and later runs need to query them. For example, a low-volume audit can append
+one result per scan and query prior results by a stable application-level key.
+Configure `tools.ledger` independently of repo-memory. The legacy
+`tools.repo-memory.ledger` declaration is unsupported. Each ledger has a
+`ledgers/<name>` branch and a disposable read-only SQLite projection rebuilt
+from persisted JSONL shards.
+
+```yaml
+tools:
+  ledger:
+    audit-history:
+      type: log
+      compaction:
+        min-segments: 32
+        max-segments: 32
+```
+
+Declare `type: log`, `set`, `map`, `table`, `counter`, or `notes` for built-in state
+models. Schemas validate operation values, not envelopes; tables require a
+string primary-key field through `key`. Maps expose `ledger_map_put` and
+`ledger_map_delete`; notes expose `ledger_note_add` and `ledger_note_vote`.
+Other types use typed `ledger_append` operations.
+
+Query `state` for current state or `records` for immutable history at
+`/tmp/gh-aw/ledgers/<name>/ledger.db`. For a log, submit `ledger_append` with
+`operation: append` and the event in `value`. Requests are deferred and become
+durable only when the trusted `push_ledger_changes` job succeeds; queued writes
+are not immediately visible in the run's projection. Never edit SQLite or
+canonical ledger files.
+
+Each record is limited to 32 KiB, each shard defaults to 100 KiB, and each run
+defaults to a 10 KiB append budget. Configure per-ledger limits with
+`max-segment-kb`, `max-record-kb`, and `max-patch-kb`. Projection preparation
+inspects at most 1024 canonical files and 100 MiB of history.
+Each writing workflow invocation creates a shard, so a frequently running
+workflow can exhaust the shard limit. Use ordinary repo-memory files for
+replaceable snapshots, pruned baselines, or histories that need more than 1024
+writer shards. Compaction belongs to Agentic Maintenance, never the agent or
+persistence job. Use per-ledger `compaction` settings (`schedule`,
+`min-segments`, `max-segments`) or disable it with `compaction: false`.
+Custom `replay.script`, `replay.config`, and `compaction.script` settings are
+rejected. Ordinary repo-memory `validation.script` remains a separate supported
+file-storage validator.
+
+Removing custom replay does not rewrite history. Existing raw-record ledgers
+can omit `type` and query `records.payload` with SQLite JSON functions. Do not
+add a built-in type to raw history unless every payload already matches that
+type's operation format. Use a new ledger name for a new typed state model.
+See the [ledger replay reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/experimental/ledger-replay.md)
+and [compaction guide](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/experimental/ledger-compaction.md).
+
 ### Tradeoffs
 
 | ✅ Pros | ❌ Cons |
@@ -214,6 +282,7 @@ Compiler creates a separate `push_repo_memory` job with `contents: write`; main 
 | Survives cache invalidation | Not available for Copilot engine (requires GitHub tools) |
 | Human-readable via GitHub branch UI | More complex setup |
 | Can target a different repository | |
+| Ledger mode provides immutable structured records and queries | Experimental, append-only, and limited to 1024 shard files by default |
 
 ---
 
@@ -304,6 +373,11 @@ Multiple memory IDs in one comment are supported; each maps to a separate `*.md`
 ## Stateful Scanning Pattern (repo-memory)
 
 Persist a baseline JSON file between runs to alert only on *new* findings — vulnerability scans, dependency audits, licence checks. Unlike `cache-memory`, the baseline survives cache expiry, so a missed cycle won't flood the repo with duplicate issues. Store only stable identifiers (advisory IDs), cap output with `max:`, treat missing baseline as `[]`. Requires Claude or custom engine — not Copilot.
+
+Keep this as a replaceable repo-memory snapshot by default. Use the experimental
+ledger only when the audit needs an append-only record of each scan or finding
+and its expected writer count fits the default 1024-shard limit; it does not replace,
+prune, or compact an existing baseline.
 
 > **Worked example** (nightly npm vulnerability scan, with key design decisions): [memory-stateful-patterns.md](memory-stateful-patterns.md#stateful-scanning-repo-memory).
 

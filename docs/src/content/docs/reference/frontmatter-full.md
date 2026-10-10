@@ -35,6 +35,12 @@ description: "Description of the workflow"
 # (optional)
 intent: "example-value"
 
+# Policy for pre-start Docker images in agent and detection jobs. 'always'
+# (default) pulls images; 'never' validates exact local RepoDigests and does not
+# contact a registry.
+# (optional)
+docker-image-pull-policy: "always"
+
 # Optional emoji to represent the workflow visually in listings and UI surfaces.
 # (optional)
 emoji: "example-value"
@@ -790,6 +796,25 @@ on:
     # Format 2: List of allowed fork repositories with glob support
     forks: []
       # Array items: string
+
+    # Acknowledge elevated permissions and secret access to suppress only the
+    # strict-mode pull_request_target trigger warning. Checkout validation remains
+    # enforced.
+    # (optional)
+    acknowledge-risk: true
+
+    # Exact literal repository/ref pairs trusted by the maintainer in addition to the
+    # supported base-repository checkouts. Expressions, wildcards, omitted refs, and
+    # PR refs are not allowed.
+    # (optional)
+    allowed-checkouts: []
+      # Array items:
+        # Literal owner/repository slug. Matches exactly, including case.
+        repository: "example-value"
+
+        # Literal trusted branch, tag, or commit SHA; not a pull request ref. Prefer an
+        # immutable commit SHA.
+        ref: "example-value"
 
   # Pull request review event trigger that runs when a pull request review is
   # submitted, edited, or dismissed
@@ -1575,12 +1600,12 @@ on:
   # Format 2: string
   stale-check: "full"
 
-  # Controls whether the activation job creates or updates a notification issue
-  # when the workflow is compiled with a blocked compile-agentic version. Set to
-  # false to suppress only that notification issue while keeping the
-  # blocked-version check itself (and its hard failure) active. This is
-  # independent of 'check-for-updates' (which disables the whole check) and
-  # 'safe-outputs.report-failure-as-issue' (which also gates the notification).
+  # Controls whether the activation job creates or updates a notification issue when
+  # the workflow is compiled with a blocked compile-agentic version. Set to false to
+  # suppress only that notification issue while keeping the blocked-version check
+  # itself (and its hard failure) active. This is independent of 'check-for-updates'
+  # (which disables the whole check) and 'safe-outputs.report-failure-as-issue'
+  # (which also gates the notification).
   # (optional)
   report-blocked-version: true
 
@@ -2160,6 +2185,25 @@ network:
     # '*.example.com' (matches sub.example.com, deep.nested.example.com, and
     # example.com itself) and ecosystem names like 'python', 'node'.
 
+  # Policy for Claude and Codex provider-hosted web search and fetch tools. This is
+  # independent from network.allowed because hosted retrieval runs on provider
+  # infrastructure.
+  # (optional)
+  # Accepted formats:
+
+  # Format 2: object
+  hosted-web:
+    # (optional)
+    allowed: []
+      # Array of strings
+
+    # (optional)
+    blocked: []
+      # Array of strings
+
+    # (optional)
+    max-uses: 1
+
 # AWF-owned private-repository executors exposed only through the
 # compiler-launched MCP gateway. Omit this field to disable enclaves.
 # (optional)
@@ -2260,38 +2304,42 @@ sandbox:
 
       # API proxy sidecar image that holds provider credentials.
       # (optional)
-      apiProxy: "example-value"
+      api-proxy: "example-value"
+
+      # Model router sidecar image used by engine.model-routing.
+      # (optional)
+      router: "example-value"
 
       # CLI proxy sidecar image used by tools.github.mode: gh-proxy,
       # integrity-reactions, or raw --difc-proxy-host AWF arguments.
       # (optional)
-      cliProxy: "example-value"
+      cli-proxy: "example-value"
 
       # Build-tools image used as the chroot sysroot base on runner.topology: arc-dind.
       # (optional)
-      buildTools: "example-value"
+      build-tools: "example-value"
 
       # DNS-over-HTTPS proxy image required when legacy-security raw AWF arguments
       # enable --dns-over-https.
       # (optional)
-      dohProxy: "example-value"
+      doh-proxy: "example-value"
 
       # Script enclave image.
       # (optional)
-      enclaveScript: "example-value"
+      enclave-script: "example-value"
 
       # Agent enclave image.
       # (optional)
-      enclaveAgent: "example-value"
+      enclave-agent: "example-value"
 
       # Shared enclave MCP server image required whenever any enclave is enabled.
       # (optional)
-      enclaveMcpServer: "example-value"
+      enclave-mcp-server: "example-value"
 
       # Docker-in-Docker staging image required when raw AWF arguments enable directory
       # or engine-binary pre-staging.
       # (optional)
-      dindStaging: "example-value"
+      dind-staging: "example-value"
 
     # Enable or disable model fallback for unresolved model selections. Set to false
     # for BYOK Azure OpenAI deployments to prevent deployment-name rewriting. Supports
@@ -2321,23 +2369,75 @@ sandbox:
     # Docker with a rootless AWF and network isolation; 'docker-sudo-iptables' runs
     # Docker with a privileged AWF, legacy iptables networking, and host/service
     # access (required for allow-host-ports and GitHub Actions services:
-    # connectivity); 'gvisor' runs the agent under gVisor's runsc runtime with strict
-    # network isolation; 'docker-sbx' runs the agent inside a Docker sbx KVM microVM
-    # (requires DOCKER_PAT and DOCKER_USERNAME secrets and a KVM-capable runner; the
-    # compiler handles the required privileged setup); 'cloud-hypervisor' runs the
-    # agent in AWF's preview Cloud Hypervisor microVM runtime on GitHub-hosted Ubuntu
-    # x86_64, sized at 2 vCPUs and 4096 MiB. Omitting runtime is equivalent to
-    # 'docker'. gvisor, docker-sbx and cloud-hypervisor are incompatible with
-    # runner.topology: arc-dind.
+    # connectivity); 'cloud-hypervisor' runs the agent in AWF's preview Cloud
+    # Hypervisor microVM runtime; 'nvx' runs the agent in AWF's fail-closed preview
+    # NVX microVM with secure defaults. Omitting runtime is equivalent to 'docker'.
     # (optional)
     runtime: "docker"
 
-    # Controls generation of sandbox runtime installation steps. Only valid with
-    # runtime: gvisor or runtime: docker-sbx. Defaults to true. Set to false when the
-    # runtime is already installed on the runner; docker-sbx credential refresh still
-    # runs.
+    # Optional overrides for AWF's fail-closed NVX preview runtime. Safe defaults
+    # apply when omitted. Artifact paths may be GitHub Actions expressions; setup
+    # verifies release provenance and stages trusted files before AWF starts.
     # (optional)
-    runtime-install: true
+    nvx:
+      # NVX preview is always enabled.
+      preview: true
+
+      # Strict AWF network isolation is always enabled.
+      network-isolation: true
+
+      # API proxy credential isolation is always enabled.
+      api-proxy: true
+
+      # (optional)
+      mount-policy: "workspace-only"
+
+      # Workload-specific guest distro layer directory; defaults to
+      # runner.temp/nvx/guest-layer and supports GitHub Actions expressions.
+      layer-path: "example-value"
+
+      # Path to the trusted, attested OpenVMM binary; defaults to
+      # runner.temp/nvx/openvmm and supports GitHub Actions expressions.
+      openvmm-path: "example-value"
+
+      # Path to the trusted, attested guest kernel; defaults to runner.temp/nvx/vmlinux
+      # and supports GitHub Actions expressions.
+      kernel-path: "example-value"
+
+      # Path to the trusted, attested guest initramfs; defaults to
+      # runner.temp/nvx/initramfs.cpio.gz and supports GitHub Actions expressions.
+      initramfs-path: "example-value"
+
+      # Path to the AWF release artifact manifest; defaults to
+      # runner.temp/nvx/nvx-test-x86_64.manifest.json and supports GitHub Actions
+      # expressions.
+      artifact-manifest-path: "example-value"
+
+      # Path to the offline Sigstore attestation bundle; defaults to
+      # runner.temp/nvx/nvx-test-x86_64.manifest.sigstore.jsonl and supports GitHub
+      # Actions expressions.
+      artifact-manifest-bundle-path: "example-value"
+
+      # Expected trusted workflow identity that signed the manifest.
+      # (optional)
+      signer-workflow: "github/gh-aw-firewall/.github/workflows/release.yml"
+
+      # (optional)
+      memory-mib: 1
+
+      # (optional)
+      memory-max-bytes: 1
+
+      # (optional)
+      pids-max: 1
+
+      # Optional bounded per-run guest-writable scratch image size in bytes.
+      # (optional)
+      scratch-bytes: 1
+
+      # Optional guest working directory, restricted to /workspace or a descendant.
+      # (optional)
+      container-workdir: "example-value"
 
     # Custom sandbox runtime configuration. Note: Network configuration is controlled
     # by the top-level 'network' field, not here.
@@ -2349,27 +2449,27 @@ sandbox:
       filesystem:
         # List of paths to deny read access
         # (optional)
-        denyRead: []
+        deny-read: []
           # Array of strings
 
         # List of paths to allow write access
         # (optional)
-        allowWrite: []
+        allow-write: []
           # Array of strings
 
         # List of paths to deny write access
         # (optional)
-        denyWrite: []
+        deny-write: []
           # Array of strings
 
       # Map of command patterns to paths that should ignore violations
       # (optional)
-      ignoreViolations:
+      ignore-violations:
         {}
 
       # Enable weaker nested sandbox mode (recommended: true for Docker access)
       # (optional)
-      enableWeakerNestedSandbox: true
+      enable-weaker-nested-sandbox: true
 
     # Per-provider API proxy target overrides. Settings are compiled into the AWF
     # config JSON.
@@ -2382,7 +2482,7 @@ sandbox:
         # provider's API. Overrides the provider default ("Authorization" for OpenAI,
         # "x-api-key" for Anthropic). Example: "api-key" for Azure OpenAI gateways.
         # (optional)
-        authHeader: "example-value"
+        auth-header: "example-value"
 
       # AWF API proxy target configuration for a single LLM provider.
       # (optional)
@@ -2391,7 +2491,7 @@ sandbox:
         # provider's API. Overrides the provider default ("Authorization" for OpenAI,
         # "x-api-key" for Anthropic). Example: "api-key" for Azure OpenAI gateways.
         # (optional)
-        authHeader: "example-value"
+        auth-header: "example-value"
 
       # AWF API proxy target configuration for the Copilot BYOK provider. Supports
       # injecting additional headers, body fields, and an optional session ID on
@@ -2401,20 +2501,20 @@ sandbox:
         # Custom authentication header name to use when forwarding requests to the Copilot
         # API. Example: "api-key" for Azure OpenAI gateways.
         # (optional)
-        authHeader: "example-value"
+        auth-header: "example-value"
 
         # Additional non-sensitive HTTP headers to inject on Copilot BYOK upstream
         # requests. Maps to AWF_BYOK_EXTRA_HEADERS. Example: { "x-openrouter-title":
         # "my-workflow" }.
         # (optional)
-        extraHeaders:
+        extra-headers:
           {}
 
         # Additional non-sensitive JSON body fields to inject on Copilot BYOK upstream
         # requests. Maps to AWF_BYOK_EXTRA_BODY_FIELDS. Example: { "custom-field":
         # "custom-value" }.
         # (optional)
-        extraBodyFields:
+        extra-body-fields:
           {}
 
         # Optional session identifier injected as the x-session-id request header and
@@ -2423,7 +2523,7 @@ sandbox:
         # strict OpenAI-compatible upstreams (e.g. Azure OpenAI) reject the unknown
         # session_id body field with HTTP 400. Example: "${{ github.run_id }}".
         # (optional)
-        sessionId: "example-value"
+        session-id: "example-value"
 
     # Additional host TCP ports the agent may connect to. Requires runtime:
     # docker-sudo-iptables. Ports published by `services:` are reached via
@@ -2443,31 +2543,31 @@ sandbox:
       # Array of path patterns that deny read access in the sandboxed environment. Takes
       # precedence over other read permissions.
       # (optional)
-      denyRead: []
+      deny-read: []
         # Array of strings
 
       # Array of path patterns that allow write access in the sandboxed environment.
       # Paths outside these patterns are read-only.
       # (optional)
-      allowWrite: []
+      allow-write: []
         # Array of strings
 
       # Array of path patterns that deny write access in the sandboxed environment.
       # Takes precedence over other write permissions.
       # (optional)
-      denyWrite: []
+      deny-write: []
         # Array of strings
 
     # When true, log sandbox violations without blocking execution. Useful for
     # debugging and gradual enforcement of sandbox policies.
     # (optional)
-    ignoreViolations:
+    ignore-violations:
       {}
 
     # When true, allows nested sandbox processes to run with relaxed restrictions.
     # Required for certain containerized tools that spawn subprocesses.
     # (optional)
-    enableWeakerNestedSandbox: true
+    enable-weaker-nested-sandbox: true
 
   # MCP Gateway configuration for routing MCP server calls through a unified HTTP
   # gateway. Requires the 'mcp-gateway' feature flag to be enabled. Per MCP Gateway
@@ -2596,15 +2696,52 @@ engine:
   # (optional)
   model: "example-value"
 
+  # Ordered alternative models after model-specific failures, supported by engines
+  # with a built-in retry harness. Each model receives its own harness retry budget.
+  # Cannot be combined with model-routing or a custom driver or harness.
+  # (optional)
+  fallback-models: []
+    # Array of strings
+
+  # Experimental per-run GitHub Copilot model and reasoning-effort selection from
+  # the task text for Copilot, Claude, Codex, and pi engines; requires the AWF
+  # firewall and ignores fixed model and effort settings. See
+  # https://github.github.com/gh-aw/reference/model-routing/.
+  # (optional)
+  model-routing:
+    # Routing objective: cost prefers the cheapest model-and-effort choice meeting the
+    # quality bar; cost-speed also weighs execution time.
+    goal: "cost"
+
+    # Routing quality profile: economy, balanced, and robust set increasing quality
+    # bars, generally with increasing cost; auto lets the classifier recommend one of
+    # these profiles per task.
+    mode: "economy"
+
+    # Required Copilot models the router may select and the routed task may call;
+    # declared sub-agent models are admitted separately. Provider qualification is
+    # added by the compiler. Must satisfy models.allowed and models.blocked; GitHub
+    # Actions expressions are rejected when either policy is set. Candidate lists from
+    # imported workflows using the same engine are merged. Unavailable models and
+    # models not covered by routing tables are not selected.
+    allowed-models: []
+      # Array of strings
+
+  # Optional model context window metadata for engines that need to register
+  # explicit model catalog entries. Supported by the Pi engine when generating its
+  # AWF gateway models.json; other engines ignore it and emit a warning.
+  # (optional)
+  context-window: 1
+
   # Optional inference provider override for this engine. Defaults to the engine's
   # native provider (copilot: github, claude: anthropic, codex: openai, pi: github).
   # (optional)
   model-provider: "github"
 
-  # Claude permission mode override. Defaults to acceptEdits (or auto when
-  # tools.edit is false).
+  # Claude permission mode override. Defaults to dontAsk for unattended runs. Other
+  # modes may approve actions beyond tools pre-approved by the workflow.
   # (optional)
-  permission-mode: "auto"
+  permission-mode: "default"
 
   # Maximum number of continuations for multi-run autopilot mode. Default is 1
   # (single run, no autopilot). Values greater than 1 enable --autopilot mode for
@@ -2799,8 +2936,9 @@ engine:
     # (optional)
     location: "example-value"
 
-  # Additional TOML configuration text that will be appended to the generated
-  # config.toml in the action (codex engine only)
+  # Additional engine configuration text. Codex accepts TOML structurally merged
+  # into config.toml. Pi accepts a JSON object with settings, model metadata
+  # overrides, MCP exposure settings, and session persistence options.
   # (optional)
   config: "example-value"
 
@@ -2822,15 +2960,18 @@ engine:
   args: []
     # Array of strings
 
-  # When true, disables automatic loading of context and custom instructions by the
-  # AI engine. The engine-specific flag depends on the engine: copilot uses
-  # --no-custom-instructions (suppresses .github/AGENTS.md and user-level custom
-  # instructions), claude uses --bare (suppresses CLAUDE.md memory files), codex
-  # uses --no-system-prompt (suppresses the default system prompt), gemini sets
-  # GEMINI_SYSTEM_MD=/dev/null (overrides the built-in system prompt with an empty
-  # one). Defaults to false.
+  # When true, disables automatic loading of context and custom instructions where
+  # supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi
+  # disables context-file, skill, prompt-template, extension, and theme discovery
+  # while retaining explicit workflow infrastructure extensions. Codex and Gemini do
+  # not support this option and emit a warning. Defaults to false.
   # (optional)
   bare: true
+
+  # Whether dynamic workflows are enabled for engines that support them. Defaults to
+  # false. Copilot dynamic workflows are experimental.
+  # (optional)
+  dynamic-workflows: true
 
   # Engine-level MCP gateway configuration. Settings here apply to the MCP gateway
   # used by this engine.
@@ -2980,12 +3121,18 @@ engine:
       body-inject:
         {}
 
-  # When true, disables automatic loading of context and custom instructions by the
-  # AI engine. The engine-specific flag depends on the engine: copilot uses
-  # --no-custom-instructions, claude uses --bare, codex uses --no-system-prompt,
-  # gemini sets GEMINI_SYSTEM_MD=/dev/null. Defaults to false.
+  # When true, disables automatic loading of context and custom instructions where
+  # supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi
+  # disables context-file, skill, prompt-template, extension, and theme discovery
+  # while retaining explicit workflow infrastructure extensions. Codex and Gemini do
+  # not support this option and emit a warning. Defaults to false.
   # (optional)
   bare: true
+
+  # Whether dynamic workflows are enabled for engines that support them. Defaults to
+  # false. Copilot dynamic workflows are experimental.
+  # (optional)
+  dynamic-workflows: true
 
 # Format 4: Engine definition: full declarative metadata for a named engine entry
 # (used in builtin engine shared workflow files such as @builtin:engines/*.md)
@@ -3363,10 +3510,10 @@ max-turns: 1
 # Format 2: GitHub Actions expression that resolves to an integer at runtime
 max-turns: "example-value"
 
-# Copilot SDK safeguard threshold for repeated tool denials before stopping
-# inference. Defaults to 5 when omitted. Supports GitHub Actions expressions (for
-# example, '${{ inputs.max-tool-denials }}'). Supported only with engine 'copilot'
-# and engine.copilot-sdk: true.
+# Safeguard threshold for repeated tool denials before stopping inference.
+# Supports the built-in Copilot SDK driver and Pi CLI, SDK, and RPC drivers.
+# Defaults to 5 for Copilot SDK when omitted. Supports GitHub Actions expressions
+# (for example, '${{ inputs.max-tool-denials }}').
 # (optional)
 # Accepted formats:
 
@@ -3375,6 +3522,19 @@ max-tool-denials: 1
 
 # Format 2: GitHub Actions expression that resolves to an integer at runtime
 max-tool-denials: "example-value"
+
+# Maximum aggregate number of tool dispatches for the workflow run, including
+# nested calls. Enforced before execution by the built-in Copilot SDK driver and
+# Pi CLI, SDK, and RPC drivers. Supports GitHub Actions expressions. Custom
+# drivers cannot enforce this contract.
+# (optional)
+# Accepted formats:
+
+# Format 1: integer
+max-tool-calls: 1
+
+# Format 2: GitHub Actions expression that resolves to an integer at runtime
+max-tool-calls: "example-value"
 
 # Per-run AI Credits budget control for firewall cost enforcement. Enabled by
 # default at 1000 (1k) when omitted. Set to -1 to disable both budget enforcement
@@ -3397,8 +3557,8 @@ max-ai-credits: "example-value"
 # (optional)
 max-turn-cache-misses: 1
 
-# 24-hour AI Credits guardrail for runs triggered by the same user. Omit the field
-# to leave the guardrail disabled. Supports GitHub Actions expressions.
+# 24-hour AI Credits guardrail for all runs of this workflow. Omit the field to
+# leave the guardrail disabled. Supports GitHub Actions expressions.
 # (optional)
 # Accepted formats:
 
@@ -3410,8 +3570,9 @@ max-daily-ai-credits: 1
 # Format 3: string
 max-daily-ai-credits: "example-value"
 
-# Format 4: Object form: specify a 'value' (the credit limit) and an optional
-# 'github-app' to mint a dedicated token for the guardrail API calls.
+# Format 4: Object form: specify a 'value' (the credit limit), an optional
+# 'github-app' to mint a dedicated token for the guardrail API calls, an optional
+# backend, and optional error handling.
 max-daily-ai-credits:
   # The maximum AI Credits budget (positive integer, K/M suffix, or expression). To
   # disable the guardrail, use the scalar form `max-daily-ai-credits: -1` instead.
@@ -3621,6 +3782,18 @@ max-daily-ai-credits:
       # rejected by the compiler). GitHub App-only permission.
       # (optional)
       workflows: "read"
+
+  # When true, an unknown daily AI Credits total produces a warning and allows the
+  # workflow to continue. Defaults to false.
+  # (optional)
+  continue-on-error: true
+
+  # Optional storage backend for the daily AI Credits rolling ledger. Use
+  # 'repo-memory' to read and write date-bucketed JSONL ledger files through
+  # tools.repo-memory. It selects the memory named 'default', or the first
+  # configured memory when no default exists.
+  # (optional)
+  backend: "repo-memory"
 
 # MCP server definitions
 # (optional)
@@ -4031,8 +4204,10 @@ tools:
     # Opts out of cross-visibility protections for private-to-public data flows. Set
     # to 'allow' for a blanket opt-out (disables forcePublicRepos and default
     # sink-visibility enforcement), or provide an array of MCP server IDs to exempt
-    # only those servers from default sink-visibility enforcement. Incompatible with
-    # strict mode when set to 'allow'. See MCP Gateway Specification Section 10.9.
+    # only those servers from default sink-visibility enforcement. Both forms are
+    # rejected in strict mode and emit a warning in non-strict mode because action
+    # logs are public and agents may expose private data. See MCP Gateway
+    # Specification Section 10.9.
     # (optional)
     # Accepted formats:
 
@@ -4041,7 +4216,7 @@ tools:
     private-to-public-flows: "allow"
 
     # Format 2: Selective exemption: disables default sink-visibility enforcement for
-    # the listed MCP server IDs only. Compatible with strict mode.
+    # the listed MCP server IDs only. Not allowed in strict mode.
     private-to-public-flows: []
       # Array items: MCP server ID to exempt from sink-visibility enforcement
 
@@ -4064,7 +4239,7 @@ tools:
     # Optional Linear API key or OAuth access token secret reference. Defaults to ${{
     # secrets.LINEAR_API_KEY }}.
     # (optional)
-    token: "${{ secrets.LINEAR_API_KEY }}"
+    token: "example-value"
 
     # Linear MCP toolset name(s) to enable. Toolsets are expanded to gateway-enforced
     # allowed tools.
@@ -4083,13 +4258,14 @@ tools:
     # List of allowed Linear MCP tool names or wildcard patterns. When toolsets are
     # set, every pattern must match a tool in those toolsets.
     # (optional)
-    allowed: ["*"]
+    allowed: []
       # Array of strings
 
     # Whether failure to connect to Linear should fail MCP gateway startup. Defaults
     # to true.
     # (optional)
     required: true
+
   # Jira tools provided by Atlassian's remote Rovo MCP service. This integration
   # supports non-interactive CI/CD authentication only.
   # (optional)
@@ -4105,8 +4281,9 @@ tools:
     # (optional)
     url: "example-value"
 
-    # Approved read-only Jira MCP tools the agent may call. Required; all-tools access
-    # and write-capable tools are not supported.
+    # Approved read-only Jira MCP tools the agent may call. Required; write-capable
+    # tools are not supported. "*" expands to all approved read-only tools; the full,
+    # unrestricted MCP tool set can never be enabled.
     allowed: []
       # Array of strings
 
@@ -4240,6 +4417,75 @@ tools:
 
   # Format 2: Enable agentic-workflows tool with default settings (same as true)
   agentic-workflows: null
+
+  # Read the immutable version-3 activation snapshot. Nonworkers without approved
+  # dispatch targets are read-only observers; workers and approved dispatchers may
+  # stage scoped queue intents. The installed ledger Policy is authoritative. Only
+  # Git storage is supported.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: Enable read-only queue observation, or queue-control intents when
+  # approved worker dispatch targets are configured.
+  work-queue: true
+
+  # Format 2: Enable the work-queue MCP server.
+  work-queue: null
+
+  # Format 3: object
+  work-queue:
+    # Fail closed and block safe outputs when no trusted inbound worker assignment is
+    # present.
+    # (optional)
+    require-assignment: true
+
+    # Declare this workflow as a work-queue worker eligible to receive trusted queue
+    # claims.
+    # (optional)
+    worker: true
+
+    # Mirror only this run's admitted Work and original authenticated Claims to GitHub
+    # Issues. Git remains authoritative; requires installed projector rules.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    issues: true
+
+    # Format 2: object
+    issues:
+      # Repository label prefix; GitHub labels are limited to 50 characters, leaving at
+      # most 33 bytes for the prefix before the longest status suffix, ': Needs
+      # attention'.
+      # (optional)
+      label: "example-value"
+
+    # Declare one schema-validated JSON memory snapshot per Claim. The compiler
+    # supplies credential-free preparation and protected immutable git-tree delivery.
+    # (optional)
+    memory:
+      # (optional)
+      name: "My Workflow"
+
+      # Fixed relative JSON file path in the snapshot tree.
+      path: "example-value"
+
+      # Fixed repository also authorized by the installed immutable Work scope.
+      target-repo: "example-value"
+
+      base-revision: "example-value"
+
+      branch-prefix: "example-value"
+
+      # (optional)
+      max-bytes: 1
+
+      # Bounded inline typed JSON Schema subset: object
+      # properties/required/additionalProperties, array items, scalar enum, numeric
+      # ranges, and string/array length bounds. No references, regexes, or executable
+      # validators.
+      schema:
+        {}
 
   # Cache memory MCP configuration for persistent memory storage
   # (optional)
@@ -4475,6 +4721,36 @@ tools:
   # (optional)
   cli-proxy: true
 
+  # Standalone Git-backed ledger configuration. Declare type: log, set, map, table,
+  # counter, or notes for trusted built-in replay. Custom replay and compaction
+  # scripts are not supported. Tables require key (the string primary-key field).
+  # Built-ins accept typed operations via the configured ledger safe-output tools.
+  # Each ledger may set compaction; compaction is lossless and preserves all source
+  # transactions.
+  # (optional)
+  ledger:
+    # Built-in ledger reducer type, or a named object-valued ledger.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: string
+    type: "log"
+
+    # Format 2: object
+    type:
+      {}
+
+    # Table primary-key field, or a named object-valued ledger.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: string
+    key: "example-value"
+
+    # Format 2: object
+    key:
+      {}
+
   # Repo memory configuration for git-based persistent storage
   # (optional)
   # Accepted formats:
@@ -4552,6 +4828,12 @@ tools:
     # committed, making them human-readable in the repository (default: false)
     # (optional)
     format-json: true
+
+    # Experimental. Enable the repo-memory ledger projection, optionally validated
+    # against a repository-relative JSON schema. Ledger workflows require AWF Cloud
+    # Hypervisor filesystem isolation. Using this field emits a compile-time warning.
+    # (optional)
+    ledger: null
 
     # Custom domain validation hook for this repo-memory entry
     # (optional)
@@ -4694,6 +4976,11 @@ safe-outputs:
     # '[analysis] ')
     # (optional)
     title-prefix: "example-value"
+
+    # Deterministic template appended after the agent-generated issue body. Available
+    # placeholders: {workflow_name}, {run_url}.
+    # (optional)
+    body-footer: "example-value"
 
     # Require create_issue tool calls to include a temporary_id.
     # (optional)
@@ -8375,9 +8662,12 @@ safe-outputs:
 
     # Protected files prevent workflow run approval when modified by the associated
     # pull request. Use exclude to remove filenames or path prefixes from the default
-    # protected set.
+    # protected set, or a leading / for an exact repository path.
     # (optional)
     protected-files:
+      # Basenames (e.g. AGENTS.md) and path prefixes (e.g. .agents/) remove protection
+      # everywhere they match. A leading / excludes only the exact repository path (e.g.
+      # /pyproject.toml), leaving same-named nested files protected.
       # (optional)
       exclude: []
         # Array of strings
@@ -8730,7 +9020,9 @@ safe-outputs:
   # Experimental. Create Linear issues through the isolated safe_outputs job.
   # (optional)
   linear-create-issue:
-    # Trusted Linear team model UUID.
+    # Optional trusted Linear team model UUID, key, name, or GitHub Actions
+    # expression. Defaults to LINEAR_TEAM_ID.
+    # (optional)
     team-id: "example-value"
 
     # Optional trusted Linear project identifier from a project URL or model UUID.
@@ -9259,6 +9551,11 @@ safe-outputs:
     # (optional)
     title-prefix: "example-value"
 
+    # Deterministic template appended after the agent-generated pull request body.
+    # Available placeholders: {workflow_name}, {run_url}.
+    # (optional)
+    body-footer: "example-value"
+
     # Optional list of labels to attach to the pull request. Accepts an array of label
     # names or a GitHub Actions expression resolving to a comma-separated list (e.g.
     # '${{ inputs.labels }}').
@@ -9718,8 +10015,9 @@ safe-outputs:
     # Token used to push an empty commit after PR creation to trigger CI events. Works
     # around the GITHUB_TOKEN limitation where pushes don't trigger workflow runs.
     # Defaults to the magic secret GH_AW_CI_TRIGGER_TOKEN if set in the repository.
-    # Use a secret expression (e.g. '${{ secrets.CI_TOKEN }}') for a custom token, or
-    # 'app' for GitHub App auth.
+    # Use a secret expression (e.g. '${{ secrets.CI_TOKEN }}') for a custom token,
+    # 'app' for GitHub App auth, or 'none' to skip the extra empty commit and keep
+    # GH_AW_CI_TRIGGER_TOKEN out of the compiled workflow.
     # (optional)
     github-token-for-extra-empty-commit: "example-value"
 
@@ -9763,8 +10061,8 @@ safe-outputs:
 
       # List of filenames or path prefixes to remove from the default protected-file
       # set. Items are matched by basename (e.g. "AGENTS.md") or path prefix (e.g.
-      # ".agents/"). Use this to allow the agent to modify specific files that are
-      # otherwise blocked by default.
+      # ".agents/"). A leading / matches only the exact repository path (e.g.
+      # "/pyproject.toml"), keeping nested files with the same name protected.
       # (optional)
       exclude: []
         # Array of strings
@@ -10431,10 +10729,11 @@ safe-outputs:
     allowed-events: []
       # Array of strings
 
-    # When true, after posting a replacement review this workflow dismisses older
-    # REQUEST_CHANGES reviews previously posted by the same workflow on the same pull
-    # request. This is best-effort and requires workflow markers in prior review
-    # bodies.
+    # When true, a clean COMMENT review with no inline findings dismisses older
+    # REQUEST_CHANGES bot reviews from the same workflow on the same pull request.
+    # Blocking reviews and reviews with inline findings do not trigger dismissal,
+    # newer reviews are never dismissed, and this best-effort behavior requires
+    # workflow provenance markers in prior review bodies.
     # (optional)
     supersede-older-reviews: true
 
@@ -11843,6 +12142,11 @@ safe-outputs:
     # (optional)
     driver: "example-value"
 
+    # Trusted queue SARIF destination ref. It must independently resolve to the
+    # immutable worker revision before upload.
+    # (optional)
+    target-ref: "example-value"
+
     # GitHub token to use for this specific output type. Overrides global github-token
     # if specified.
     # (optional)
@@ -12346,6 +12650,446 @@ safe-outputs:
   # 10)
   autofix-code-scanning-alert: null
 
+  # Experimental. Create Azure DevOps work items through a trusted safe-output
+  # handler. Using this field emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-create-work-item:
+    # (optional)
+    work-item-type: "example-value"
+
+    # (optional)
+    description-field: "example-value"
+
+    # (optional)
+    area-path: "example-value"
+
+    # (optional)
+    iteration-path: "example-value"
+
+    # (optional)
+    assignee: "example-value"
+
+    # (optional)
+    tags: []
+      # Array of strings
+
+    # (optional)
+    allowed-tags: []
+      # Array of strings
+
+    # (optional)
+    custom-fields:
+      {}
+
+    # (optional)
+    artifact-link:
+      # (optional)
+      enabled: true
+
+      # (optional)
+      repository: "example-value"
+
+      # (optional)
+      branch: "example-value"
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-create-work-item: null
+
+  # Experimental. Update explicitly scoped Azure DevOps work items and explicitly
+  # enabled fields. Using this field emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-update-work-item:
+    # Accepted formats:
+
+    # Format 1: integer
+    target: 1
+
+    # Format 3: array
+    target: []
+      # Array items: integer
+
+    # Format 4: string
+    target: "example-value"
+
+    # (optional)
+    status: true
+
+    # (optional)
+    title: true
+
+    # (optional)
+    body: true
+
+    # (optional)
+    markdown-body: true
+
+    # (optional)
+    title-prefix: "example-value"
+
+    # (optional)
+    tag-prefix: "example-value"
+
+    # (optional)
+    area-path: true
+
+    # (optional)
+    iteration-path: true
+
+    # (optional)
+    assignee: true
+
+    # (optional)
+    tags: true
+
+    # (optional)
+    allowed-tags: []
+      # Array of strings
+
+    # (optional)
+    allowed-area-prefixes: []
+      # Array of strings
+
+    # (optional)
+    allowed-iteration-prefixes: []
+      # Array of strings
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-update-work-item: null
+
+  # Experimental. Comment on explicitly scoped Azure DevOps work items. Using this
+  # field emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-comment-on-work-item:
+    # Accepted formats:
+
+    # Format 1: integer
+    target: 1
+
+    # Format 3: array
+    target: []
+      # Array items: integer
+
+    # Format 4: string
+    target: "example-value"
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-comment-on-work-item: null
+
+  # Experimental. Assign an Azure DevOps identity to a work item. Using this field
+  # emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-assign-work-item:
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    target: 1
+
+    # Format 3: array
+    target: []
+      # Array items: integer
+
+    # Format 4: string
+    target: "example-value"
+
+    # (optional)
+    allowed: []
+      # Array of strings
+
+    # (optional)
+    blocked: []
+      # Array of strings
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-assign-work-item: null
+
+  # Experimental. Link explicitly scoped Azure DevOps work items. Using this field
+  # emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-link-work-items:
+    # Accepted formats:
+
+    # Format 1: integer
+    target: 1
+
+    # Format 3: array
+    target: []
+      # Array items: integer
+
+    # Format 4: string
+    target: "example-value"
+
+    # (optional)
+    allowed-link-types: []
+      # Array of strings
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-link-work-items: null
+
+  # Experimental. Upload a staged workspace file to an Azure DevOps work item. Using
+  # this field emits a compile-time warning.
+  # (optional)
+  # Accepted formats:
+
+  # Format 1: object
+  ado-upload-workitem-attachment:
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    target: 1
+
+    # Format 3: array
+    target: []
+      # Array items: integer
+
+    # Format 4: string
+    target: "example-value"
+
+    # (optional)
+    max-file-size: 1
+
+    # (optional)
+    allowed-extensions: []
+      # Array of strings
+
+    # (optional)
+    comment-prefix: "example-value"
+
+    # A positive integer value that may also be specified as a GitHub Actions
+    # expression string that resolves to an integer at runtime (e.g. '${{
+    # inputs.max-runs }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max: "example-value"
+
+    # A boolean value that may also be specified as a GitHub Actions expression string
+    # that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: boolean
+    staged: true
+
+    # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+    staged: "example-value"
+
+    # Internal hidden feature. Optional declarative sample payloads for deterministic
+    # safe-output replay.
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: array
+    samples: []
+      # Array items: object
+
+    # Format 2: object
+    samples:
+      {}
+
+  # Format 2: null
+  ado-upload-workitem-attachment: null
+
   # Enable AI agents to create GitHub Check Runs that surface analysis results in
   # the PR checks UI. Requires checks: write permission.
   # (optional)
@@ -12652,8 +13396,8 @@ safe-outputs:
     blocked: []
       # Array of strings
 
-    # Optional maximum number of labels to add (default: 3) Supports integer or GitHub
-    # Actions expression (e.g. '${{ inputs.max }}').
+    # Optional maximum number of add_labels calls (default: 5). Supports integer or
+    # GitHub Actions expression (e.g. '${{ inputs.max }}').
     # (optional)
     # Accepted formats:
 
@@ -12662,6 +13406,17 @@ safe-outputs:
 
     # Format 2: GitHub Actions expression that resolves to an integer at runtime
     max: "example-value"
+
+    # Maximum number of labels per add_labels call (default: 10). Supports integer or
+    # GitHub Actions expression (e.g. '${{ inputs.max_labels }}').
+    # (optional)
+    # Accepted formats:
+
+    # Format 1: integer
+    max-labels: 1
+
+    # Format 2: GitHub Actions expression that resolves to an integer at runtime
+    max-labels: "example-value"
 
     # When false, excludes issues:write from the minted GitHub App token for
     # add-labels. Default (omitted or true) includes issues:write.
@@ -12716,6 +13471,13 @@ safe-outputs:
     # repository. Default (omitted or false) rejects labels that don't already exist.
     # (optional)
     create-if-missing: true
+
+    # Optional JSON Schema that narrows each labels item in the add_labels MCP tool.
+    # The schema must remain compatible with the built-in string or object label
+    # schema and may only tighten fields, required properties, or values.
+    # (optional)
+    item-schema:
+      {}
 
     # When true, emit step summary messages instead of making GitHub API calls for
     # this specific output type (preview mode)
@@ -13902,6 +14664,12 @@ safe-outputs:
     # github.event.issue.number or github.event.pull_request.number.
     # (optional)
     target: null
+
+    # Only assign an agent if all these labels are currently present on the target
+    # issue or pull request.
+    # (optional)
+    required-labels: []
+      # Array of strings
 
     # Target repository in format 'owner/repo' for cross-repository agent assignment.
     # Takes precedence over trial target repo settings.
@@ -16096,14 +16864,16 @@ safe-outputs:
     # Works around the GITHUB_TOKEN limitation where pushes don't trigger workflow
     # runs. Defaults to the magic secret GH_AW_CI_TRIGGER_TOKEN if set in the
     # repository. Use a secret expression (e.g. '${{ secrets.CI_TOKEN }}') for a
-    # custom token, or 'app' for GitHub App auth.
+    # custom token, 'app' for GitHub App auth, or 'none' to skip the extra empty
+    # commit and keep GH_AW_CI_TRIGGER_TOKEN out of the compiled workflow.
     # (optional)
     github-token-for-extra-empty-commit: "example-value"
 
     # When true (default), if pushing to the PR branch fails due to a
-    # non-fast-forward/diverged branch, create a fallback pull request that targets
-    # the original PR branch. Set to false to disable this behavior and avoid
-    # requiring pull-requests: write permission.
+    # non-fast-forward/diverged branch or an exhausted workflow-permission check
+    # timeout, create a fallback pull request that targets the original PR branch. Set
+    # to false to disable this behavior and avoid requiring pull-requests: write
+    # permission.
     # (optional)
     fallback-as-pull-request: true
 
@@ -16391,8 +17161,8 @@ safe-outputs:
 
       # List of filenames or path prefixes to remove from the default protected-file
       # set. Items are matched by basename (e.g. "AGENTS.md") or path prefix (e.g.
-      # ".agents/"). Use this to allow the agent to modify specific files that are
-      # otherwise blocked by default.
+      # ".agents/"). A leading / matches only the exact repository path (e.g.
+      # "/pyproject.toml"), keeping nested files with the same name protected.
       # (optional)
       exclude: []
         # Array of strings
@@ -19019,7 +19789,7 @@ safe-outputs:
   # Format 1: Configuration for no-op safe output (logging only, no GitHub API
   # calls). Always available as a fallback to ensure human-visible artifacts.
   noop:
-    # Maximum number of noop messages (default: 1) Supports integer or GitHub Actions
+    # Maximum number of noop messages (default: 2) Supports integer or GitHub Actions
     # expression (e.g. '${{ inputs.max }}').
     # (optional)
     # Accepted formats:
@@ -19267,7 +20037,7 @@ safe-outputs:
         # (optional)
         workflows: "read"
 
-  # Format 2: Enable noop output with default configuration (max: 1)
+  # Format 2: Enable noop output with default configuration (max: 2)
   noop: null
 
   # Format 3: Explicitly disable noop output (false). Noop is enabled by default
@@ -19836,6 +20606,11 @@ safe-outputs:
   # Format 1: ⚠️ Experimental. Configuration for uploading a code coverage report
   # via actions/upload-code-coverage
   upload-code-coverage:
+    # Trusted queue coverage target; independently resolved to the immutable worker
+    # revision before upload.
+    # (optional)
+    target-ref: "example-value"
+
     # Fixed fail-on-error input passed to actions/upload-code-coverage (fixed; the
     # agent cannot override this value). When true (default), the upload job fails if
     # the upload or processing fails.
@@ -20461,15 +21236,52 @@ safe-outputs:
       # (optional)
       model: "example-value"
 
+      # Ordered alternative models after model-specific failures, supported by engines
+      # with a built-in retry harness. Each model receives its own harness retry budget.
+      # Cannot be combined with model-routing or a custom driver or harness.
+      # (optional)
+      fallback-models: []
+        # Array of strings
+
+      # Experimental per-run GitHub Copilot model and reasoning-effort selection from
+      # the task text for Copilot, Claude, Codex, and pi engines; requires the AWF
+      # firewall and ignores fixed model and effort settings. See
+      # https://github.github.com/gh-aw/reference/model-routing/.
+      # (optional)
+      model-routing:
+        # Routing objective: cost prefers the cheapest model-and-effort choice meeting the
+        # quality bar; cost-speed also weighs execution time.
+        goal: "cost"
+
+        # Routing quality profile: economy, balanced, and robust set increasing quality
+        # bars, generally with increasing cost; auto lets the classifier recommend one of
+        # these profiles per task.
+        mode: "economy"
+
+        # Required Copilot models the router may select and the routed task may call;
+        # declared sub-agent models are admitted separately. Provider qualification is
+        # added by the compiler. Must satisfy models.allowed and models.blocked; GitHub
+        # Actions expressions are rejected when either policy is set. Candidate lists from
+        # imported workflows using the same engine are merged. Unavailable models and
+        # models not covered by routing tables are not selected.
+        allowed-models: []
+          # Array of strings
+
+      # Optional model context window metadata for engines that need to register
+      # explicit model catalog entries. Supported by the Pi engine when generating its
+      # AWF gateway models.json; other engines ignore it and emit a warning.
+      # (optional)
+      context-window: 1
+
       # Optional inference provider override for this engine. Defaults to the engine's
       # native provider (copilot: github, claude: anthropic, codex: openai, pi: github).
       # (optional)
       model-provider: "github"
 
-      # Claude permission mode override. Defaults to acceptEdits (or auto when
-      # tools.edit is false).
+      # Claude permission mode override. Defaults to dontAsk for unattended runs. Other
+      # modes may approve actions beyond tools pre-approved by the workflow.
       # (optional)
-      permission-mode: "auto"
+      permission-mode: "default"
 
       # Maximum number of continuations for multi-run autopilot mode. Default is 1
       # (single run, no autopilot). Values greater than 1 enable --autopilot mode for
@@ -20664,8 +21476,9 @@ safe-outputs:
         # (optional)
         location: "example-value"
 
-      # Additional TOML configuration text that will be appended to the generated
-      # config.toml in the action (codex engine only)
+      # Additional engine configuration text. Codex accepts TOML structurally merged
+      # into config.toml. Pi accepts a JSON object with settings, model metadata
+      # overrides, MCP exposure settings, and session persistence options.
       # (optional)
       config: "example-value"
 
@@ -20687,15 +21500,18 @@ safe-outputs:
       args: []
         # Array of strings
 
-      # When true, disables automatic loading of context and custom instructions by the
-      # AI engine. The engine-specific flag depends on the engine: copilot uses
-      # --no-custom-instructions (suppresses .github/AGENTS.md and user-level custom
-      # instructions), claude uses --bare (suppresses CLAUDE.md memory files), codex
-      # uses --no-system-prompt (suppresses the default system prompt), gemini sets
-      # GEMINI_SYSTEM_MD=/dev/null (overrides the built-in system prompt with an empty
-      # one). Defaults to false.
+      # When true, disables automatic loading of context and custom instructions where
+      # supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi
+      # disables context-file, skill, prompt-template, extension, and theme discovery
+      # while retaining explicit workflow infrastructure extensions. Codex and Gemini do
+      # not support this option and emit a warning. Defaults to false.
       # (optional)
       bare: true
+
+      # Whether dynamic workflows are enabled for engines that support them. Defaults to
+      # false. Copilot dynamic workflows are experimental.
+      # (optional)
+      dynamic-workflows: true
 
       # Engine-level MCP gateway configuration. Settings here apply to the MCP gateway
       # used by this engine.
@@ -20845,12 +21661,18 @@ safe-outputs:
           body-inject:
             {}
 
-      # When true, disables automatic loading of context and custom instructions by the
-      # AI engine. The engine-specific flag depends on the engine: copilot uses
-      # --no-custom-instructions, claude uses --bare, codex uses --no-system-prompt,
-      # gemini sets GEMINI_SYSTEM_MD=/dev/null. Defaults to false.
+      # When true, disables automatic loading of context and custom instructions where
+      # supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi
+      # disables context-file, skill, prompt-template, extension, and theme discovery
+      # while retaining explicit workflow infrastructure extensions. Codex and Gemini do
+      # not support this option and emit a warning. Defaults to false.
       # (optional)
       bare: true
+
+      # Whether dynamic workflows are enabled for engines that support them. Defaults to
+      # false. Copilot dynamic workflows are experimental.
+      # (optional)
+      dynamic-workflows: true
 
     # Format 4: Engine definition: full declarative metadata for a named engine entry
     # (used in builtin engine shared workflow files such as @builtin:engines/*.md)
@@ -21301,6 +22123,12 @@ safe-outputs:
     # (optional)
     environment: "example-value"
 
+    # Optional HTTPS base URL for a mirror of pinned threat-detect release assets. The
+    # compiler appends the pinned release tag and asset name; compiler-supplied
+    # SHA-256 digests remain authoritative.
+    # (optional)
+    artifact-base-url: "example-value"
+
     # When true (default), detection failures produce warnings and allow safe outputs
     # to proceed with a caution notice and 'needs-review' label. When false, detection
     # failures block safe outputs entirely. Accepts a boolean literal or a GitHub
@@ -21327,6 +22155,13 @@ safe-outputs:
   # (e.g., 'send-notification' becomes 'send_notification').
   # (optional)
   jobs:
+    {}
+
+  # Queue-worker custom delivery adapters. Prepared jobs/actions/steps receive
+  # isolated Claim inputs without write credentials; effects are applied by the
+  # trusted handler and independently verified, never inferred from job success.
+  # (optional)
+  claim-adapters:
     {}
 
   # Inline JavaScript script handlers that run inside the consolidated safe-outputs
@@ -21480,6 +22315,211 @@ safe-outputs:
   # Format 2: Advanced configuration for @mention filtering with fine-grained
   # control
   mentions:
+    # Dedicated token for resolving mention allowlists in the trusted safe_outputs
+    # job. It is not exposed to agent-job ingestion and does not inherit other
+    # safe-output credentials or affect write operations.
+    # (optional)
+    github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+    # Dedicated GitHub App for resolving mention allowlists in the trusted
+    # safe_outputs job. Its token is read-only, takes precedence over
+    # mentions.github-token, and does not inherit safe-outputs.github-app.
+    # (optional)
+    github-app:
+      # Deprecated alias for client-id. GitHub App ID/client ID (e.g., '${{ vars.APP_ID
+      # }}').
+      # (optional)
+      app-id: "example-value"
+
+      # GitHub App client ID (e.g., '${{ vars.APP_ID }}'). Required to mint a GitHub App
+      # token.
+      # (optional)
+      client-id: "example-value"
+
+      # GitHub App private key (e.g., '${{ secrets.APP_PRIVATE_KEY }}'). Required to
+      # mint a GitHub App token.
+      # (optional)
+      private-key: "example-value"
+
+      # If true, skip token minting when client-id/private-key resolve to empty strings
+      # at runtime. Defaults to false.
+      # (optional)
+      ignore-if-missing: true
+
+      # Optional owner of the GitHub App installation (defaults to current repository
+      # owner if not specified)
+      # (optional)
+      owner: "example-value"
+
+      # Optional list of repositories to grant access to (defaults to current repository
+      # if not specified)
+      # (optional)
+      repositories: []
+        # Array of strings
+
+      # Optional extra GitHub App-only permissions to merge into the minted token. Takes
+      # effect for tools.github.github-app and safe-outputs.github-app; ignored in
+      # on.github-app and the top-level github-app fallback. Use to add GitHub App-only
+      # scopes (e.g. members, organization-administration) not expressible via standard
+      # handler declarations.
+      # (optional)
+      permissions:
+        # Permission level for repository administration (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission for repository administration.
+        # (optional)
+        administration: "read"
+
+        # Permission level for Codespaces (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        codespaces: "read"
+
+        # Permission level for Codespaces lifecycle administration (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        codespaces-lifecycle-admin: "read"
+
+        # Permission level for Codespaces metadata (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        codespaces-metadata: "read"
+
+        # Permission level for user email addresses (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        email-addresses: "read"
+
+        # Permission level for repository environments (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        environments: "read"
+
+        # Permission level for git signing (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        git-signing: "read"
+
+        # Permission level for organization members (read/none; "write" is rejected by the
+        # compiler). Required for org team membership API calls.
+        # (optional)
+        members: "read"
+
+        # Permission level for organization administration (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-administration: "read"
+
+        # Permission level for organization announcement banners (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-announcement-banners: "read"
+
+        # Permission level for organization Codespaces (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-codespaces: "read"
+
+        # Permission level for organization Copilot (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-copilot: "read"
+
+        # Permission level for organization custom org roles (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-org-roles: "read"
+
+        # Permission level for organization custom properties (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-properties: "read"
+
+        # Permission level for organization custom repository roles (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-custom-repository-roles: "read"
+
+        # Permission level for organization events (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-events: "read"
+
+        # Permission level for organization webhooks (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-hooks: "read"
+
+        # Permission level for organization members management (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-members: "read"
+
+        # Permission level for organization packages (read/none; "write" is rejected by
+        # the compiler). GitHub App-only permission.
+        # (optional)
+        organization-packages: "read"
+
+        # Permission level for organization personal access token requests (read/none;
+        # "write" is rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-personal-access-token-requests: "read"
+
+        # Permission level for organization personal access tokens (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-personal-access-tokens: "read"
+
+        # Permission level for organization plan (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        organization-plan: "read"
+
+        # Permission level for organization self-hosted runners (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-self-hosted-runners: "read"
+
+        # Permission level for organization user blocking (read/none; "write" is rejected
+        # by the compiler). GitHub App-only permission.
+        # (optional)
+        organization-user-blocking: "read"
+
+        # Permission level for repository custom properties (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        repository-custom-properties: "read"
+
+        # Permission level for secret scanning alerts (read/none). Forwarded as
+        # permission-secret-scanning-alerts input for actions/create-github-app-token.
+        # (optional)
+        secret-scanning-alerts: "read"
+
+        # Permission level for repository webhooks (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        repository-hooks: "read"
+
+        # Permission level for single file access (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        single-file: "read"
+
+        # Permission level for team discussions (read/none; "write" is rejected by the
+        # compiler). GitHub App-only permission.
+        # (optional)
+        team-discussions: "read"
+
+        # Permission level for Dependabot vulnerability alerts (read/none; "write" is
+        # rejected by the compiler). Also available as a GITHUB_TOKEN scope. When used
+        # with a GitHub App, forwarded as permission-vulnerability-alerts input.
+        # (optional)
+        vulnerability-alerts: "read"
+
+        # Permission level for GitHub Actions workflow files (read/none; "write" is
+        # rejected by the compiler). GitHub App-only permission.
+        # (optional)
+        workflows: "read"
+
     # Allow mentions of repository collaborators (users with repository access,
     # excluding bots). Default: true
     # (optional)
@@ -21498,10 +22538,11 @@ safe-outputs:
 
     # List of team slugs whose members are always allowed to be mentioned. Accepts
     # 'team-slug' (resolved against the current org) or 'org/team-slug' format. Team
-    # members are fetched from the GitHub API at runtime; bots are excluded.
-    # IMPORTANT: requires read:org scope — not available with the default
-    # GITHUB_TOKEN. Use a classic PAT with read:org, a fine-grained PAT with
-    # Members:Read, or a GitHub App with the Members:Read permission. Without the
+    # members are resolved in the trusted safe_outputs job; bots are excluded.
+    # Requires the mention-resolution token to have read:org scope, which the default
+    # github.token does not provide. Configure safe-outputs.mentions.github-token with
+    # a classic PAT or fine-grained PAT with Members:Read, or
+    # safe-outputs.mentions.github-app with the Members:Read permission. Without the
     # required scope, team lookups fail with a warning and those members are skipped.
     # (optional)
     allowed-teams: []
@@ -21525,6 +22566,13 @@ safe-outputs:
   # this by specifying their own footer field. Defaults to true.
   # (optional)
   footer: true
+
+  # Deterministic template appended to every safe output body, in addition to
+  # handler-specific body-footer content and independently of the generated
+  # attribution footer. Imported body footers are additive. Available placeholders:
+  # {workflow_name}, {run_url}.
+  # (optional)
+  body-footer: "example-value"
 
   # When set to false or "false", disables all activation and fallback comments
   # entirely (run-started, run-success, run-failure, PR/issue creation links).
@@ -21552,22 +22600,31 @@ safe-outputs:
   # those categories trigger issues. If only prefixed (excluded) categories are
   # specified, all categories except those trigger issues. If both are specified,
   # categories must match included AND not match excluded. Common categories:
-  # agent_failure, timed_out, missing_safe_outputs, report_incomplete, missing_tool,
-  # missing_data, inference_access_error, mcp_policy_error,
-  # ai_credits_rate_limit_error, max_ai_credits_exceeded.
+  # agent_failure, timed_out, transport_wedge, missing_safe_outputs,
+  # report_incomplete, missing_tool, missing_data, inference_access_error,
+  # mcp_policy_error, ai_credits_rate_limit_error, max_ai_credits_exceeded,
+  # daily_ai_credits_unknown.
   report-failure-as-issue: []
     # Array items: string
 
   # Repository to create failure tracking issues in, in the format 'owner/repo'.
   # Useful when the current repository has issues disabled. Defaults to the current
-  # repository.
+  # repository. Supports GitHub Actions expressions (e.g. '${{
+  # inputs.failure-issue-repo }}') so reusable workflows can let callers configure
+  # this at runtime.
   # (optional)
   failure-issue-repo: "example-value"
 
   # Controls whether to report failed non-builtin jobs as issues (default: true).
-  # Set to false to disable.
+  # Set to false to disable. Supports GitHub Actions expressions.
   # (optional)
+  # Accepted formats:
+
+  # Format 1: boolean
   report-failed-jobs: true
+
+  # Format 2: GitHub Actions expression that resolves to a boolean at runtime
+  report-failed-jobs: "example-value"
 
   # Maximum number of bot trigger references (e.g. 'fixes #123', 'closes #456')
   # allowed in output before all of them are neutralized. Default: 10. Supports
@@ -22543,12 +23600,20 @@ runtimes:
 # Checkout configuration for the agent job. Controls how actions/checkout is
 # invoked. Can be a single checkout configuration, an array for multiple
 # checkouts, or false to disable the default checkout step entirely (dev-mode
-# checkouts are unaffected).
+# checkouts are unaffected). Set pull-request: false in a checkout configuration
+# to disable the generated PR branch checkout and its associated base-config
+# snapshot/restore steps.
 # (optional)
 # Accepted formats:
 
 # Format 1: Single checkout configuration for the default workspace
 checkout:
+  # Set to false to disable the compiler-generated PR branch checkout and its
+  # associated base-config snapshot/restore steps. The normal repository checkout
+  # remains enabled.
+  # (optional)
+  pull-request: true
+
   # Repository to checkout in owner/repo format. Defaults to the current repository.
   # (optional)
   repository: "example-value"
@@ -23259,8 +24324,8 @@ import-schema:
 model: "example-value"
 
 # ⚠️ Experimental. Deterministic graders for workflow-run observations. Built-in
-# graders use execution artifacts, custom graders use inline scripts, and the
-# operational-value grader uses a repository evaluator.
+# graders use execution artifacts, custom graders use inline JavaScript, and the
+# operational-value grader uses either inline Bash or a repository Bash evaluator.
 # (optional)
 graders:
   {}

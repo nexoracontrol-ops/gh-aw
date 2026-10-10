@@ -141,7 +141,8 @@ func (c *Compiler) addActivationSetupAndWorkflowCallSteps(ctx *activationJobBuil
 	if enableArtifactClient {
 		artifactClientCondition = maxDailyAICreditsConfiguredIfExpr
 	}
-	ctx.steps = append(ctx.steps, c.generateSetupStepWithArtifactClientCondition(
+	ctx.steps = append(ctx.steps, c.generateSetupStepForJob(
+		"activation",
 		ctx.data,
 		setupActionRef,
 		SetupActionDestination,
@@ -220,6 +221,7 @@ func (c *Compiler) addActivationEngineOutputs(ctx *activationJobBuildContext, en
 	ctx.steps = append(ctx.steps, awInfoYAML.String())
 	ctx.outputs["engine_id"] = "${{ steps.generate_aw_info.outputs.engine_id }}"
 	ctx.outputs["model"] = "${{ steps.generate_aw_info.outputs.model }}"
+	ctx.outputs["aw_context"] = "${{ steps.generate_aw_info.outputs.aw_context }}"
 	if operationalValueGraderEnabled(ctx.data) {
 		ctx.outputs["run_created_at"] = "${{ steps.generate_aw_info.outputs.run_created_at }}"
 	}

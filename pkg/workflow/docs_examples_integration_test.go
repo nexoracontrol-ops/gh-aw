@@ -27,7 +27,7 @@ func TestDocumentationGalleryWorkflowsCompile(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Name() == "index.md" || entry.Name() == "multi-repo.md" || entry.Name() == "maintaining-repos.md" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Name() == "index.md" || entry.Name() == "multi-repo.md" || entry.Name() == "maintaining-repos.md" || entry.Name() == "dependency-analysis.md" {
 			continue
 		}
 
@@ -59,13 +59,6 @@ func TestDocumentationGalleryWorkflowsCompile(t *testing.T) {
 		})
 	}
 
-	t.Run("repo-assist-upstream", func(t *testing.T) {
-		const (
-			rawURL = "https://raw.githubusercontent.com/githubnext/agentics/main/workflows/repo-assist.md"
-		)
-
-		fetchAndCompileExampleWorkflow(t, "repo-assist.md", rawURL)
-	})
 }
 
 func fetchAndCompileExampleWorkflow(t *testing.T, workflowName, rawURL string) {

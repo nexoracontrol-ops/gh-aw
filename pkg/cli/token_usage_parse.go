@@ -24,7 +24,8 @@ func parseTokenUsageFile(filePath string) (*TokenUsageSummary, error) {
 
 func buildTokenUsageSummary(entries []TokenUsageEntry, duplicateRecordCount int) *TokenUsageSummary {
 	summary := &TokenUsageSummary{
-		ByModel: make(map[string]*ModelTokenUsage),
+		ByModel:     make(map[string]*ModelTokenUsage),
+		agentModels: make(map[string]*ModelTokenUsage),
 	}
 	if len(entries) == 0 {
 		tokenUsageLog.Print("No token usage entries found")
@@ -32,6 +33,9 @@ func buildTokenUsageSummary(entries []TokenUsageEntry, duplicateRecordCount int)
 	}
 
 	for _, entry := range entries {
+		if summary.endpoint == "" {
+			summary.endpoint = entry.Path
+		}
 		// Aggregate totals
 		summary.TotalInputTokens += entry.InputTokens
 		summary.TotalOutputTokens += entry.OutputTokens
@@ -60,6 +64,12 @@ func buildTokenUsageSummary(entries []TokenUsageEntry, duplicateRecordCount int)
 		m.Requests++
 		m.DurationMs += entry.DurationMs
 		m.ResponseBytes += entry.ResponseBytes
+		if model != "unknown" && (entry.Purpose == "" || entry.Purpose == "agent" || entry.Purpose == "subagent") {
+			if summary.agentModels[model] == nil {
+				summary.agentModels[model] = &ModelTokenUsage{Provider: entry.Provider}
+			}
+			summary.agentModels[model].Requests++
+		}
 	}
 
 	tokenUsageLog.Printf("Parsed %d entries: %d input, %d output, %d cache_read, %d cache_write, %d requests",
@@ -239,7 +249,11 @@ func extractAmbientContextMetrics(entries []TokenUsageEntry) *AmbientContextMetr
 		return 0
 	})
 
-	firstCall := ordered[0].entry
+	var firstCall TokenUsageEntry
+	for _, entry := range ordered {
+		firstCall = entry.entry
+		break
+	}
 	return &AmbientContextMetrics{
 		InputTokens:  firstCall.InputTokens,
 		CachedTokens: firstCall.CacheReadTokens,

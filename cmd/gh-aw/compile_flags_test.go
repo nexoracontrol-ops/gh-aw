@@ -2,7 +2,14 @@
 
 package main
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/github/gh-aw/pkg/cli"
+	"github.com/spf13/cobra"
+)
 
 func TestCompileCommandShortFlags(t *testing.T) {
 	t.Parallel()
@@ -10,6 +17,7 @@ func TestCompileCommandShortFlags(t *testing.T) {
 	if forceFlag == nil {
 		t.Fatal("expected --force flag on compile command")
 	}
+
 	if forceFlag.Shorthand != "f" {
 		t.Fatalf("expected --force shorthand to be -f, got -%s", forceFlag.Shorthand)
 	}
@@ -39,11 +47,94 @@ func TestCompileCommandShortFlags(t *testing.T) {
 	}
 }
 
+func TestCompileDevelopmentRejectsExplicitFalseFlags(t *testing.T) {
+	t.Parallel()
+	for _, name := range cli.DryRunRequiredBoolFlags() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			cmd.Flags().Bool("dry-run", false, "")
+			cmd.Flags().Bool(name, false, "")
+			if err := cmd.ParseFlags([]string{"--dry-run", "--" + name + "=false"}); err != nil {
+				t.Fatal(err)
+			}
+			opts := getCompileCmdOptions(cmd)
+			if enabled, supplied := opts.toCompileConfig(nil).ExplicitBoolFlags[name]; !supplied || enabled {
+				t.Fatalf("explicit --%s=false was not propagated", name)
+			}
+			if err := runCompileCmd(cmd, nil); err == nil || !strings.Contains(err.Error(), "--"+name+"=false") || !strings.Contains(err.Error(), "remove") {
+				t.Fatalf("expected actionable rejection before compilation, got %v", err)
+			}
+			if err := cmd.Flags().Set(name, "true"); err != nil {
+				t.Fatal(err)
+			}
+			opts = getCompileCmdOptions(cmd)
+			if err := cli.ValidateDevelopmentCompileFlags(opts.dryRun, opts.explicitBoolFlags); err != nil {
+				t.Fatalf("explicitly enabling required check should be accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestCompileDevelopmentAllowsOptionalDockerChecks(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"false", "true"} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			cmd := &cobra.Command{}
+			cmd.Flags().Bool("dry-run", false, "")
+			scanners := []string{
+				"validate-images", "zizmor", "actionlint", "poutine", "runner-guard",
+				"syft", "grype", "grant", "yamllint",
+			}
+			args := []string{"--dry-run"}
+			for _, name := range scanners {
+				cmd.Flags().Bool(name, false, "")
+				args = append(args, "--"+name+"="+value)
+			}
+			if err := cmd.ParseFlags(args); err != nil {
+				t.Fatal(err)
+			}
+			opts := getCompileCmdOptions(cmd)
+			if err := cli.ValidateDevelopmentCompileFlags(opts.dryRun, opts.explicitBoolFlags); err != nil {
+				t.Fatalf("Docker checks must remain optional in dry-run mode: %v", err)
+			}
+			config := opts.toCompileConfig(nil)
+			for _, actual := range []bool{
+				config.ValidateImages, config.Zizmor, config.Actionlint, config.Poutine,
+				config.RunnerGuard, config.Syft, config.Grype, config.Grant, config.Yamllint,
+			} {
+				if actual != (value == "true") {
+					t.Fatalf("optional Docker check value %q was not preserved", value)
+				}
+			}
+		})
+	}
+}
+
 func TestCompileOptionsPropagateForceRefreshContainerPins(t *testing.T) {
 	t.Parallel()
 	config := (&compileCmdOptions{forceRefreshContainerPins: true}).toCompileConfig(nil)
 	if !config.ForceRefreshContainerPins {
 		t.Fatal("expected ForceRefreshContainerPins to be propagated to CompileConfig")
+	}
+}
+
+func TestCompileOptionsPropagateAllowExperimental(t *testing.T) {
+	t.Parallel()
+	flag := compileCmd.Flags().Lookup("allow-experimental")
+	if flag == nil || flag.DefValue != "false" {
+		t.Fatal("expected --allow-experimental to default to false")
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("allow-experimental", false, "")
+	if err := cmd.ParseFlags([]string{"--allow-experimental"}); err != nil {
+		t.Fatal(err)
+	}
+	opts := getCompileCmdOptions(cmd)
+	if !opts.toCompileConfig(nil).AllowExperimental {
+		t.Fatal("expected experimental opt-in to reach CompileConfig")
 	}
 }
 
@@ -61,5 +152,47 @@ func TestCompileOptionsPropagateModels(t *testing.T) {
 	config := (&compileCmdOptions{models: true}).toCompileConfig(nil)
 	if !config.Models {
 		t.Fatal("expected Models to be propagated to CompileConfig")
+	}
+}
+
+func TestCompileOptionsPropagateRequireSelfHostedRunners(t *testing.T) {
+	t.Parallel()
+
+	flag := compileCmd.Flags().Lookup("require-self-hosted-runners")
+	if flag == nil {
+		t.Fatal("expected --require-self-hosted-runners flag on compile command")
+	}
+
+	if flag.DefValue != "false" {
+		t.Fatalf("expected --require-self-hosted-runners default to be false, got %s", flag.DefValue)
+	}
+
+	config := (&compileCmdOptions{requireSelfHostedRunners: true}).toCompileConfig(nil)
+	if !config.RequireSelfHostedRunners {
+		t.Fatal("expected RequireSelfHostedRunners to be propagated to CompileConfig")
+	}
+}
+
+func TestCompileDevelopmentAndEnvironmentFlags(t *testing.T) {
+	t.Parallel()
+	for name, defaultValue := range map[string]string{"dry-run": "false", "environment": ""} {
+		flag := compileCmd.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != defaultValue {
+			t.Fatalf("expected --%s with default %q, got %v", name, defaultValue, flag)
+		}
+		if compileCmd.Flags().Lookup("dev") != nil {
+			t.Fatal("expected --dev to be replaced by --dry-run")
+		}
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("dry-run", false, "")
+	cmd.Flags().String("environment", "", "")
+	if err := cmd.ParseFlags([]string{"--dry-run", "--environment", "test: #1"}); err != nil {
+		t.Fatal(err)
+	}
+	opts := getCompileCmdOptions(cmd)
+	config := opts.toCompileConfig(nil)
+	if !config.DryRun || config.EnvironmentOverride != "test: #1" {
+		t.Fatalf("development flags were not propagated: %+v", config)
 	}
 }

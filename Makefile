@@ -10,6 +10,8 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 DOCKER_IMAGE=ghcr.io/github/gh-aw
 DOCKER_PLATFORMS=linux/amd64,linux/arm64
 BASE_REF ?= origin/main
+# Use the runtime's locked Prettier version from every working directory.
+PRETTIER := $(abspath actions/setup/js/node_modules/.bin/prettier)
 JS_IMPACTED_TEST_EXCLUDES=--exclude '**/*.integration.test.cjs' --exclude '**/frontmatter_hash_github_api.test.cjs'
 CI_WORKFLOW_FILE ?= ci.yml
 CI_COVERAGE_ARTIFACT_PATTERN ?= ci-integration-coverage-*
@@ -262,6 +264,7 @@ check-cjs-syntax:
 
 .PHONY: test-js
 test-js: build-js
+	node --test scripts/pr-sous-chef.test.mjs
 	cd actions/setup/js && npm run test:js -- --no-file-parallelism
 	cd eslint-factory && npm test
 
@@ -487,10 +490,11 @@ bundle-js:
 	@echo "✓ bundle-js tool built"
 	@echo "To bundle a JavaScript file: ./bundle-js <input-file> [output-file]"
 
-# Run Bash script tests (check-stale-lock-files, check-workflow-drift, check-cgo-cjs-workflow-purity)
+# Run script tests (authentication probes, stale locks, workflow drift, and workflow purity).
 .PHONY: test-scripts
 test-scripts: build
-	@echo "Running Bash script tests..."
+	@echo "Running script tests..."
+	node --test scripts/agy-authentication.test.cjs
 	bash scripts/extract-workflow-frontmatter-keys_test.sh
 	bash scripts/check-stale-lock-files_test.sh
 	bash scripts/check-skill-file-paths_test.sh
@@ -498,8 +502,12 @@ test-scripts: build
 	bash scripts/resolve-base-commit_test.sh
 	bash scripts/check-workflow-drift_test.sh ./$(BINARY_NAME)
 	bash scripts/check-cgo-cjs-workflow-purity_test.sh
+	bash scripts/update-threat-detect-pins_test.sh
+	bash actions/setup/sh/collect_usage_artifact_files_test.sh
 	bash actions/setup/sh/copy_gh_aw_binary_for_mcp_test.sh
-	@echo "✓ All Bash script tests passed"
+	bash actions/setup/sh/create_gh_aw_tmp_dir_test.sh
+	bash actions/setup/sh/download_docker_images_local_test.sh
+	@echo "✓ All script tests passed"
 
 # Test all code (Go, JavaScript, wasm golden, and shell scripts)
 .PHONY: test-all
@@ -630,8 +638,8 @@ check-node-version:
 	@if ! command -v node >/dev/null 2>&1; then \
 		echo "Error: Node.js is not installed."; \
 		echo ""; \
-		echo "This project requires Node.js 20 or higher."; \
-		echo "Please install Node.js 20+ and try again."; \
+		echo "This project requires Node.js 24 or higher."; \
+		echo "Please install Node.js 24+ and try again."; \
 		echo ""; \
 		echo "For installation instructions, see:"; \
 		echo "  https://github.com/github/gh-aw/blob/main/CONTRIBUTING.md#prerequisites"; \
@@ -640,10 +648,10 @@ check-node-version:
 	NODE_VERSION=$$(node --version); \
 	NODE_VERSION_NUM=$$(echo "$$NODE_VERSION" | sed 's/v//'); \
 	NODE_MAJOR=$$(echo "$$NODE_VERSION_NUM" | cut -d. -f1); \
-	if [ "$$NODE_MAJOR" -lt 20 ]; then \
+	if [ "$$NODE_MAJOR" -lt 24 ]; then \
 		echo "Error: Node.js version $$NODE_VERSION is not supported."; \
 		echo ""; \
-		echo "This project requires Node.js 20 or higher."; \
+		echo "This project requires Node.js 24 or higher."; \
 		echo "Your current version: $$NODE_VERSION"; \
 		echo ""; \
 		echo "Please upgrade Node.js and try again."; \
@@ -985,8 +993,8 @@ fmt-go:
 fmt-cjs:
 	@echo "→ Formatting JavaScript files..."
 	@cd actions/setup/js && npm run format:cjs --silent >/dev/null 2>&1
-	@cd eslint-factory && npx prettier --write '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore --log-level=error 2>&1
-	@npx prettier --write 'scripts/**/*.js' --ignore-path .prettierignore --log-level=error 2>&1
+	@cd eslint-factory && "$(PRETTIER)" --write '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore --log-level=error 2>&1
+	@"$(PRETTIER)" --write 'scripts/**/*.js' --ignore-path .prettierignore --log-level=error 2>&1
 	@echo "✓ JavaScript files formatted"
 
 # Format JSON files in pkg directory (excluding actions/setup/js, which is handled by npm script)
@@ -994,7 +1002,7 @@ fmt-cjs:
 fmt-json:
 	@echo "→ Formatting JSON files..."
 	@cd actions/setup/js && npm run format:pkg-json --silent >/dev/null 2>&1
-	@npx prettier --write 'pkg/cli/data/models.json' 'actions/setup/js/models.json' --ignore-path .prettierignore --log-level=error 2>&1
+	@"$(PRETTIER)" --write 'pkg/cli/data/models.json' 'actions/setup/js/models.json' --ignore-path .prettierignore --log-level=error 2>&1
 	@echo "✓ JSON files formatted"
 
 # Check formatting
@@ -1011,8 +1019,8 @@ fmt-check:
 .PHONY: fmt-check-cjs
 fmt-check-cjs:
 	cd actions/setup/js && npm run lint:cjs
-	cd eslint-factory && npx prettier --check '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore
-	npx prettier --check 'scripts/**/*.js' --ignore-path .prettierignore
+	cd eslint-factory && "$(PRETTIER)" --check '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore
+	"$(PRETTIER)" --check 'scripts/**/*.js' --ignore-path .prettierignore
 
 # Check JSON file formatting in pkg directory (excluding actions/setup/js, which is handled by npm script)
 .PHONY: fmt-check-json
@@ -1161,6 +1169,13 @@ install: build
 .PHONY: generate-schema-docs
 generate-schema-docs:
 	node scripts/generate-schema-docs.js
+
+.PHONY: session-schemas check-session-schemas
+session-schemas:
+	cd actions/setup/js && npm run schema:session
+
+check-session-schemas:
+	cd actions/setup/js && npm run schema:session:check
 
 # Generate agent factory documentation page
 .PHONY: generate-agent-factory
@@ -1315,6 +1330,23 @@ update: build
 	$(MAKE) sync-install-script-hashes
 	$(MAKE) build
 
+# Update the reviewed threat-detect release pins and generated workflows
+.PHONY: update-threat-detect-pins
+update-threat-detect-pins:
+	@if [ -z "$(THREAT_DETECT_VERSION)" ]; then \
+		echo "Usage: make update-threat-detect-pins THREAT_DETECT_VERSION=v0.5.2"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(THREAT_DETECT_VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "Error: THREAT_DETECT_VERSION must be a semantic release tag such as v0.5.2"; \
+		echo "Usage: make update-threat-detect-pins THREAT_DETECT_VERSION=v0.5.2"; \
+		exit 1; \
+	fi
+	bash scripts/update-threat-detect-pins.sh "$(THREAT_DETECT_VERSION)"
+	$(MAKE) fmt
+	$(MAKE) recompile
+	@echo "✓ Threat-detect pins updated; review pkg/constants/version_constants.go, pkg/constants/version_constants_test.go, and generated workflow locks together."
+
 # Run development server
 .PHONY: dev
 dev: build
@@ -1431,7 +1463,7 @@ help:
 	@echo "  deps             - Install dependencies"
 	@echo "  deps-dev         - Install development dependencies (includes tools)"
 	@echo "  install-shellcheck - Install pinned shellcheck binary"
-	@echo "  check-node-version - Check Node.js version (20 or higher required)"
+	@echo "  check-node-version - Check Node.js version (24 or higher required)"
 	@echo "  golint           - Run golangci-lint (full repository scan)"
 	@echo "  golint-incremental - Run golangci-lint incrementally (only changed files, requires BASE_REF)"
 	@echo "  lint             - Run linter"
@@ -1469,12 +1501,15 @@ help:
 	@echo "  check-stale-compat - Guard: detect when compat.json max-agent is out of sync with DefaultCopilotVersion"
 	@echo "  sync-install-script-hashes - Update install-gh-aw.sh SHA and SHA256 constants in pkg/cli/copilot_setup.go (runs automatically during update)"
 	@echo "  update           - Update GitHub Actions and workflows, sync action pins, and rebuild binary"
+	@echo "  update-threat-detect-pins - Update reviewed threat-detect pins; set THREAT_DETECT_VERSION=vX.Y.Z"
 	@echo "  fix              - Apply automatic codemod-style fixes to workflow files (depends on build)"
 	@echo "  recompile        - Recompile all workflow files (runs init, depends on build)"
 	@echo "  merge-main       - Format, merge main, recompile workflows, and format again"
 	@echo "  compile-cli-workflows - Compile workflows in pkg/cli/workflows (builds binary if missing)"
 	@echo "  dependabot       - Generate Dependabot manifests for npm dependencies in workflows"
 	@echo "  generate-schema-docs - Generate frontmatter full reference documentation from JSON schema"
+	@echo "  session-schemas - Generate canonical and unified session JSON schemas from TypeScript declarations"
+	@echo "  check-session-schemas - Check generated session schemas for declaration drift"
 	@echo "  generate-agent-factory     - Generate agent factory documentation page"
 	@echo "  generate-llms-txt  - Generate llms.txt at repository root from .github/aw/*.md"
 	@echo "  build-slides     - Build slides with Marp to docs/public/slides/gh-aw.html"

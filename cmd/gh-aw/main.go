@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sort"
@@ -27,6 +28,11 @@ var (
 // Global flags
 var verboseFlag bool
 var bannerFlag bool
+
+// printVersion writes the CLI name and version string to the given writer.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "%s version %s\n", string(constants.CLIExtensionPrefix), version)
+}
 
 // formatListWithOr formats a list of strings with commas and "or" before the last item
 // Example: ["a", "b", "c"] -> "a, b, or c"
@@ -79,9 +85,8 @@ func validateEngine(engine string) error {
 }
 
 var rootCmd = &cobra.Command{
-	Use:     string(constants.CLIExtensionPrefix),
-	Short:   "GitHub Agentic Workflows CLI",
-	Version: version,
+	Use:   string(constants.CLIExtensionPrefix),
+	Short: "GitHub Agentic Workflows CLI",
 	Long: `GitHub Agentic Workflows CLI
 
 Common Tasks:
@@ -104,6 +109,14 @@ For detailed help on any command, use:
 		}
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if versionFlag, _ := cmd.Flags().GetBool("version"); versionFlag {
+			// Reset the flag's value immediately so repeated in-process
+			// executions (e.g. tests reusing rootCmd) don't keep printing
+			// the version after a run that didn't pass --version.
+			_ = cmd.Flags().Set("version", "false")
+			printVersion(os.Stdout)
+			return nil
+		}
 		return cmd.Help()
 	},
 }
@@ -387,12 +400,13 @@ var versionCmd = &cobra.Command{
 	Long:    `Print the current version and build information for the gh aw CLI extension.`,
 	Example: `  ` + string(constants.CLIExtensionPrefix) + ` version   # Print the current version`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Fprintf(os.Stderr, "%s version %s\n", string(constants.CLIExtensionPrefix), version)
+		printVersion(os.Stdout)
 		return nil
 	},
 }
 
 type compileCmdOptions struct {
+	explicitBoolFlags         map[string]bool
 	engineOverride            string
 	actionMode                string
 	actionTag                 string
@@ -403,11 +417,15 @@ type compileCmdOptions struct {
 	logicalRepo               string
 	scheduleSeed              string
 	priorManifestFile         string
+	environment               string
+	dryRun                    bool
+	allowExperimental         bool
 	validate                  bool
 	watch                     bool
 	noEmit                    bool
 	purge                     bool
 	strict                    bool
+	requireSelfHostedRunners  bool
 	trial                     bool
 	dependabot                bool
 	forceOverwrite            bool
@@ -445,6 +463,9 @@ func getCompileCmdOptions(cmd *cobra.Command) compileCmdOptions {
 	actionTag, _ := cmd.Flags().GetString("action-tag")
 	actionsRepo, _ := cmd.Flags().GetString("actions-repo")
 	ghAwRef, _ := cmd.Flags().GetString("gh-aw-ref")
+	environment, _ := cmd.Flags().GetString("environment")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	allowExperimental, _ := cmd.Flags().GetBool("allow-experimental")
 	validate, _ := cmd.Flags().GetBool("validate")
 	watch, _ := cmd.Flags().GetBool("watch")
 	dir, _ := cmd.Flags().GetString("dir")
@@ -452,6 +473,7 @@ func getCompileCmdOptions(cmd *cobra.Command) compileCmdOptions {
 	noEmit, _ := cmd.Flags().GetBool("no-emit")
 	purge, _ := cmd.Flags().GetBool("purge")
 	strict, _ := cmd.Flags().GetBool("strict")
+	requireSelfHostedRunners, _ := cmd.Flags().GetBool("require-self-hosted-runners")
 	trial, _ := cmd.Flags().GetBool("trial")
 	logicalRepo, _ := cmd.Flags().GetString("logical-repo")
 	dependabot, _ := cmd.Flags().GetBool("dependabot")
@@ -485,14 +507,26 @@ func getCompileCmdOptions(cmd *cobra.Command) compileCmdOptions {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	useSamples, _ := cmd.Flags().GetBool("use-samples")
 	return compileCmdOptions{
-		engineOverride: engineOverride, actionMode: actionMode, actionTag: actionTag, actionsRepo: actionsRepo, ghAwRef: ghAwRef,
+		explicitBoolFlags: getExplicitDevelopmentBoolFlags(cmd),
+		engineOverride:    engineOverride, actionMode: actionMode, actionTag: actionTag, actionsRepo: actionsRepo, ghAwRef: ghAwRef,
 		dir: dir, workflowsDir: workflowsDir, logicalRepo: logicalRepo, scheduleSeed: scheduleSeed, priorManifestFile: priorManifestFile,
-		validate: validate, watch: watch, noEmit: noEmit, purge: purge, strict: strict, trial: trial, dependabot: dependabot,
+		environment: environment, dryRun: dryRun, allowExperimental: allowExperimental,
+		validate: validate, watch: watch, noEmit: noEmit, purge: purge, strict: strict, requireSelfHostedRunners: requireSelfHostedRunners, trial: trial, dependabot: dependabot,
 		forceOverwrite: forceOverwrite, refreshStopTime: refreshStopTime, forceRefreshActionPins: forceRefreshActionPins, forceRefreshContainerPins: forceRefreshContainerPins, allowActionRefs: allowActionRefs,
 		zizmor: zizmor, poutine: poutine, actionlint: actionlint, runnerGuard: runnerGuard, syft: syft, grype: grype, grant: grant, yamllint: yamllint, shellcheck: shellcheck,
 		jsonOutput: jsonOutput, showAllErrors: showAllErrors, fix: fix, stats: stats, models: models, failFast: failFast, noCheckUpdate: noCheckUpdate,
 		staged: staged, approve: approve, validateImages: validateImages, ghes: ghes, verbose: verbose, useSamples: useSamples,
 	}
+}
+
+func getExplicitDevelopmentBoolFlags(cmd *cobra.Command) map[string]bool {
+	flags := make(map[string]bool)
+	for _, name := range cli.DryRunRequiredBoolFlags() {
+		if cmd.Flags().Changed(name) {
+			flags[name], _ = cmd.Flags().GetBool(name)
+		}
+	}
+	return flags
 }
 
 func (o *compileCmdOptions) resolveGhAwRef(ctx context.Context) error {
@@ -517,9 +551,12 @@ func (o *compileCmdOptions) workflowDir() string {
 
 func (o *compileCmdOptions) toCompileConfig(args []string) cli.CompileConfig {
 	return cli.CompileConfig{
-		MarkdownFiles: args, Verbose: o.verbose, EngineOverride: o.engineOverride, ActionMode: o.actionMode, ActionTag: o.actionTag,
+		ExplicitBoolFlags: o.explicitBoolFlags,
+		MarkdownFiles:     args, Verbose: o.verbose, EngineOverride: o.engineOverride, ActionMode: o.actionMode, ActionTag: o.actionTag,
 		ActionsRepo: o.actionsRepo, Validate: o.validate, Watch: o.watch, WorkflowDir: o.workflowDir(),
 		NoEmit: o.noEmit, Purge: o.purge, TrialMode: o.trial, TrialLogicalRepoSlug: o.logicalRepo, Strict: o.strict,
+		RequireSelfHostedRunners: o.requireSelfHostedRunners,
+		EnvironmentOverride:      o.environment, DryRun: o.dryRun, AllowExperimental: o.allowExperimental,
 		Dependabot: o.dependabot, ForceOverwrite: o.forceOverwrite, RefreshStopTime: o.refreshStopTime, ForceRefreshActionPins: o.forceRefreshActionPins, ForceRefreshContainerPins: o.forceRefreshContainerPins,
 		AllowActionRefs: o.allowActionRefs, Zizmor: o.zizmor, Poutine: o.poutine, Actionlint: o.actionlint, RunnerGuard: o.runnerGuard,
 		Syft: o.syft, Grype: o.grype, Grant: o.grant, Yamllint: o.yamllint, Shellcheck: o.shellcheck, JSONOutput: o.jsonOutput, ShowAllErrors: o.showAllErrors,
@@ -530,6 +567,12 @@ func (o *compileCmdOptions) toCompileConfig(args []string) cli.CompileConfig {
 
 func runCompileCmd(cmd *cobra.Command, args []string) error {
 	opts := getCompileCmdOptions(cmd)
+	if err := cli.ValidateDevelopmentCompileFlags(opts.dryRun, opts.explicitBoolFlags); err != nil {
+		return err
+	}
+	if cmd.Flags().Changed("environment") && opts.environment == "" {
+		return errors.New("--environment requires a non-empty environment name")
+	}
 	if err := opts.resolveGhAwRef(cmd.Context()); err != nil {
 		return err
 	}
@@ -549,7 +592,6 @@ func runCompileCmd(cmd *cobra.Command, args []string) error {
 		}
 	}
 	config := opts.toCompileConfig(args)
-	cli.PrepareCompileModelValidation(cmd.Context(), &config)
 	if _, err := cli.CompileWorkflows(cmd.Context(), config); err != nil {
 		return err
 	}
@@ -558,9 +600,9 @@ func runCompileCmd(cmd *cobra.Command, args []string) error {
 
 type commandSet struct {
 	addCmd, addWizardCmd, editCmd, updateCmd, deployCmd, trialCmd, initCmd, statusCmd, listCmd                    *cobra.Command
-	mcpCmd, logsCmd, auditCmd, viewCmd, healthCmd, outcomesCmd, mcpServerCmd, prCmd, secretsCmd                   *cobra.Command
+	mcpCmd, logsCmd, auditCmd, sessionsCmd, viewCmd, healthCmd, outcomesCmd, mcpServerCmd, prCmd, secretsCmd      *cobra.Command
 	fixCmd, formatCmd, upgradeCmd, completionCmd, hashCmd, projectCmd, doctorCmd, checksCmd, validateCmd, lintCmd *cobra.Command
-	domainsCmd, experimentsCmd, forecastCmd, gradersCmd, modelsCmd, envCmd, jsonSchemaCmd                         *cobra.Command
+	domainsCmd, experimentsCmd, forecastCmd, gradersCmd, modelsCmd, envCmd, jsonSchemaCmd, workCmd                *cobra.Command
 }
 
 func fixPathForCommand(s string) string {
@@ -693,17 +735,13 @@ func configureRootCommand() {
 	rootCmd.AddGroup(&cobra.Group{ID: "utilities", Title: "Utilities:"})
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose output showing detailed information")
 	rootCmd.PersistentFlags().BoolVar(&bannerFlag, "banner", false, "Display ASCII logo banner with purple GitHub color theme")
+	rootCmd.Flags().Bool("version", false, "Print the current version")
 	rootCmd.SetOut(os.Stderr)
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
-	rootCmd.SetVersionTemplate(string(constants.CLIExtensionPrefix) + " version {{.Version}}\n")
 	rootCmd.InitDefaultHelpFlag()
 	if f := rootCmd.Flags().Lookup("help"); f != nil {
 		f.Usage = "Show help for " + string(constants.CLIExtensionPrefix)
-	}
-	rootCmd.InitDefaultVersionFlag()
-	if f := rootCmd.Flags().Lookup("version"); f != nil {
-		f.Usage = "Print the current version"
 	}
 	rootCmd.SetUsageFunc(rootUsageFunc)
 }
@@ -722,6 +760,7 @@ func createCommandSet() commandSet {
 		mcpCmd:         cli.NewMCPCommand(),
 		logsCmd:        cli.NewLogsCommand(),
 		auditCmd:       cli.NewAuditCommand(),
+		sessionsCmd:    cli.NewSessionsCommand(),
 		viewCmd:        cli.NewViewCommand(),
 		healthCmd:      cli.NewHealthCommand(),
 		outcomesCmd:    cli.NewOutcomesCommand(),
@@ -743,6 +782,7 @@ func createCommandSet() commandSet {
 		forecastCmd:    cli.NewForecastCommand(),
 		gradersCmd:     cli.NewGradersCommand(),
 		envCmd:         cli.NewEnvCommand(),
+		workCmd:        cli.NewWorkCommand(),
 		modelsCmd:      cli.NewModelsCommand(),
 		jsonSchemaCmd:  cli.NewJSONSchemaCommand(),
 	}
@@ -771,6 +811,10 @@ func configureCompileBuildFlags() {
 	compileCmd.Flags().Bool("no-emit", false, "Validate workflow without generating lock files")
 	compileCmd.Flags().Bool("purge", false, "Delete .lock.yml files that were not regenerated during compilation (only when no specific files are provided)")
 	compileCmd.Flags().Bool("strict", false, "Override frontmatter to enforce strict mode validation for all workflows (enforces action pinning, network config, safe-outputs, disallows write permissions and deprecated fields). Note: Workflows default to strict mode unless frontmatter sets strict: false")
+	compileCmd.Flags().Bool("dry-run", false, "Compile with strict validation, shellcheck, and model checks; Docker-based scanners are opt-in; report gate/scanner coverage; disable compiler-managed GitHub mutations, stage safe outputs, and record dry_run in aw_info.json; custom scripts and external MCP effects remain unverified; does not authorize execution, upload, or dispatch workflows")
+	compileCmd.Flags().Bool("allow-experimental", false, "Accept experimental-feature notices during dry-run compilation; notices remain visible and all other warnings and scanner failures remain fatal")
+	compileCmd.Flags().String("environment", "", "Override the environment on every generated job; fails for reusable-workflow caller jobs, which cannot declare an environment")
+	compileCmd.Flags().Bool("require-self-hosted-runners", false, "Fail compilation unless every generated workflow job selects a self-hosted runner")
 	compileCmd.Flags().Bool("trial", false, "Enable trial mode compilation (modifies workflows for trial execution)")
 	compileCmd.Flags().StringP("logical-repo", "l", "", "Repository to simulate workflow execution against (for trial mode)")
 	compileCmd.Flags().Bool("use-samples", false, "Hidden: replace the agentic 'Execute coding agent' step with a deterministic driver that replays the workflow's safe-outputs `samples` frontmatter entries through the safe-outputs MCP server. Used to make end-to-end tests deterministic.")
@@ -859,20 +903,22 @@ func assignCommandGroups(cmds commandSet) {
 	cmds.mcpCmd.GroupID, cmds.fixCmd.GroupID, cmds.formatCmd.GroupID, cmds.domainsCmd.GroupID = "development", "development", "development", "development"
 	runCmd.GroupID, enableCmd.GroupID, disableCmd.GroupID, cmds.trialCmd.GroupID = "execution", "execution", "execution", "execution"
 	cmds.logsCmd.GroupID, cmds.auditCmd.GroupID, cmds.viewCmd.GroupID = "analysis", "analysis", "analysis"
+	cmds.sessionsCmd.GroupID = "analysis"
 	cmds.healthCmd.GroupID, cmds.outcomesCmd.GroupID, cmds.checksCmd.GroupID = "analysis", "analysis", "analysis"
 	cmds.statusCmd.GroupID, cmds.listCmd.GroupID, cmds.experimentsCmd.GroupID, cmds.forecastCmd.GroupID, cmds.modelsCmd.GroupID = "analysis", "analysis", "analysis", "analysis", "analysis"
 	cmds.gradersCmd.GroupID = "analysis"
 	cmds.mcpServerCmd.GroupID, cmds.prCmd.GroupID, cmds.completionCmd.GroupID, cmds.hashCmd.GroupID, cmds.projectCmd.GroupID = "utilities", "utilities", "utilities", "utilities", "utilities"
 	cmds.jsonSchemaCmd.GroupID = "utilities"
+	cmds.workCmd.GroupID = "utilities"
 }
 
 func addCommandsToRoot(cmds commandSet) {
 	rootCmd.AddCommand(
 		compileCmd, cmds.addCmd, cmds.addWizardCmd, cmds.editCmd, cmds.updateCmd, cmds.deployCmd, cmds.upgradeCmd, cmds.trialCmd, newCmd, cmds.initCmd,
-		runCmd, removeCmd, cmds.statusCmd, cmds.listCmd, enableCmd, disableCmd, cmds.logsCmd, cmds.auditCmd, cmds.viewCmd,
+		runCmd, removeCmd, cmds.statusCmd, cmds.listCmd, enableCmd, disableCmd, cmds.logsCmd, cmds.auditCmd, cmds.sessionsCmd, cmds.viewCmd,
 		cmds.healthCmd, cmds.outcomesCmd, cmds.checksCmd, cmds.mcpCmd, cmds.mcpServerCmd, cmds.prCmd, versionCmd, cmds.secretsCmd,
 		cmds.fixCmd, cmds.formatCmd, cmds.validateCmd, cmds.lintCmd, cmds.completionCmd, cmds.hashCmd, cmds.projectCmd, cmds.doctorCmd,
-		cmds.domainsCmd, cmds.experimentsCmd, cmds.forecastCmd, cmds.gradersCmd, cmds.modelsCmd, cmds.envCmd, cmds.jsonSchemaCmd,
+		cmds.domainsCmd, cmds.experimentsCmd, cmds.forecastCmd, cmds.gradersCmd, cmds.modelsCmd, cmds.envCmd, cmds.jsonSchemaCmd, cmds.workCmd,
 	)
 }
 
@@ -934,7 +980,7 @@ func main() {
 		// Check if error is already formatted to avoid double formatting:
 		// - Contains suggestions (FormatErrorWithSuggestions)
 		// - Starts with ✗ (FormatErrorMessage)
-		// - Contains file:line:column: pattern (console.FormatError)
+		// - Contains file:line:column: pattern (console.FormatErrorStdout)
 		isAlreadyFormatted := strings.Contains(errMsg, "Suggestions:") ||
 			strings.HasPrefix(errMsg, "✗") ||
 			strings.Contains(errMsg, ":") && (strings.Contains(errMsg, "error:") || strings.Contains(errMsg, "warning:"))

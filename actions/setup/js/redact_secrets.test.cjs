@@ -43,7 +43,352 @@ describe("redact_secrets.cjs", () => {
       tempDir && fs.existsSync(tempDir) && fs.rmSync(tempDir, { recursive: !0, force: !0 });
       for (const key of Object.keys(process.env)) key.startsWith("SECRET_") && delete process.env[key];
     }),
+    it("scans large nested file lists without overflowing the call stack", () => {
+      const { findFiles } = require("./redact_secrets.cjs");
+      const child = path.join(tempDir, "aw-mcp");
+      const entries = Array.from({ length: 150000 }, (_, i) => ({
+        name: `log-${i}.jsonl`,
+        isSymbolicLink: () => false,
+        isDirectory: () => false,
+        isFile: () => true,
+      }));
+      const readdir = vi.spyOn(fs, "readdirSync").mockImplementation(dir => {
+        if (dir === child) return entries;
+        if (dir === tempDir) return [{ name: "aw-mcp", isSymbolicLink: () => false, isDirectory: () => true }];
+        throw new Error("Unexpected directory");
+      });
+      try {
+        const files = findFiles(tempDir, [".jsonl"]);
+        expect(files).toHaveLength(entries.length);
+        expect(files[0]).toBe(path.join(child, "log-0.jsonl"));
+        expect(files.at(-1)).toBe(path.join(child, "log-149999.jsonl"));
+      } finally {
+        readdir.mockRestore();
+      }
+    }),
+    describe("file handling", () => {
+      it.each([false, true])("processes runner-owned read-only files in read-only Go module directories (secrets: %s)", hasSecrets => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const moduleDir = path.join(tempDir, "go-mod");
+        fs.mkdirSync(moduleDir);
+        const file = path.join(moduleDir, "README.md");
+        fs.writeFileSync(file, "secret-value", { mode: 0o444 });
+        fs.chmodSync(moduleDir, 0o555);
+        const inode = fs.statSync(file).ino;
+        try {
+          expect(processFile(file, hasSecrets ? ["secret-value"] : [], [], true)).toBe(hasSecrets ? 1 : 0);
+          expect(fs.readFileSync(file, "utf8")).toBe(hasSecrets ? "***REDACTED***" : "secret-value");
+          expect(fs.statSync(file).ino).toBe(inode);
+          expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+          expect(fs.statSync(moduleDir).mode & 0o777).toBe(0o555);
+          fs.writeFileSync(file, "[custom redaction]");
+          expect(fs.readFileSync(file, "utf8")).toBe("[custom redaction]");
+          expect(fs.readdirSync(moduleDir)).toEqual(["README.md"]);
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+        } finally {
+          fs.chmodSync(moduleDir, 0o700);
+        }
+      });
+      it.each(["EACCES", "EPERM"])("prepares unchanged non-writable logs for custom masking (%s)", code => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "custom-sensitive-text", { mode: 0o444 });
+        const inode = fs.statSync(file).ino;
+        const access = fs.accessSync;
+        const spy = vi.spyOn(fs, "accessSync").mockImplementation((target, mode) => {
+          if (target === file) throw Object.assign(new Error("permission denied"), { code });
+          return access(target, mode);
+        });
+        try {
+          expect(processFile(file, [], [], true)).toBe(0);
+          expect(fs.readFileSync(file, "utf8")).toBe("custom-sensitive-text");
+          expect(fs.statSync(file).ino).not.toBe(inode);
+          expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+          fs.writeFileSync(file, "[custom redaction]");
+          expect(fs.readFileSync(file, "utf8")).toBe("[custom redaction]");
+          expect(fs.readdirSync(tempDir)).toEqual(["server.log"]);
+          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Replaced non-writable file"));
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      it.each(["EACCES", "EPERM"])("fails closed without disclosing secrets in filenames or errors when permissions cannot be changed (%s)", code => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const moduleDir = path.join(tempDir, "go-mod");
+        fs.mkdirSync(moduleDir);
+        const file = path.join(moduleDir, "secret-value-README.md");
+        fs.writeFileSync(file, "secret-value", { mode: 0o444 });
+        fs.chmodSync(moduleDir, 0o555);
+        const chmod = vi.spyOn(fs, "chmodSync").mockImplementation(() => {
+          throw Object.assign(new Error("permission denied: secret-value"), { code });
+        });
+        try {
+          expect(() => processFile(file, ["secret-value"], ["runtime-mask"])).toThrow(/^ERR_VALIDATION: Failed to remove artifact source after secret redaction failed$/);
+          expect(fs.readFileSync(file, "utf8")).toBe("secret-value");
+          expect(fs.statSync(file).mode & 0o777).toBe(0o444);
+          expect(mockCore.info.mock.calls.flat().join("\n")).not.toContain("secret-value");
+          expect(mockCore.warning.mock.calls.flat().join("\n")).not.toContain("secret-value");
+        } finally {
+          chmod.mockRestore();
+          fs.chmodSync(moduleDir, 0o700);
+        }
+      });
+      it("atomically replaces container-owned logs when writing redacted content is denied", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "secret-value");
+        const write = fs.writeFileSync;
+        const spy = vi.spyOn(fs, "writeFileSync").mockImplementation((target, ...args) => {
+          if (target === file) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+          return write(target, ...args);
+        });
+        try {
+          expect(processFile(file, ["secret-value"])).toBe(1);
+          expect(fs.readFileSync(file, "utf8")).toBe("***REDACTED***");
+          expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+          expect(fs.readdirSync(tempDir)).toEqual(["server.log"]);
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      it("leaves writable files without matches unchanged", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "no secrets", { mode: 0o640 });
+        const before = fs.statSync(file);
+        expect(processFile(file, [])).toBe(0);
+        const after = fs.statSync(file);
+        expect(after.ino).toBe(before.ino);
+        expect(after.mode).toBe(before.mode);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+      });
+      it.each(["EACCES", "EPERM"])("does not require write access to sanitized files without custom masking (%s)", code => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const directory = path.join(tempDir, "container-logs");
+        fs.mkdirSync(directory);
+        const file = path.join(directory, "server.log");
+        fs.writeFileSync(file, "safe log content", { mode: 0o444 });
+        fs.chmodSync(directory, 0o555);
+        const before = fs.statSync(file);
+        const access = vi.spyOn(fs, "accessSync").mockImplementation(() => {
+          throw Object.assign(new Error("permission denied"), { code });
+        });
+        const chmod = vi.spyOn(fs, "chmodSync").mockImplementation(() => {
+          throw Object.assign(new Error("container-owned file"), { code });
+        });
+        const unlink = vi.spyOn(fs, "unlinkSync").mockImplementation(() => {
+          throw Object.assign(new Error("container-owned directory"), { code });
+        });
+        try {
+          expect(processFile(file, ["secret-value"], ["runtime-mask"])).toBe(0);
+          expect(fs.readFileSync(file, "utf8")).toBe("safe log content");
+          const after = fs.statSync(file);
+          expect(after.ino).toBe(before.ino);
+          expect(after.mode).toBe(before.mode);
+          expect(after.mtimeMs).toBe(before.mtimeMs);
+          expect(access).not.toHaveBeenCalled();
+          expect(chmod).not.toHaveBeenCalled();
+          expect(unlink).not.toHaveBeenCalled();
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+        } finally {
+          access.mockRestore();
+          chmod.mockRestore();
+          unlink.mockRestore();
+          fs.chmodSync(directory, 0o700);
+        }
+      });
+      it.each(["missing.log", "missing.html"])("tolerates disappeared files even with runtime masks (%s)", name => {
+        const { processFile } = require("./redact_secrets.cjs");
+        expect(processFile(path.join(tempDir, name), ["secret-value"], ["runtime-mask"])).toBe(0);
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+        expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Skipping file that disappeared"));
+        expect(fs.readdirSync(tempDir)).toEqual([]);
+      });
+      it("removes an unsanitized file and reports failure when replacement is blocked", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "secret-value");
+        const write = fs.writeFileSync;
+        const spy = vi.spyOn(fs, "writeFileSync").mockImplementation((target, ...args) => {
+          if (target === file) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+          return write(target, ...args);
+        });
+        const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+          throw Object.assign(new Error("file locked"), { code: "EBUSY" });
+        });
+        try {
+          expect(processFile(file, ["secret-value"])).toBe(0);
+          expect(fs.existsSync(file)).toBe(false);
+          expect(fs.readdirSync(tempDir)).toEqual([]);
+          expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Removed artifact source"));
+        } finally {
+          spy.mockRestore();
+          rename.mockRestore();
+        }
+      });
+      it("does not treat missing temporary storage as a missing artifact", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "secret-value");
+        const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+          throw Object.assign(new Error("missing temporary directory"), { code: "ENOENT" });
+        });
+        try {
+          expect(processFile(file, ["secret-value"])).toBe(0);
+          expect(fs.existsSync(file)).toBe(false);
+          expect(mockCore.setFailed).toHaveBeenCalled();
+        } finally {
+          write.mockRestore();
+        }
+      });
+      it("surfaces failure when an unsanitized file cannot be replaced or removed", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "secret-value");
+        const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        });
+        const unlink = vi.spyOn(fs, "unlinkSync").mockImplementation(() => {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        });
+        try {
+          expect(() => processFile(file, ["secret-value"])).toThrow("Failed to remove artifact source");
+        } finally {
+          write.mockRestore();
+          unlink.mockRestore();
+        }
+      });
+    }),
     describe("main function integration", () => {
+      it.each([false, true])("prepares unchanged files only when custom masking is configured (%s)", prepareForCustomMasking => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "custom-sensitive-text", { mode: 0o444 });
+        expect(processFile(file, [], [], prepareForCustomMasking)).toBe(0);
+        expect(fs.readFileSync(file, "utf8")).toBe("custom-sensitive-text");
+        expect(fs.statSync(file).mode & 0o777).toBe(prepareForCustomMasking ? 0o600 : 0o444);
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+      });
+      it.each([false, true])("passes custom masking configuration through the full scan (%s)", prepareForCustomMasking => {
+        const file = path.join(tempDir, "server.log");
+        fs.writeFileSync(file, "custom-sensitive-text", { mode: 0o444 });
+        const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+        return eval(`(async () => { ${modifiedScript}; await main({ prepareForCustomMasking: ${prepareForCustomMasking} }); })()`).then(() => {
+          expect(fs.statSync(file).mode & 0o777).toBe(prepareForCustomMasking ? 0o600 : 0o444);
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+        });
+      });
+      it("continues scanning when a nested directory disappears", () => {
+        const { findFiles } = require("./redact_secrets.cjs");
+        const missing = path.join(tempDir, "missing");
+        fs.mkdirSync(missing);
+        fs.writeFileSync(path.join(tempDir, "server.log"), "readable");
+        const readDir = fs.readdirSync;
+        const spy = vi.spyOn(fs, "readdirSync").mockImplementation((dir, options) => {
+          if (dir === missing) throw Object.assign(new Error("missing directory"), { code: "ENOENT" });
+          return readDir(dir, options);
+        });
+        try {
+          expect(findFiles(tempDir, [".log"])).toEqual([path.join(tempDir, "server.log")]);
+          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Skipping directory that disappeared"));
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      it("continues scanning when a symbolic link disappears before removal", () => {
+        const { findFiles } = require("./redact_secrets.cjs");
+        const link = path.join(tempDir, "linked.log");
+        fs.symlinkSync(path.join(tempDir, "missing-target"), link);
+        const unlink = fs.unlinkSync;
+        const spy = vi.spyOn(fs, "unlinkSync").mockImplementation(target => {
+          if (target === link) {
+            unlink(target);
+            throw Object.assign(new Error("symbolic link disappeared"), { code: "ENOENT" });
+          }
+          return unlink(target);
+        });
+        try {
+          expect(findFiles(tempDir, [".log"])).toEqual([]);
+          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Skipping symbolic link that disappeared"));
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      it("fails closed when agent stdio disappears before mask collection", async () => {
+        const stdio = path.join(tempDir, "agent-stdio.log");
+        const artifact = path.join(tempDir, "server.log");
+        fs.writeFileSync(stdio, "no runtime masks");
+        fs.writeFileSync(artifact, "secret-value");
+        process.env.GH_AW_SECRET_NAMES = "TEST_SECRET";
+        process.env.SECRET_TEST_SECRET = "secret-value";
+        const read = fs.readFileSync;
+        const spy = vi.spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
+          if (file === stdio && fs.existsSync(stdio)) fs.unlinkSync(stdio);
+          return read(file, ...args);
+        });
+        try {
+          const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+          await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+          expect(fs.existsSync(artifact)).toBe(false);
+          expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Removed artifact sources after runtime mask collection failed"));
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      it("continues redacting artifact files when a directory is inaccessible", async () => {
+        const cache = path.join(tempDir, "aw-mcp");
+        const artifact = path.join(tempDir, "agent-stdio.log");
+        fs.mkdirSync(cache);
+        fs.writeFileSync(artifact, "secret-value");
+        process.env.GH_AW_SECRET_NAMES = "TEST_SECRET";
+        process.env.SECRET_TEST_SECRET = "secret-value";
+        const readDir = fs.readdirSync;
+        const readDirSpy = vi.spyOn(fs, "readdirSync").mockImplementation((dir, options) => {
+          if (dir === cache) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+          return readDir(dir, options);
+        });
+        try {
+          const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+          await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+          expect(readDirSpy).toHaveBeenCalledWith(cache, expect.anything());
+          expect(fs.readFileSync(artifact, "utf8")).toBe("***REDACTED***");
+          expect(mockCore.setFailed).not.toHaveBeenCalled();
+          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Skipping inaccessible directory"));
+        } finally {
+          readDirSpy.mockRestore();
+        }
+      });
+      it("redacts readable MCP artifact logs", async () => {
+        const logs = path.join(tempDir, "aw-mcp", "logs");
+        const artifact = path.join(logs, "runs.json");
+        fs.mkdirSync(logs, { recursive: true });
+        fs.writeFileSync(artifact, '{"token":"secret-value"}');
+        process.env.GH_AW_SECRET_NAMES = "TEST_SECRET";
+        process.env.SECRET_TEST_SECRET = "secret-value";
+        const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+        await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+        expect(fs.readFileSync(artifact, "utf8")).toBe('{"token":"***REDACTED***"}');
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+      });
+      it("redacts decoded keys and values in nested Claim diagnostics using agent runtime masks", async () => {
+        const directory = path.join(tempDir, "claims", "original-claim");
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        const secret = 'runtime"\\opaque\nsecond-line';
+        const encodedMask = secret.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+        fs.writeFileSync(path.join(tempDir, "agent-stdio.log"), `::add-mask::${encodedMask}\n`);
+        const filenames = ["safe-output-items.jsonl", "temporary-id-map.json", "safe-output-errors.json"];
+        for (const filename of filenames) fs.writeFileSync(path.join(directory, filename), JSON.stringify({ [secret]: { value: secret } }) + "\n", { mode: 0o600 });
+        const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+        await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+        for (const filename of filenames) {
+          const file = path.join(directory, filename);
+          expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ "***\n***": { value: "***\n***" } });
+          expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+        }
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+      });
       (it("should scan for built-in patterns even when GH_AW_SECRET_NAMES is not set", async () => {
         (await eval(`(async () => { ${redactScript}; await main(); })()`),
           expect(mockCore.info).toHaveBeenCalledWith(`Starting secret redaction in /tmp/gh-aw and ${process.env.RUNNER_TEMP}/gh-aw directories`),
@@ -73,6 +418,17 @@ describe("redact_secrets.cjs", () => {
             expect(fs.readFileSync(path.join(tempDir, "test1.txt"), "utf8")).toBe("Secret: ***REDACTED***"),
             expect(fs.readFileSync(path.join(tempDir, "test2.json"), "utf8")).toBe('{"key": "***REDACTED***"}'),
             expect(fs.readFileSync(path.join(tempDir, "test3.log"), "utf8")).toBe("Log: ***REDACTED***"));
+        }),
+        it("should remove symbolic links before artifact upload", async () => {
+          const target = path.join(tempDir, "target.json");
+          const link = path.join(tempDir, "linked.json");
+          fs.writeFileSync(target, '{"safe":true}');
+          fs.symlinkSync(target, link);
+          const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir.replace(/\\/g, "\\\\")}", targetExtensions)`);
+          await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+          expect(fs.existsSync(link)).toBe(false);
+          expect(fs.existsSync(target)).toBe(true);
+          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Removed symbolic link before artifact upload"));
         }),
         it("should use core.info for logging hits", async () => {
           const testFile = path.join(tempDir, "test.txt"),

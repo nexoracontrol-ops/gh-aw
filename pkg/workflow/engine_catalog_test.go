@@ -21,7 +21,7 @@ func TestEngineCatalog_IDs(t *testing.T) {
 	require.NotEmpty(t, ids, "IDs() should return a non-empty list")
 
 	// Verify all built-in engines are present
-	expectedIDs := []string{"claude", "codex", "copilot", "gemini", "pi"}
+	expectedIDs := []string{"agy", "claude", "codex", "copilot", "gemini", "pi"}
 	assert.Equal(t, expectedIDs, ids, "IDs() should return all built-in engines in sorted order")
 
 	// Verify the list is sorted
@@ -45,6 +45,19 @@ func TestEngineCatalog_All(t *testing.T) {
 		assert.Equal(t, ids[i], def.ID, "All()[%d].ID should match IDs()[%d]", i, i)
 		assert.NotEmpty(t, def.DisplayName, "All()[%d].DisplayName should not be empty", i)
 	}
+}
+
+func TestEngineCatalog_GeminiDeprecated(t *testing.T) {
+	catalog := NewEngineCatalog(NewEngineRegistry())
+	for _, def := range catalog.All() {
+		if def.ID == "gemini" {
+			assert.Contains(t, def.Description, "Deprecated")
+			assert.Contains(t, def.Description, "agy")
+			assert.Equal(t, NewGeminiEngine().GetDescription(), def.Description)
+			return
+		}
+	}
+	t.Fatal("deprecated Gemini engine must remain selectable")
 }
 
 // engineSchemaOneOfVariants parses the main workflow schema and returns the

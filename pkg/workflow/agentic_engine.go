@@ -120,6 +120,9 @@ type EngineCapabilities struct {
 	// MaxTurns reports whether the engine supports the max-turns feature.
 	MaxTurns bool
 
+	// ContextWindow reports whether the engine supports the context-window feature.
+	ContextWindow bool
+
 	// WebSearch reports whether the engine has built-in support for the web-search tool.
 	WebSearch bool
 
@@ -156,6 +159,9 @@ type EngineCapabilities struct {
 
 	// Plugins reports whether the engine can install Agent Plugins.
 	Plugins bool
+
+	// DynamicWorkflows reports whether the engine supports loading saved dynamic workflows.
+	DynamicWorkflows bool
 }
 
 // PluginInstallationProvider generates installation steps for Agent Plugins.
@@ -163,10 +169,33 @@ type PluginInstallationProvider interface {
 	GetPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep
 }
 
+// PostConfigPluginInstallationProvider installs plugin state after runtime configuration is written.
+type PostConfigPluginInstallationProvider interface {
+	GetPostConfigPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep
+}
+
 // CapabilityProvider detects what capabilities an engine supports.
 // Engines can optionally implement this to indicate feature support.
 type CapabilityProvider interface {
 	GetCapabilities() EngineCapabilities
+}
+
+// HostedWebCapabilities describes hosted-web support that can depend on the
+// workflow's selected inference provider.
+type HostedWebCapabilities struct {
+	Supported         bool
+	SupportsMaxUses   bool
+	UnsupportedReason string
+}
+
+// HostedWebCapabilityProvider reports whether an engine supports hosted web
+// search for the current workflow.
+type HostedWebCapabilityProvider interface {
+	GetHostedWebCapabilities(workflowData *WorkflowData) HostedWebCapabilities
+}
+
+func dynamicWorkflowsEnabled(engine CapabilityProvider, config *EngineConfig) bool {
+	return engine != nil && engine.GetCapabilities().DynamicWorkflows && config.DynamicWorkflowsEnabled()
 }
 
 // MCPProxyEngine provides the identity and MCP capability information needed to
@@ -573,6 +602,7 @@ func NewEngineRegistry() *EngineRegistry {
 		NewCodexEngine(),
 		NewCopilotEngine(),
 		NewGeminiEngine(),
+		NewAgyEngine(),
 		NewPiEngine(),
 	}
 	for _, engine := range builtins {
@@ -582,6 +612,18 @@ func NewEngineRegistry() *EngineRegistry {
 			// with a compile-time constant port, so this is a programming error caught
 			// by CI (TestBuiltinEnginesRegisterWithoutError), never user input.
 			panic(fmt.Sprintf("BUG: failed to register built-in engine: %v", err))
+		}
+	}
+	for _, definition := range loadBuiltinEngineDefinitions() {
+		if definition.Behaviors == nil {
+			continue
+		}
+		engine, err := NewBehaviorDefinedEngine(definition)
+		if err != nil {
+			panic(fmt.Sprintf("BUG: invalid built-in engine definition %q: %v", definition.ID, err))
+		}
+		if err := registry.Register(engine); err != nil {
+			panic(fmt.Sprintf("BUG: failed to register built-in engine %q: %v", definition.ID, err))
 		}
 	}
 
@@ -762,8 +804,9 @@ func (r *EngineRegistry) GetEngineByPrefix(prefix string) (CodingAgentEngine, er
 			return 0
 		}
 	})
-	agenticEngineLog.Printf("Found %d engine candidate(s) for prefix %s, using: %s", len(candidates), prefix, candidates[0].id)
-	return candidates[0].engine, nil
+	candidate := candidates[0] //nolint:uncheckedsliceindex // The empty case returns above.
+	agenticEngineLog.Printf("Found %d engine candidate(s) for prefix %s, using: %s", len(candidates), prefix, candidate.id)
+	return candidate.engine, nil
 }
 
 // resolveStepTimeoutValue returns the timeout value string to emit on an

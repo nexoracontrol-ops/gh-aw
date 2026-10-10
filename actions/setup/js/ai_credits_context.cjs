@@ -15,6 +15,7 @@ const MAX_AI_CREDITS_EXCEEDED_FIELDS = new Set(["max_ai_credits_exceeded", "maxA
 const AI_CREDITS_TOTAL_FIELDS = new Set(["ai_credits_total", "aiCreditsTotal"]);
 /** @type {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean }} */
 const EMPTY_AI_CREDITS_STATE = { aiCredits: "", maxAICredits: "", rateLimitError: false, maxAICreditsExceeded: false };
+const EMPTY_AGENT_STDIO_STATE = { ...EMPTY_AI_CREDITS_STATE, proxyHTTP403: false };
 const BUDGET_EXCEEDED_EVENT = "budget_exceeded";
 // The literal error type emitted by the AWF API proxy (HTTP 400) when maxAiCredits is active
 // and the requested model is not in the built-in pricing table.
@@ -23,6 +24,14 @@ const UNKNOWN_MODEL_AI_CREDITS_TYPE = "unknown_model_ai_credits";
 // miss counter reaches the apiProxy.maxCacheMisses limit. Engine-agnostic: all engines share
 // the same proxy guardrail.
 const MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE = "max_cache_misses_exceeded";
+// Guardrail rejections emitted by the AWF API proxy as HTTP 403 responses. Each is a
+// deliberate policy decision by the proxy — never a credential problem — so retrying the
+// same request against the same (already spent) proxy counter can never succeed.
+// Engine-agnostic: all engines share the same proxy guardrails.
+const API_PROXY_GUARD_REJECTION_EVENT_TYPES = [MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE, "effective_tokens_limit_exceeded", "permission_denied_limit_exceeded", "model_policy_violation"];
+// Counter fields carried by proxy guard rejection events, reported alongside the guard name
+// so the step log states what limit was hit and at which value.
+const API_PROXY_GUARD_COUNTER_FIELDS = ["consecutive_cache_misses", "max_cache_misses", "effective_tokens", "max_effective_tokens", "permission_denied_count", "max_permission_denied", "model"];
 const MAX_AI_CREDITS_EXCEEDED_STDIO_RE = /maximum ai credits exceeded(?:\s*\((\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\))?/i;
 const DEFAULT_AGENT_STDIO_LOG = "/tmp/gh-aw/agent-stdio.log";
 const AGENT_STDIO_LOG_MAX_TAIL = 64 * 1024; // 64 KB — sufficient for any realistic error block
@@ -66,6 +75,27 @@ function isTrueLike(value) {
  */
 function sanitizeModelName(value) {
   return typeof value === "string" ? value.replace(/\r?\n|\r/g, " ").trim() : "";
+}
+
+/**
+ * Read the compiler's effective proxy budget when network audit entries omit it.
+ * @returns {string}
+ */
+function parseMaxAICreditsFromAWFConfig() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const configPath = process.env.GH_AW_AWF_CONFIG_PATH || path.join(agentOutputFile ? path.dirname(agentOutputFile) : "/tmp/gh-aw", "awf-config.json");
+  if (!fs.existsSync(configPath)) return "";
+  try {
+    /** @type {unknown} */
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    if (!config || typeof config !== "object" || !("apiProxy" in config)) return "";
+    const apiProxy = config.apiProxy;
+    if (!apiProxy || typeof apiProxy !== "object" || !("maxAiCredits" in apiProxy)) return "";
+    return parsePositiveNumberString(apiProxy.maxAiCredits);
+  } catch (error) {
+    core.warning(`Could not read AWF AI credits budget from ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+    return "";
+  }
 }
 
 /**
@@ -361,10 +391,20 @@ function parseMaxAICreditsExceededFromAuditLog(auditJsonlPathOverride) {
   );
   if (explicitExceeded) return true;
 
-  const configuredMaxAICredits = parsePositiveNumberString(process.env.GH_AW_MAX_AI_CREDITS) || parseMaxAICreditsFromAuditLog(auditJsonlPathOverride);
+  const configuredMaxAICredits = parsePositiveNumberString(process.env.GH_AW_MAX_AI_CREDITS) || parseMaxAICreditsFromAuditLog(auditJsonlPathOverride) || parseMaxAICreditsFromAWFConfig();
   if (!configuredMaxAICredits) return false;
 
-  const latestAICreditsTotal = iterateJSONLFiles(
+  const latestAICreditsTotal = parseLatestAICreditsTotalFromTokenUsageLog(auditJsonlPathOverride);
+  if (!latestAICreditsTotal) return false;
+  return Number.parseFloat(latestAICreditsTotal) >= Number.parseFloat(configuredMaxAICredits);
+}
+
+/**
+ * @param {string} [auditJsonlPathOverride]
+ * @returns {string}
+ */
+function parseLatestAICreditsTotalFromTokenUsageLog(auditJsonlPathOverride) {
+  return iterateJSONLFiles(
     resolveTokenUsageLogPaths(auditJsonlPathOverride),
     "",
     content => /(?:ai_credits_total|aiCreditsTotal)/.test(content),
@@ -378,8 +418,6 @@ function parseMaxAICreditsExceededFromAuditLog(auditJsonlPathOverride) {
       return latestTotal || acc;
     }
   );
-  if (!latestAICreditsTotal) return false;
-  return Number.parseFloat(latestAICreditsTotal) >= Number.parseFloat(configuredMaxAICredits);
 }
 
 /**
@@ -477,6 +515,100 @@ function parseMaxCacheMissesExceededFromEventLog(eventLogPathOverride) {
 }
 
 /**
+ * Resolves the candidate JSONL files that can carry AWF API proxy guard rejection events.
+ * In addition to the api-proxy event logs, the proxy's token tracker audit log and the
+ * copy of the detection run's firewall logs (made by the detection job) are considered, so
+ * the same detection works in the agent job and in the threat-detection job.
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {string[]}
+ */
+function resolveAPIProxyGuardLogPaths(eventLogPathOverride) {
+  if (eventLogPathOverride) return [eventLogPathOverride];
+  const candidates = resolveUnknownModelAICreditsLogPaths();
+  const seen = new Set(candidates);
+  const addCandidate = candidate => {
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const roots = [];
+  if (agentOutputFile) roots.push(path.dirname(agentOutputFile));
+  roots.push("/tmp/gh-aw");
+  roots.push("/tmp/gh-aw/threat-detection");
+  for (const root of roots) {
+    for (const base of ["logs", "audit"]) {
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "token-tracker-audit.jsonl"));
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "event-logs.jsonl"));
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "events.jsonl"));
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Detects an AWF API proxy guard rejection (HTTP 403) from the proxy's structured logs and
+ * returns the guard name together with the counters it reported. The proxy answers with such
+ * a rejection when one of its guardrails fires (consecutive cache misses, effective token
+ * limit, permission-denied limit, model policy). These are deliberate policy outcomes, not
+ * credential failures, and the counter is not reset by retrying.
+ * Structured entries emitted by the AWF API proxy look like:
+ *   { "type": "max_cache_misses_exceeded", "consecutive_cache_misses": 6, "max_cache_misses": 5 }
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {{ guard: string, counters: Record<string, string|number> } | null}
+ */
+function parseAPIProxyGuardRejectionFromEventLog(eventLogPathOverride) {
+  /** @type {{ guard: string, counters: Record<string, string|number> } | null} */
+  let rejection = null;
+  iterateJSONLFiles(
+    resolveAPIProxyGuardLogPaths(eventLogPathOverride),
+    false,
+    content => API_PROXY_GUARD_REJECTION_EVENT_TYPES.some(type => content.includes(type)),
+    (acc, entry) => {
+      if (acc) return true; // already detected, keep the first rejection
+      /** @type {string} */
+      let guard = "";
+      traverseObjectTree(entry, (_key, value) => {
+        if (typeof value === "string" && API_PROXY_GUARD_REJECTION_EVENT_TYPES.includes(value)) {
+          guard = value;
+          return true;
+        }
+        return false;
+      });
+      if (!guard) return undefined;
+      /** @type {Record<string, string|number>} */
+      const counters = {};
+      traverseObjectTree(entry, (key, value) => {
+        if (!API_PROXY_GUARD_COUNTER_FIELDS.includes(key)) return false;
+        if (typeof value === "number" && Number.isFinite(value)) counters[key] = value;
+        else if (typeof value === "string" && value.trim()) counters[key] = value.trim();
+        return false;
+      });
+      rejection = { guard, counters };
+      return true;
+    },
+    acc => acc
+  );
+  return rejection;
+}
+
+/**
+ * Formats a proxy guard rejection for a single-line step log entry, e.g.
+ *   "max_cache_misses_exceeded (consecutive_cache_misses=5, max_cache_misses=5)".
+ *
+ * @param {{ guard: string, counters?: Record<string, string|number> } | null | undefined} rejection
+ * @returns {string}
+ */
+function formatAPIProxyGuardRejection(rejection) {
+  if (!rejection || !rejection.guard) return "";
+  const counters = rejection.counters || {};
+  const parts = Object.keys(counters).map(key => `${key}=${counters[key]}`);
+  return parts.length > 0 ? `${rejection.guard} (${parts.join(", ")})` : rejection.guard;
+}
+
+/**
  * Single-pass combined read of the audit log, returning all AI credits fields at once.
  * Used by resolveAICreditsFailureState to avoid reading the same file twice.
  * No contentGuard is applied: rate-limit signal detection must scan all entries anyway,
@@ -523,15 +655,19 @@ function logAICreditSource(label, auditValue, stdioValue, envValue, envVarName) 
 function resolveAICreditsFailureState({ logProvenance = true } = {}) {
   const stdioSignals = parseAICreditsExceededFromAgentStdio();
   const { aiCredits: auditAICredits, maxAICredits: auditMaxAICredits, rateLimitError: auditRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded } = parseAuditLogCombined();
+  const tokenAICredits = parseLatestAICreditsTotalFromTokenUsageLog();
+  const configMaxAICredits = auditMaxAICredits ? "" : parseMaxAICreditsFromAWFConfig();
   const envAICredits = parsePositiveNumberString(process.env.GH_AW_AIC);
   const envMaxAICredits = parsePositiveNumberString(process.env.GH_AW_MAX_AI_CREDITS);
   const envRateLimitSignal = process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR === "true";
-  const envRateLimitSignalHasEvidence = envRateLimitSignal && !!(auditAICredits || stdioSignals.aiCredits || envAICredits);
+  const envRateLimitSignalHasEvidence = envRateLimitSignal && !!(auditAICredits || tokenAICredits || stdioSignals.aiCredits || envAICredits);
 
   // Log provenance so failing issues can be diagnosed when credit data is missing.
   if (logProvenance) {
-    logAICreditSource("aiCredits", auditAICredits, stdioSignals.aiCredits, envAICredits, "GH_AW_AIC");
-    logAICreditSource("maxAICredits", auditMaxAICredits, stdioSignals.maxAICredits, envMaxAICredits, "GH_AW_MAX_AI_CREDITS");
+    if (!auditAICredits && tokenAICredits) core.info(`[ai-credits] aiCredits source=token_usage value=${tokenAICredits}`);
+    else logAICreditSource("aiCredits", auditAICredits, stdioSignals.aiCredits, envAICredits, "GH_AW_AIC");
+    if (configMaxAICredits) core.info(`[ai-credits] maxAICredits source=awf_config value=${configMaxAICredits}`);
+    else logAICreditSource("maxAICredits", auditMaxAICredits, stdioSignals.maxAICredits, envMaxAICredits, "GH_AW_MAX_AI_CREDITS");
 
     const rawRateLimitSignalSource = auditRateLimitError
       ? "audit_log"
@@ -545,15 +681,18 @@ function resolveAICreditsFailureState({ logProvenance = true } = {}) {
     core.info(`[ai-credits] rateLimitSignal source=${rawRateLimitSignalSource}`);
   }
 
-  const aiCredits = auditAICredits || stdioSignals.aiCredits || envAICredits || "";
-  const maxAICredits = auditMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
+  const aiCredits = auditAICredits || tokenAICredits || stdioSignals.aiCredits || envAICredits || "";
+  const maxAICredits = auditMaxAICredits || configMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
   const rawAICreditsRateLimitError = auditRateLimitError || stdioSignals.rateLimitError || envRateLimitSignalHasEvidence;
   const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError);
-  return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded };
+  // A completed response can cross the cap without another request being rejected.
+  // Require a failed job and evidence that the local proxy rejected a request.
+  const tokenBudgetExceeded = process.env.GH_AW_AGENT_CONCLUSION === "failure" && stdioSignals.proxyHTTP403 && !!tokenAICredits && !!maxAICredits && Number.parseFloat(tokenAICredits) >= Number.parseFloat(maxAICredits);
+  return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded || tokenBudgetExceeded };
 }
 
 /**
- * @returns {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean }}
+ * @returns {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean, proxyHTTP403: boolean }}
  */
 function parseAICreditsExceededFromAgentStdio() {
   try {
@@ -563,11 +702,11 @@ function parseAICreditsExceededFromAgentStdio() {
     // silently break detection.
     const derivedPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : null;
     const stdioLogPath = derivedPath && fs.existsSync(derivedPath) ? derivedPath : DEFAULT_AGENT_STDIO_LOG;
-    if (!fs.existsSync(stdioLogPath)) return EMPTY_AI_CREDITS_STATE;
+    if (!fs.existsSync(stdioLogPath)) return EMPTY_AGENT_STDIO_STATE;
     // Read only the tail to avoid OOM on large logs; the error token always
     // appears near the end of the file.
     const stat = fs.statSync(stdioLogPath);
-    if (stat.size === 0) return EMPTY_AI_CREDITS_STATE;
+    if (stat.size === 0) return EMPTY_AGENT_STDIO_STATE;
     const readSize = Math.min(stat.size, AGENT_STDIO_LOG_MAX_TAIL);
     const buf = Buffer.alloc(readSize);
     const fd = fs.openSync(stdioLogPath, "r");
@@ -577,12 +716,16 @@ function parseAICreditsExceededFromAgentStdio() {
       fs.closeSync(fd);
     }
     const content = buf.toString("utf8");
+    const proxyHTTP403 = content.split(/\r?\n/).some(line => {
+      const proxyFailure = line.match(/Authentication failed with provider at (\S+) \(HTTP 403\)\.?/i);
+      return proxyFailure !== null && isLikelyAWFAPIProxyURL(proxyFailure[1]);
+    });
     // Use matchAll and take the last occurrence — in retried runs the final
     // entry carries the authoritative (highest) credit values.
     const RE_G = new RegExp(MAX_AI_CREDITS_EXCEEDED_STDIO_RE.source, "gi");
     const allMatches = [...content.matchAll(RE_G)];
     const match = allMatches.at(-1);
-    if (!match) return EMPTY_AI_CREDITS_STATE;
+    if (!match) return { ...EMPTY_AGENT_STDIO_STATE, proxyHTTP403 };
     const aiCredits = parsePositiveNumberString(match[1] || "");
     const maxAICredits = parsePositiveNumberString(match[2] || "");
     return {
@@ -590,9 +733,33 @@ function parseAICreditsExceededFromAgentStdio() {
       maxAICredits,
       rateLimitError: true,
       maxAICreditsExceeded: true,
+      proxyHTTP403,
     };
   } catch {
-    return EMPTY_AI_CREDITS_STATE;
+    return EMPTY_AGENT_STDIO_STATE;
+  }
+}
+
+/**
+ * @param {string} providerUrl
+ * @returns {boolean}
+ */
+function isLikelyAWFAPIProxyURL(providerUrl) {
+  try {
+    const { hostname, port } = new URL(providerUrl);
+    const normalizedHostname = hostname.toLowerCase();
+    return (
+      port === "10002" &&
+      (normalizedHostname === "api-proxy" ||
+        normalizedHostname === "host.docker.internal" ||
+        normalizedHostname === "localhost" ||
+        /^127(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+        /^10(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+        /^192\.168(?:\.\d{1,3}){2}$/.test(normalizedHostname) ||
+        /^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}$/.test(normalizedHostname))
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -604,6 +771,9 @@ module.exports = {
   parseUnknownModelAICreditsFromAuditLog,
   parseUnknownModelAICreditsAndModelFromAuditLog,
   parseMaxCacheMissesExceededFromEventLog,
+  parseAPIProxyGuardRejectionFromEventLog,
+  formatAPIProxyGuardRejection,
   resolveAICreditsFailureState,
   MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE,
+  API_PROXY_GUARD_REJECTION_EVENT_TYPES,
 };

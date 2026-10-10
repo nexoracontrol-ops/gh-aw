@@ -22,16 +22,13 @@ concurrency:
 max-turns: 100
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
 imports:
   - ../skills/jqschema/SKILL.md
   - shared/mcp/serena-go.md
   - shared/reporting.md
   - shared/otlp.md
   - shared/graders.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -65,7 +62,7 @@ evals:
   - id: summary-comment-added
     question: Does the agent output confirm that a summary comment was added to the original conversation thread?
 
-model: openai/gpt-5.3-codex
+model: copilot/gpt-5.6-terra
 ---
 
 # /cloclo

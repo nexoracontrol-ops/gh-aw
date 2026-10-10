@@ -508,6 +508,18 @@ describe("mcp_scripts_validation.cjs", () => {
   });
 
   describe("validateArgumentsAgainstSchema", () => {
+    it("enforces required fields in root anyOf branches", async () => {
+      const { validateArgumentsAgainstSchema } = await import("./mcp_scripts_validation.cjs");
+      const schema = {
+        type: "object",
+        properties: { issue_number: { type: "number" }, status: { type: "string" }, labels: { type: "array" } },
+        anyOf: [{ required: ["status"] }, { required: ["labels"] }],
+      };
+
+      expect(validateArgumentsAgainstSchema({ issue_number: 42 }, schema)).toMatchObject({ path: "status", message: "is required" });
+      expect(validateArgumentsAgainstSchema({ issue_number: 42, status: "open" }, schema)).toBeNull();
+    });
+
     it("validates nested array item objects and required fields", async () => {
       const { validateArgumentsAgainstSchema } = await import("./mcp_scripts_validation.cjs");
       const schema = {
@@ -567,6 +579,26 @@ describe("mcp_scripts_validation.cjs", () => {
         path: "labels[0].extra",
       });
       expect(validateArgumentsAgainstSchema({ labels: [{ name: "bug", confidence: "HIGH" }] }, schema)).toBeNull();
+    });
+
+    it("rejects inherited property names as undeclared schema properties", async () => {
+      const { validateValueAgainstSchema } = await import("./mcp_scripts_validation.cjs");
+      const schema = { type: "object", properties: { subject: { type: "string" } }, additionalProperties: false };
+
+      for (const key of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+        const value = JSON.parse(`{"${key}":"unvalidated"}`);
+        expect(validateValueAgainstSchema(value, schema)).toMatchObject({ path: key, message: "is not allowed by the schema" });
+      }
+    });
+
+    it("requires required properties to be own properties", async () => {
+      const { validateValueAgainstSchema } = await import("./mcp_scripts_validation.cjs");
+      const value = Object.create({ subject: "inherited" });
+
+      expect(validateValueAgainstSchema(value, { type: "object", required: ["subject"] })).toMatchObject({
+        path: "subject",
+        message: "is required",
+      });
     });
   });
 

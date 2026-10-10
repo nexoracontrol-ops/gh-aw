@@ -3,10 +3,14 @@
 package workflow
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCopilotEngineExecutionSteps(t *testing.T) {
@@ -112,7 +116,7 @@ func TestCopilotEngineExecutionSteps(t *testing.T) {
 	}
 }
 
-func TestCopilotEngineExecutionStepsWithWebFetchKeepsBuiltinToolSchema(t *testing.T) {
+func TestCopilotEngineExecutionStepsWithNativeWebFetchOmitsPermission(t *testing.T) {
 	engine := NewCopilotEngine()
 	workflowData := &WorkflowData{
 		Name: "test-workflow",
@@ -126,18 +130,41 @@ func TestCopilotEngineExecutionStepsWithWebFetchKeepsBuiltinToolSchema(t *testin
 	}
 
 	stepContent := strings.Join([]string(steps[0]), "\n")
-	if strings.Contains(stepContent, "--disable-builtin-mcps") {
-		t.Fatalf("Expected web-fetch workflows to keep Copilot built-in tool schema enabled, got:\n%s", stepContent)
+	if !strings.Contains(stepContent, "--disable-builtin-mcps") {
+		t.Fatalf("Expected Copilot built-in MCP servers to remain disabled, got:\n%s", stepContent)
 	}
-	if !strings.Contains(stepContent, "--allow-tool web_fetch") {
-		t.Fatalf("Expected web-fetch workflows to allow web_fetch, got:\n%s", stepContent)
+	if strings.Contains(stepContent, "--allow-tool web_fetch") {
+		t.Fatalf("Expected native web-fetch permission to be omitted, got:\n%s", stepContent)
 	}
 }
 
-func TestCopilotEngineExecutionStepsWithWebFetchAndWildcardBashScopesTools(t *testing.T) {
+func TestCopilotEngineExecutionStepsWithNativeWebSearchOmitsPermission(t *testing.T) {
 	engine := NewCopilotEngine()
 	workflowData := &WorkflowData{
 		Name: "test-workflow",
+		Tools: map[string]any{
+			"web-search": nil,
+		},
+	}
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
+	if len(steps) != 1 {
+		t.Fatalf("Expected 1 execution step, got %d", len(steps))
+	}
+
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	if !strings.Contains(stepContent, "--disable-builtin-mcps") {
+		t.Fatalf("Expected Copilot built-in MCP servers to remain disabled, got:\n%s", stepContent)
+	}
+	if strings.Contains(stepContent, "--allow-tool web_search") {
+		t.Fatalf("Expected native web-search permission to be omitted, got:\n%s", stepContent)
+	}
+}
+
+func TestCopilotEngineExecutionStepsWithSDKWebFetchAndWildcardBashScopesTools(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		Name:         "test-workflow",
+		EngineConfig: &EngineConfig{CopilotSDK: true},
 		Tools: map[string]any{
 			"bash":      []any{"*"},
 			"web-fetch": nil,
@@ -212,6 +239,86 @@ func TestCopilotEngineExecutionSteps_WithLSPConfig(t *testing.T) {
 	stepContent := strings.Join([]string(steps[0]), "\n")
 	if !strings.Contains(stepContent, `"lspServers":{"typescript":{"command":"typescript-language-server","args":["--stdio"],"fileExtensions":{".ts":"typescript"}}}`) {
 		t.Fatalf("Expected lspServers config in step content, got:\n%s", stepContent)
+	}
+}
+
+func TestCopilotDynamicWorkflowsSettings(t *testing.T) {
+	enabled, disabled := true, false
+	for _, tt := range []struct {
+		name string
+		data *WorkflowData
+		want bool
+	}{
+		{name: "nil workflow"},
+		{name: "default", data: &WorkflowData{}},
+		{name: "enabled", data: &WorkflowData{EngineConfig: &EngineConfig{DynamicWorkflows: &enabled}}, want: true},
+		{name: "disabled", data: &WorkflowData{EngineConfig: &EngineConfig{DynamicWorkflows: &disabled}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var settings copilotSettings
+			require.NoError(t, json.Unmarshal([]byte(buildCopilotSettingsContent(tt.data)), &settings))
+			assert.Equal(t, tt.want, settings.EnabledFeatureFlags["EXTENSIONS"])
+			assert.False(t, settings.BuiltInAgents["rubberDuck"])
+		})
+	}
+}
+
+func TestCopilotDynamicWorkflowsExecution(t *testing.T) {
+	enabled, disabled := true, false
+	for _, mode := range []struct {
+		name     string
+		firewall bool
+		sdk      bool
+	}{
+		{name: "direct"},
+		{name: "firewall", firewall: true},
+		{name: "sdk server arguments", sdk: true},
+	} {
+		for _, setting := range []struct {
+			name  string
+			value *bool
+			want  bool
+		}{
+			{name: "default"},
+			{name: "enabled", value: &enabled, want: true},
+			{name: "disabled", value: &disabled},
+		} {
+			t.Run(mode.name+"/"+setting.name, func(t *testing.T) {
+				data := &WorkflowData{
+					EngineConfig: &EngineConfig{
+						DynamicWorkflows: setting.value,
+						CopilotSDK:       mode.sdk,
+						Env: map[string]string{
+							"GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS": strconv.FormatBool(!setting.want),
+						},
+					},
+					Tools: map[string]any{"bash": []any{"*"}},
+				}
+				if mode.firewall {
+					data.NetworkPermissions = &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}}
+				}
+				engine := NewCopilotEngine()
+				args, _ := engine.buildCopilotArgs(data)
+				argString := strings.Join(args, " ")
+				step := strings.Join(engine.GetExecutionSteps(data, "/tmp/gh-aw/test.log")[0], "\n")
+				assert.Contains(t, step, `"EXTENSIONS":`+strconv.FormatBool(setting.want))
+				assert.True(t, containsEnvValue(step, "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS", strconv.FormatBool(setting.want)))
+				assert.NotContains(t, args, "--experimental")
+				if setting.want {
+					assert.Contains(t, argString, "--allow-tool workflow")
+					assert.NotContains(t, argString, "--deny-tool workflow")
+				} else {
+					assert.Contains(t, argString, "--deny-tool workflow")
+					assert.NotContains(t, argString, "--allow-tool workflow")
+				}
+				if mode.sdk {
+					_, serverArgs := engine.buildCopilotBaseCommand(data, args, "driver")
+					var decoded []string
+					require.NoError(t, json.Unmarshal([]byte(serverArgs), &decoded))
+					assert.Contains(t, strings.Join(decoded, " "), "--"+map[bool]string{true: "allow", false: "deny"}[setting.want]+"-tool workflow")
+				}
+			})
+		}
 	}
 }
 

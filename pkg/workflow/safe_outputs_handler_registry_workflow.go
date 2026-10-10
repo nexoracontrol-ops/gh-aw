@@ -29,6 +29,7 @@ var workflowHandlerRegistry = map[string]handlerBuilder{
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
 			AddIfNotEmpty("driver", c.Driver).
+			AddIfNotEmpty("target-ref", c.TargetRef).
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddStringSlice("allowed_repos", c.AllowedRepos).
 			AddIfNotEmpty("github-token", resolveHandlerGitHubToken(c.GitHubApp, "create-code-scanning-alert", c.GitHubToken)).
@@ -67,6 +68,9 @@ var workflowHandlerRegistry = map[string]handlerBuilder{
 			AddIfNotEmpty("target-repo", c.TargetRepoSlug).
 			AddTemplatableStringSlice("allowed_repos", c.AllowedRepos).
 			AddTemplatableStringSlice("allowed_refs", c.AllowedRefs)
+		if cfg.WorkQueueEnabled {
+			builder.AddDefault("work_queue_enabled", true)
+		}
 
 		// Add workflow_files map if it has entries
 		if len(c.WorkflowFiles) > 0 {
@@ -77,10 +81,18 @@ var workflowHandlerRegistry = map[string]handlerBuilder{
 		if len(c.AwContextWorkflows) > 0 {
 			builder.AddStringSlice("aw_context_workflows", c.AwContextWorkflows)
 		}
+		if len(c.WorkQueueWorkflows) > 0 {
+			builder.AddStringSlice("work_queue_workflows", c.WorkQueueWorkflows)
+		}
 
 		builder.AddIfNotEmpty("target-ref", c.TargetRef)
 		builder.AddIfNotEmpty("github-token", resolveHandlerGitHubToken(c.GitHubApp, "dispatch-workflow", c.GitHubToken))
 		builder.AddTemplatableBool("staged", templatableBoolPtrToStringPtr(c.Staged))
+		if cfg.WorkQueueEnabled {
+			config := builder.Build()
+			configureWorkQueueDispatchCredential(&WorkflowData{SafeOutputs: cfg}, config)
+			return config
+		}
 		return builder.Build()
 	},
 	"dispatch_repository": func(cfg *SafeOutputsConfig) map[string]any {
@@ -138,6 +150,8 @@ var workflowHandlerRegistry = map[string]handlerBuilder{
 		c := cfg.UploadCodeCoverage
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
+			AddIfNotEmpty("target-ref", c.TargetRef).
+			AddDefault("wait-for-processing-timeout", c.WaitForProcessingTimeout).
 			AddIfNotEmpty("github-token", resolveHandlerGitHubToken(c.GitHubApp, "upload-code-coverage", c.GitHubToken)).
 			AddTemplatableBool("staged", templatableBoolPtrToStringPtr(c.Staged)).
 			Build()

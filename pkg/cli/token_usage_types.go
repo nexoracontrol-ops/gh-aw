@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -21,15 +22,17 @@ type TokenCoreMetrics struct {
 
 // TokenUsageEntry represents a single line from token-usage.jsonl
 type TokenUsageEntry struct {
-	Schema    string `json:"_schema,omitempty"` // Self-describing record type, e.g. "token-usage/v0.26.0"
-	Timestamp string `json:"timestamp"`
-	Event     string `json:"event"`
-	RequestID string `json:"request_id"`
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	Path      string `json:"path"`
-	Status    int    `json:"status"`
-	Streaming bool   `json:"streaming"`
+	Schema     string `json:"_schema,omitempty"` // Self-describing record type, e.g. "token-usage/v0.26.0"
+	Timestamp  string `json:"timestamp"`
+	Event      string `json:"event"`
+	RequestID  string `json:"request_id"`
+	Purpose    string `json:"purpose,omitempty"`
+	XInitiator string `json:"x_initiator,omitempty"`
+	Provider   string `json:"provider"`
+	Model      string `json:"model"`
+	Path       string `json:"path"`
+	Status     int    `json:"status"`
+	Streaming  bool   `json:"streaming"`
 	TokenCoreMetrics
 	DurationMs              int             `json:"duration_ms"`
 	ResponseBytes           int             `json:"response_bytes"`
@@ -46,23 +49,28 @@ type AmbientContextMetrics struct {
 
 // TokenUsageSummary contains aggregated token usage from the firewall proxy
 type TokenUsageSummary struct {
-	TotalInputTokens      int                         `json:"total_input_tokens" console:"header:Input Tokens,format:number"`
-	TotalOutputTokens     int                         `json:"total_output_tokens" console:"header:Output Tokens,format:number"`
-	TotalCacheReadTokens  int                         `json:"total_cache_read_tokens" console:"header:Cache Read,format:number"`
-	TotalCacheWriteTokens int                         `json:"total_cache_write_tokens" console:"header:Cache Write,format:number"`
-	TotalRequests         int                         `json:"total_requests" console:"header:Requests"`
-	TotalSteeringEvents   int                         `json:"total_steering_events,omitempty" console:"header:Steering Events,format:number,omitempty"`
-	TotalDurationMs       int                         `json:"total_duration_ms"`
-	TotalResponseBytes    int                         `json:"total_response_bytes"`
-	CacheEfficiency       float64                     `json:"cache_efficiency"`
-	TotalAIC              float64                     `json:"total_aic,omitempty"`
-	AICFound              bool                        `json:"-"`
-	AmbientContext        *AmbientContextMetrics      `json:"ambient_context,omitempty"`
-	ByModel               map[string]*ModelTokenUsage `json:"by_model"`
-	SubagentModelRequests []SubagentModelRequest      `json:"subagent_model_requests,omitempty"`
-	SubagentModelActuals  []SubagentModelActual       `json:"subagent_model_actuals,omitempty"`
-	MismatchCount         int                         `json:"mismatch_count,omitempty"`
-	Warnings              []string                    `json:"warnings,omitempty"`
+	TotalInputTokens       int                         `json:"total_input_tokens" console:"header:Input Tokens,format:number"`
+	TotalOutputTokens      int                         `json:"total_output_tokens" console:"header:Output Tokens,format:number"`
+	TotalCacheReadTokens   int                         `json:"total_cache_read_tokens" console:"header:Cache Read,format:number"`
+	TotalCacheWriteTokens  int                         `json:"total_cache_write_tokens" console:"header:Cache Write,format:number"`
+	TotalRequests          int                         `json:"total_requests" console:"header:Requests"`
+	TotalSteeringEvents    int                         `json:"total_steering_events,omitempty" console:"header:Steering Events,format:number,omitempty"`
+	SteeringEventCounts    map[string]int              `json:"steering_event_counts,omitempty" console:"-"`
+	TotalDurationMs        int                         `json:"total_duration_ms"`
+	TotalResponseBytes     int                         `json:"total_response_bytes"`
+	CacheEfficiency        float64                     `json:"cache_efficiency"`
+	TotalAIC               float64                     `json:"total_aic,omitempty"`
+	AICFound               bool                        `json:"-"`
+	AmbientContext         *AmbientContextMetrics      `json:"ambient_context,omitempty"`
+	ByModel                map[string]*ModelTokenUsage `json:"by_model"`
+	SubagentModelRequests  []SubagentModelRequest      `json:"subagent_model_requests,omitempty"`
+	DeclaredSubagentModels []SubagentModelRequest      `json:"declared_subagent_models,omitempty"`
+	SubagentModelActuals   []SubagentModelActual       `json:"subagent_model_actuals,omitempty"`
+	AgentUsage             []AgentUsageBreakdown       `json:"agent_usage,omitempty"`
+	MismatchCount          int                         `json:"mismatch_count,omitempty"`
+	Warnings               []string                    `json:"warnings,omitempty"`
+	agentModels            map[string]*ModelTokenUsage
+	endpoint               string
 }
 
 // ModelTokenUsage contains per-model token usage statistics
@@ -91,18 +99,68 @@ type ModelTokenUsageRow struct {
 
 // SubagentModelRequest captures requested/effective model attribution for a sub-agent.
 type SubagentModelRequest struct {
-	AgentName       string `json:"agent_name"`
-	RequestedModel  string `json:"requested_model"`
-	InvocationCount int    `json:"invocation_count"`
-	EffectiveModel  string `json:"effective_model,omitempty"`
-	ReasonCode      string `json:"reason_code,omitempty"`
+	AgentName       string   `json:"agent_name"`
+	RequestedModel  string   `json:"requested_model"`
+	ResolvedModel   string   `json:"resolved_model,omitempty"`
+	ServedModels    []string `json:"served_models,omitempty"`
+	ErrorCode       string   `json:"error_code,omitempty"`
+	InvocationCount int      `json:"invocation_count"`
+	CompletedCount  int      `json:"completed_count,omitempty"`
+	FailedCount     int      `json:"failed_count,omitempty"`
+	IncompleteCount int      `json:"incomplete_count,omitempty"`
+	Effort          string   `json:"effort,omitempty"`
+	Error           string   `json:"error,omitempty"`
+	EffectiveModel  string   `json:"effective_model,omitempty"`
+	ReasonCode      string   `json:"reason_code,omitempty"`
 }
 
 // SubagentModelActual captures model usage observed in token-usage logs.
 type SubagentModelActual struct {
-	Model    string `json:"model"`
-	Provider string `json:"provider,omitempty"`
-	Requests int    `json:"requests"`
+	Model         string   `json:"model"`
+	Provider      string   `json:"provider,omitempty"`
+	Requests      int      `json:"requests"`
+	ResolvedModel string   `json:"resolved_model,omitempty"`
+	ServedModels  []string `json:"served_models,omitempty"`
+	TokenCoreMetrics
+	AIC              float64 `json:"aic,omitempty"`
+	TotalDurationMs  int     `json:"total_duration_ms,omitempty"`
+	agentName        string
+	identityEvidence []string
+}
+
+type AgentUsageBreakdown struct {
+	AgentName       string   `json:"agent_name"`
+	AgentType       string   `json:"agent_type"`
+	SourceEngine    string   `json:"source_engine,omitempty"`
+	InstanceCount   int      `json:"instance_count"`
+	CompletedCount  int      `json:"completed_count,omitempty"`
+	FailedCount     int      `json:"failed_count,omitempty"`
+	IncompleteCount int      `json:"incomplete_count,omitempty"`
+	RequestedModels []string `json:"requested_models,omitempty"`
+	ResolvedModels  []string `json:"resolved_models,omitempty"`
+	ServedModels    []string `json:"served_models,omitempty"`
+	Effort          string   `json:"effort,omitempty"`
+	Requests        int      `json:"requests"`
+	TokenCoreMetrics
+	AIC                float64           `json:"aic,omitempty"`
+	TotalApiDurationMs int               `json:"total_api_duration_ms,omitempty"`
+	Models             []AgentModelUsage `json:"models,omitempty"`
+	requestUsages      []agentRequestUsage
+}
+
+type agentRequestUsage struct {
+	Model           string
+	Timestamp       time.Time
+	UsageIncomplete bool
+	TokenCoreMetrics
+}
+
+type AgentModelUsage struct {
+	Model         string `json:"model"`
+	ResolvedModel string `json:"resolved_model,omitempty"`
+	Requests      int    `json:"requests"`
+	TokenCoreMetrics
+	AIC float64 `json:"aic,omitempty"`
 }
 
 // agentUsageEntry is the JSON structure written by parse_token_usage.cjs to
@@ -125,14 +183,15 @@ type agentUsageEntry struct {
 }
 
 // proxyEventsEntry is a JSONL record from api-proxy-logs/events.jsonl.
-// The event name appears under one of four field names depending on the proxy version;
-// the message field is present on steering events.
+// The event name appears under one of four top-level field names or nested payload
+// fields depending on the proxy version; the message field is present on steering events.
 type proxyEventsEntry struct {
-	// Event name appears under one of these four keys; all are checked.
-	Event          string `json:"event"`
-	Type           string `json:"type"`
-	EventNameSnake string `json:"event_name"`
-	EventNameCamel string `json:"eventName"`
+	// Event name appears under one of these four keys or in the nested payload.
+	Event          string          `json:"event"`
+	Type           string          `json:"type"`
+	EventNameSnake string          `json:"event_name"`
+	EventNameCamel string          `json:"eventName"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
 	// Message text (present on steering events).
 	Message string `json:"message"`
 	// Optional RFC3339/RFC3339Nano timestamp (not always present).
@@ -142,10 +201,11 @@ type proxyEventsEntry struct {
 // tokenUsageJSONLPath is the relative path within the firewall logs directory
 const tokenUsageJSONLPath = "api-proxy-logs/token-usage.jsonl"
 const proxyEventsJSONLPath = "api-proxy-logs/events.jsonl"
+const proxyEventLogsJSONLPath = "api-proxy-logs/event-logs.jsonl"
 const agentUsageJSONPath = "agent_usage.json"
 const modelMismatchReasonTokenUsageMissing = "TOKEN_USAGE_MISSING"
 const modelMismatchReasonModelNotObserved = "REQUESTED_MODEL_NOT_OBSERVED"
-const subagentStdioWarning = "partial or incorrect data: sub-agent model requests are inferred from agent-stdio.log; use token_usage.jsonl for reliable token consumption"
+const modelMismatchReasonSubagentFailed = "SUBAGENT_FAILED"
 const tokenSteeringEventName = "token_steering"
 const timeoutSteeringEventName = "timeout_steering"
 const awfTokenWarningPrefix = "[AWF TOKEN WARNING]"

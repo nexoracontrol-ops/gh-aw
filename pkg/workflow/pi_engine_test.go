@@ -20,13 +20,67 @@ func TestNewPiEngine(t *testing.T) {
 	assert.False(t, engine.IsExperimental(), "Pi engine should not be experimental")
 	capabilities := engine.GetCapabilities()
 	assert.True(t, capabilities.ToolsAllowlist, "Pi should support tools allowlist (needed for gh-proxy/cli-proxy settings)")
-	assert.False(t, capabilities.MCP, "Pi should not support MCP directly")
+	assert.True(t, capabilities.MCP, "Pi supports native MCP through the policy gateway")
+	assert.True(t, capabilities.BashCommandAllowlist, "Pi enforces bash allowlists in its pre-tool hook")
+	assert.True(t, capabilities.BashDisable, "Pi can disable bash")
 	assert.True(t, capabilities.MaxTurns, "Pi should support max turns")
+	assert.True(t, capabilities.ContextWindow, "Pi should support context-window")
 }
 
 func TestPiEngine_GetModelEnvVarName(t *testing.T) {
 	engine := NewPiEngine()
 	assert.Equal(t, "PI_MODEL", engine.GetModelEnvVarName(), "Model env var should be PI_MODEL")
+}
+
+func TestPiEngine_GetExecutionSteps_AutoModels(t *testing.T) {
+	for _, model := range []string{"", "auto", "copilot/auto"} {
+		t.Run(fmt.Sprintf("model=%q", model), func(t *testing.T) {
+			workflowData := &WorkflowData{
+				Name:               "test-pi-auto",
+				Model:              model,
+				EngineConfig:       &EngineConfig{ID: "pi"},
+				ParsedTools:        NewTools(map[string]any{}),
+				NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+			}
+			steps := NewPiEngine().GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+			require.Len(t, steps, 1)
+			stepText := strings.Join(steps[0], "\n")
+			assert.Contains(t, stepText, "--model aw-gateway/auto")
+			assert.Contains(t, stepText, "GH_AW_PI_MODEL_ID=auto")
+			assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=github")
+			assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_FALLBACK_PORT=10002")
+			assert.NotContains(t, stepText, "aw-gateway/gpt-5.4")
+			assert.Equal(t, model, workflowData.Model, "Defaulting must not mutate the caller's workflow data")
+		})
+	}
+}
+
+func TestPiEngine_GetExecutionSteps_DefaultWithOpenAIProvider(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:               "test-pi-openai-default",
+		EngineConfig:       &EngineConfig{ID: "pi", LLMProvider: LLMProviderOpenAI},
+		ParsedTools:        NewTools(map[string]any{}),
+		NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+	}
+	steps := NewPiEngine().GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+	require.Len(t, steps, 1)
+	stepText := strings.Join(steps[0], "\n")
+	assert.Contains(t, stepText, "--model aw-gateway/gpt-5.4")
+	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=openai")
+	assert.NotContains(t, stepText, "--model aw-gateway/auto")
+}
+
+func TestPiEngine_GetExecutionSteps_DefaultWithoutGateway(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:         "test-pi-native-default",
+		EngineConfig: &EngineConfig{ID: "pi"},
+		ParsedTools:  NewTools(map[string]any{}),
+	}
+	steps := NewPiEngine().GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+	require.Len(t, steps, 1)
+	stepText := strings.Join(steps[0], "\n")
+	assert.Contains(t, stepText, "--model github-copilot/gpt-5.4")
+	assert.NotContains(t, stepText, "--model github-copilot/auto")
 }
 
 func TestPiEngine_ResolveLLMProvider_DefaultGitHub(t *testing.T) {
@@ -216,6 +270,9 @@ func TestPiEngine_GetExecutionSteps_Basic(t *testing.T) {
 	assert.Contains(t, stepText, "agentic_execution", "Step should have agentic_execution id")
 	assert.Contains(t, stepText, "pi_provider.cjs", "Step should load the provider extension")
 	assert.Contains(t, stepText, "pi_steering_extension.cjs", "Step should automatically load the steering extension")
+	assert.Contains(t, stepText, "pi_tool_policy.cjs", "Step must enforce tool policy")
+	assert.Contains(t, stepText, "builtin:mcp", "Step loads native MCP")
+	assert.Contains(t, stepText, "--no-approve", "Untrusted project resources must not load implicitly")
 	assert.Contains(t, stepText, "shell_harness.cjs", "Step should run Pi through the shared shell harness")
 	assert.Contains(t, stepText, "GH_AW_TIMEOUT_MINUTES: 20", "Step should expose the timeout to the shared harness")
 }
@@ -262,18 +319,23 @@ func TestPiEngine_GetExecutionSteps_IgnoresRedundantYoloArg(t *testing.T) {
 
 func TestFilterPiArgs(t *testing.T) {
 	t.Run("empty args", func(t *testing.T) {
-		require.Empty(t, filterPiArgs(nil))
-		require.Empty(t, filterPiArgs([]string{}))
+		require.Empty(t, filterPiArgs(nil, false))
+		require.Empty(t, filterPiArgs([]string{}, false))
 	})
 
 	t.Run("drops yolo variants only", func(t *testing.T) {
-		filtered := filterPiArgs([]string{"--yolo", "--custom-flag", "value", "--yolo=true", "--yolo=false"})
+		filtered := filterPiArgs([]string{"--yolo", "--custom-flag", "value", "--yolo=true", "--yolo=false"}, false)
 		assert.Equal(t, []string{"--custom-flag", "value"}, filtered)
 	})
 
 	t.Run("drops all redundant args", func(t *testing.T) {
-		filtered := filterPiArgs([]string{"--yolo", "--yolo=false"})
+		filtered := filterPiArgs([]string{"--yolo", "--yolo=false"}, false)
 		assert.Equal(t, []string{}, filtered)
+	})
+
+	t.Run("drops model and thinking overrides when routing", func(t *testing.T) {
+		filtered := filterPiArgs([]string{"--model", "fixed-model", "--thinking=high", "--custom-flag", "value"}, true)
+		assert.Equal(t, []string{"--custom-flag", "value"}, filtered)
 	})
 }
 
@@ -370,6 +432,33 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider(t *testing.T) {
 	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=COPILOT_GITHUB_TOKEN", "Should export the gateway secret env var name for pi_models_json.cjs")
 	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.CopilotLLMGatewayPort), "Should export the compile-time fallback port")
 	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=github", "Should export the reflect provider name for pi_models_json.cjs")
+	assert.NotContains(t, stepText, "GH_AW_PI_CONTEXT_WINDOW", "Should not export context window when engine.context-window is not configured")
+}
+
+func TestPiEngine_GetExecutionSteps_FirewallContextWindow(t *testing.T) {
+	engine := NewPiEngine()
+	toolsRaw := map[string]any{
+		"github":    map[string]any{"mode": "gh-proxy"},
+		"cli-proxy": true,
+	}
+	workflowData := &WorkflowData{
+		Name:  "test-workflow",
+		Model: "copilot/custom-model",
+		EngineConfig: &EngineConfig{
+			ID:            "pi",
+			ContextWindow: 256000,
+		},
+		Tools:       toolsRaw,
+		ParsedTools: NewTools(toolsRaw),
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+	}
+	steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/agent-stdio.log")
+	require.Len(t, steps, 1, "Should produce exactly one execution step")
+
+	stepText := strings.Join(steps[0], "\n")
+	assert.Contains(t, stepText, "GH_AW_PI_CONTEXT_WINDOW=256000", "Should export configured context window for pi_models_json.cjs")
 }
 
 func TestPiEngine_GetExecutionSteps_FirewallAnthropicProvider(t *testing.T) {
@@ -453,6 +542,7 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider_CopilotRequestsWrite
 		"github":    map[string]any{"mode": "gh-proxy"},
 		"cli-proxy": true,
 	}
+
 	workflowData := &WorkflowData{
 		Name:         "test-workflow",
 		Model:        "copilot/gpt-5.4",
@@ -484,4 +574,38 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider_CopilotRequestsWrite
 	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=COPILOT_GITHUB_TOKEN", "Should export the gateway secret env var name for pi_models_json.cjs")
 	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.CopilotLLMGatewayPort), "Should export the compile-time fallback port")
 	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=github", "Should export the reflect provider name for pi_models_json.cjs")
+}
+
+func TestPiEngine_GetExecutionSteps_ModelRouting(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "routed-workflow",
+		Model: "gpt-5.6-sol",
+		EngineConfig: &EngineConfig{
+			ID:          "pi",
+			LLMProvider: LLMProviderGitHub,
+			Args:        []string{"--model", "fixed-model", "--thinking", "high", "--custom-flag", "kept"},
+			ModelRouting: &CopilotModelRoutingConfig{
+				Goal: "cost", Mode: "balanced", AllowedModels: []string{"gpt-5.6-sol"},
+			},
+		},
+		NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+		ParsedTools:        NewTools(map[string]any{}),
+	}
+
+	step := strings.Join(NewPiEngine().GetExecutionSteps(workflowData, "test-log")[0], "\n")
+	assert.Contains(t, step, "GH_AW_MODEL_ROUTING")
+	assert.Contains(t, step, "candidateModels")
+	assert.Contains(t, step, "pi_models_json.cjs")
+	assert.Contains(t, step, "pi_runtime.cjs")
+	assert.Contains(t, step, "pi_subagent_extension.cjs")
+	assert.Equal(t, 1, strings.Count(step, "/pi_models_json.cjs"))
+	assert.Less(t, strings.Index(step, "/pi_models_json.cjs"), strings.Index(step, "/pi_runtime.cjs"))
+	assert.NotContains(t, step, "GH_AW_PI_MODEL:")
+	assert.NotContains(t, step, "GH_AW_PI_NATIVE_PROVIDER:")
+	assert.NotContains(t, step, "GH_AW_PI_MODEL_ID=")
+	assert.NotContains(t, step, "--model aw-gateway/gpt-5.6-sol")
+	assert.NotContains(t, step, "--thinking high")
+	assert.NotContains(t, step, "--model fixed-model")
+	assert.Contains(t, step, "--custom-flag kept")
+	assert.Contains(t, step, `--model "aw-gateway/$(cat /tmp/gh-aw/pi-routing-model)"`)
 }

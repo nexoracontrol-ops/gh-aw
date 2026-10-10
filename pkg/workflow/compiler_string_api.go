@@ -149,10 +149,14 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 	if err != nil {
 		return nil, err
 	}
+	if err := c.validateCopilotWebToolsSupport(engineSetup.agenticEngine, engineSetup.engineConfig, toolsResult.tools); err != nil {
+		return nil, err
+	}
 
 	// Build initial workflow data structure
 	workflowData := c.buildInitialWorkflowData(parseResult.frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
 	workflowData.WorkflowID = GetWorkflowIDFromPath(cleanPath)
+	resolveMaxDailyAICBackendIntoWorkflowData(workflowData, parseResult.frontmatterResult.Frontmatter, engineSetup.importsResult.MergedMaxDailyAICredits)
 
 	// Validate bash tool configuration
 	if err := validateBashToolConfig(workflowData.ParsedTools, workflowData.Name); err != nil {
@@ -207,6 +211,7 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 	workflowData.ActionResolver = actionResolver
 	workflowData.ActionPinWarnings = c.actionPinWarnings
 	workflowData.ActionPinMappings = c.getActionPinMappings()
+	workflowData.ActionPinPrefixes = c.getActionPinPrefixes()
 	workflowData.ContainerPinMappings = c.getContainerPinMappings()
 
 	// Extract YAML configuration sections

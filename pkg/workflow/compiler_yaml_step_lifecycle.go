@@ -59,7 +59,7 @@ func writeStepsSection(yaml *strings.Builder, stepsYAML string) {
 	}
 }
 
-func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine) {
+func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine) { //nolint:largefunc // Existing run-info environment assembly keeps related fields together.
 	// Engine ID (prefer EngineConfig.ID, fallback to AI field for backwards compatibility)
 	engineID := engine.GetID()
 	if data.EngineConfig != nil && data.EngineConfig.ID != "" {
@@ -138,7 +138,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 		firewallType = "squid"
 	}
 
-	// Sandbox agent runtime (e.g., "gvisor", "docker-sbx", "cloud-hypervisor"), stored in aw_info.json
+	// Sandbox agent runtime (e.g., "cloud-hypervisor"), stored in aw_info.json
 	// for observability and used by the logs/audit --runtime filter.
 	agentRuntime := ""
 	if data.SandboxConfig != nil && data.SandboxConfig.Agent != nil {
@@ -184,6 +184,9 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	fmt.Fprintf(yaml, "          GH_AW_INFO_EXPERIMENTAL: \"%t\"\n", engine.IsExperimental())
 	fmt.Fprintf(yaml, "          GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST: \"%t\"\n", engine.GetCapabilities().ToolsAllowlist)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_STAGED: \"%s\"\n", stagedValue)
+	if c.dryRun {
+		yaml.WriteString("          GH_AW_INFO_DRY_RUN: \"true\"\n")
+	}
 	fmt.Fprintf(yaml, "          GH_AW_INFO_ALLOWED_DOMAINS: '%s'\n", domainsJSON)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_FIREWALL_ENABLED: \"%t\"\n", firewallEnabled)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWF_VERSION: \"%s\"\n", firewallVersion)
@@ -219,8 +222,8 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	// validateLockdownRequirements is called from generate_aw_info.cjs and uses these vars.
 	githubTool, hasGitHub := data.Tools["github"]
 	if hasGitHub && githubTool != false {
-		toolConfig, _ := githubTool.(map[string]any)
-		if hasGitHubLockdownExplicitlySet(toolConfig) && getGitHubLockdown(toolConfig) {
+		toolConfig, ok := githubTool.(map[string]any)
+		if ok && hasGitHubLockdownExplicitlySet(toolConfig) && getGitHubLockdown(toolConfig) {
 			yaml.WriteString("          GITHUB_MCP_LOCKDOWN_EXPLICIT: \"true\"\n")
 			yaml.WriteString("          GH_AW_GITHUB_TOKEN: ${{ secrets.GH_AW_GITHUB_TOKEN }}\n")
 			yaml.WriteString("          GH_AW_GITHUB_MCP_SERVER_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN }}\n")
@@ -253,6 +256,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			compilerYamlStepLifecycleLog.Printf("Failed to marshal skills for GH_AW_INFO_SKILLS, engine will not receive skill list: %v", err)
 		}
 	}
+	writeSubagentModelDeclarations(yaml, data, engineID)
 	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
@@ -262,7 +266,34 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	yaml.WriteString("            await main(core, context);\n")
 }
 
-func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *WorkflowData) error {
+func writeSubagentModelDeclarations(yaml *strings.Builder, data *WorkflowData, engineID string) {
+	if len(data.SubAgentModels) == 0 || (engineID != "pi" && engineID != "copilot") {
+		return
+	}
+	declarations := make([]map[string]any, 0, len(data.SubAgentModels))
+	provider := "github-copilot"
+	if engineID == "pi" {
+		provider = piSubagentProvider(piConfiguredProvider(data))
+		if provider == "copilot" {
+			provider = "github-copilot"
+		}
+	}
+	for _, agent := range data.SubAgentModels {
+		model := RewriteExperimentsReferenceForDownstreamJobs(agent.Model, data.Experiments)
+		model = RewriteActivationOutputsToLocalStepOutputs(model, data.Experiments)
+		declarations = append(declarations, map[string]any{
+			"name": agent.Name, "model": model,
+			"patterns": expandSubagentModelPatterns(agent.Model, data, provider),
+		})
+	}
+	encoded, err := json.Marshal(declarations)
+	if err != nil {
+		panic(fmt.Sprintf("BUG: cannot encode sub-agent model declarations: %v", err))
+	}
+	yaml.WriteString(formatYAMLEnv("          ", "GH_AW_INFO_SUB_AGENT_MODELS", string(encoded)))
+}
+
+func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *WorkflowData) error { //nolint:largefunc // Existing artifact collection keeps related output paths and ordering together.
 	// Copy the raw safe-output NDJSON to a /tmp/gh-aw/ path so it can be included in the
 	// unified agent artifact together with all other /tmp/gh-aw/ outputs.
 	yaml.WriteString("      - name: Copy Safe Outputs\n")
@@ -272,6 +303,19 @@ func (c *Compiler) generateOutputCollectionStep(yaml *strings.Builder, data *Wor
 	yaml.WriteString("        run: |\n")
 	fmt.Fprintf(yaml, "          mkdir -p /tmp/gh-aw\n")
 	fmt.Fprintf(yaml, "          cp \"$GH_AW_SAFE_OUTPUTS\" /tmp/gh-aw/%s 2>/dev/null || true\n", constants.SafeOutputsFilename)
+	if isWorkQueueEnabled(data) {
+		yaml.WriteString("      - name: Copy work queue claim finish intent\n")
+		yaml.WriteString("        if: always()\n")
+		yaml.WriteString("        env:\n")
+		yaml.WriteString("          GH_AW_SAFE_OUTPUTS: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}\n")
+		yaml.WriteString("        run: |\n")
+		yaml.WriteString("          finish_intent_dir=\"$(dirname \"$GH_AW_SAFE_OUTPUTS\")/work-queue\"\n")
+		fmt.Fprintf(yaml, "          if cp \"$finish_intent_dir/work-queue.finish.jsonl\" %s 2>/dev/null; then\n", constants.WorkQueueFinishIntentPath)
+		yaml.WriteString("            echo 'Work queue: copied finish intent into agent artifact'\n")
+		yaml.WriteString("          else\n")
+		yaml.WriteString("            echo 'Work queue: no finish intent to copy (tool not called or file unavailable)'\n")
+		yaml.WriteString("          fi\n")
+	}
 
 	yaml.WriteString("      - name: Ingest agent output\n")
 	yaml.WriteString("        id: collect_output\n")

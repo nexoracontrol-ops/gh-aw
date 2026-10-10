@@ -66,7 +66,7 @@ func generateCacheMemorySteps(builder *strings.Builder, data *WorkflowData) {
 		// When threat detection is enabled, we only restore the cache and defer saving to a separate job after detection
 		// Use actions/cache for normal caches (which auto-saves via post-action)
 		threatDetectionEnabled := IsDetectionJobEnabled(data.SafeOutputs)
-		useRestoreOnly := cache.RestoreOnly || threatDetectionEnabled
+		useRestoreOnly := data.DryRun || cache.RestoreOnly || threatDetectionEnabled
 
 		actionName := "Restore cache-memory file share data"
 
@@ -133,6 +133,9 @@ func generateCacheMemoryGitSetupStep(builder *strings.Builder, cache CacheMemory
 // to the current integrity branch. These steps run after agent execution and before artifact
 // upload so that the saved tarball always includes up-to-date git history.
 func generateCacheMemoryGitCommitSteps(builder *strings.Builder, data *WorkflowData) {
+	if data.DryRun {
+		return
+	}
 	if data.CacheMemoryConfig == nil || len(data.CacheMemoryConfig.Caches) == 0 {
 		return
 	}
@@ -205,10 +208,7 @@ func generateCacheMemoryValidation(builder *strings.Builder, data *WorkflowData)
 		fmt.Fprintf(builder, "          MEMORY_DIR: %s\n", cacheDir)
 		fmt.Fprintf(builder, "          MEMORY_ID: %s\n", cache.ID)
 		fmt.Fprintf(builder, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON)
-		if cache.Validation != nil {
-			fmt.Fprintf(builder, "          VALIDATION_SCRIPT_B64: %s\n", memoryValidationScriptBase64(cache.Validation))
-			fmt.Fprintf(builder, "          VALIDATION_TIMEOUT_SECONDS: %d\n", memoryValidationTimeoutSeconds(cache.Validation))
-		}
+		appendMemoryValidationEnvironment(builder, cache.Validation)
 		builder.WriteString("        with:\n")
 		builder.WriteString("          script: |\n")
 		builder.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
@@ -492,10 +492,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 			fmt.Fprintf(&validationStep, "          MEMORY_DIR: %s\n", cacheDir)
 			fmt.Fprintf(&validationStep, "          MEMORY_ID: %s\n", cache.ID)
 			fmt.Fprintf(&validationStep, "          ALLOWED_EXTENSIONS: '%s'\n", allowedExtsJSON)
-			if cache.Validation != nil {
-				fmt.Fprintf(&validationStep, "          VALIDATION_SCRIPT_B64: %s\n", memoryValidationScriptBase64(cache.Validation))
-				fmt.Fprintf(&validationStep, "          VALIDATION_TIMEOUT_SECONDS: %d\n", memoryValidationTimeoutSeconds(cache.Validation))
-			}
+			appendMemoryValidationEnvironment(&validationStep, cache.Validation)
 			validationStep.WriteString("        with:\n")
 			validationStep.WriteString("          script: |\n")
 			validationStep.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
@@ -550,7 +547,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 		// Cache job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
 		cacheTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		cacheParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		setupSteps = append(setupSteps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, cacheTraceID, cacheParentSpanID)...)
+		setupSteps = append(setupSteps, c.generateSetupStepForJob("update_cache_memory", data, setupActionRef, SetupActionDestination, false, cacheTraceID, cacheParentSpanID, "")...)
 	}
 
 	// Prepend setup steps to all cache steps

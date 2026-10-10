@@ -29,10 +29,62 @@ experiments:
     issue: 43177
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
+sandbox:
+  agent:
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   agentic-workflows:
+  ledger:
+    audit-history:
+      type: table
+      key: run_id
+      schema:
+        type: object
+        required: [record_type, run_id, audited_at, audit_window, runs_reviewed, aggregate_metrics, finding_ids, recommendation_ids, anomaly_ids, recurring_finding_ids, outcome]
+        properties:
+          record_type:
+            enum: [workflow_run_audit]
+          run_id:
+            type: string
+          audited_at:
+            type: string
+          audit_window:
+            type: object
+            properties:
+              start:
+                type: string
+              end:
+                type: string
+            additionalProperties: false
+          runs_reviewed:
+            type: integer
+            minimum: 0
+          aggregate_metrics:
+            type: object
+          finding_ids:
+            type: array
+            items:
+              type: string
+          recommendation_ids:
+            type: array
+            items:
+              type: string
+          anomaly_ids:
+            type: array
+            items:
+              type: string
+          recurring_finding_ids:
+            type: array
+            items:
+              type: string
+          outcome:
+            enum: [findings_reported, noop]
+        additionalProperties: false
+      max-record-kb: 16
+      max-patch-kb: 10
   timeout: 300
 safe-outputs:
   upload-asset:
@@ -44,11 +96,6 @@ imports:
     with:
       title-prefix: "[audit-workflows] "
       expires: 1d
-  - uses: shared/repo-memory-standard.md
-    with:
-      branch-name: "memory/audit-workflows"
-      description: "Historical audit data and patterns"
-      max-patch-size: 51200
   - ../skills/jqschema/SKILL.md
   - shared/reporting.md
 
@@ -58,16 +105,13 @@ imports:
   - shared/graders.md
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: workflow_runs_audited
     question: Did the agent audit agentic workflow runs from the last 24 hours?
   - id: issues_identified_or_noop
     question: Were issues, missing tools, errors, and improvement opportunities identified, or was noop used when no problems were found?
 
-model: openai/gpt-5.3-codex
+model: copilot/gpt-6-luna
 ---
 
 # Agentic Workflow Audit Agent
@@ -126,7 +170,7 @@ Output is saved to: /tmp/gh-aw/aw-mcp/logs
 1. **Collection phase**: summarize missing tools, hard failures, and token/runtime outliers.
 2. **Clustering phase**: group recurring failure signatures and map them to known issues vs. novel anomalies.
 3. **Recommendation phase**: derive the smallest actionable set of fixes, each linked to evidence.
-4. **Synthesis phase**: combine phase outputs into one final audit report and repo-memory update.
+4. **Synthesis phase**: combine phase outputs into one final audit report and ledger record.
 {{else}}
 **Analyze**: Review logs for:
 - Missing tools (patterns, frequency, legitimacy)
@@ -141,20 +185,16 @@ Before writing the final report, verify that each recommendation cites at least 
 Before writing the final report, verify recommendations are concrete and evidence-based.
 {{/if}}
 
-**Repo Memory**: Store findings in `/tmp/gh-aw/repo-memory/default/`:
-- `audit-history.jsonl` — append one structured summary entry per audit cycle
-- `workflow-trends.json` — rolling per-workflow cost, duration, success, and reliability trends
-- `known-issues.json` — recurring problems with first-seen, last-seen, recurrence count, affected workflows, and status
-- `recommendations.json` — accumulated recommendations linked back to audits, workflows, and known issues
-- `anomalies.json` — unusual runs or cost spikes with a multi-day persistence score and current escalation state
-- `metrics-summary.json` — aggregate daily metrics used for charts and rollups
+**Audit history**: Use the replay projection at `/tmp/gh-aw/ledgers/audit-history/ledger.db` as the durable record of each audit. Query recent audit summaries before analysis to compare stable finding, recommendation, and anomaly IDs, and query by run ID before appending to avoid duplicate records:
 
-When updating repo memory:
-- merge with existing data instead of overwriting useful history
-- serialize `workflow-trends.json` and `recommendations.json` as pretty-printed JSON with two-space indentation and a trailing newline; never store them as minified single-line JSON
-- keep stable IDs so issues, recommendations, and anomalies can be cross-referenced across days
-- increment recurrence and persistence counters when the same problem reappears
-- compare the current audit with prior entries before deciding whether something is new or ongoing
+```sql
+SELECT key, value FROM state ORDER BY key DESC LIMIT 100;
+```
+
+If replay is reported unavailable, use the generic `records` history instead of querying replay tables.
+Use run logs as the source for the 30-day charts and rollups; do not maintain a second copy of those metrics in mutable memory files.
+
+After completing the report, query `state` for the current run ID, then submit one `ledger_append` operation `upsert` with the run ID as `key` and a `value` containing `record_type: workflow_run_audit`, the UTC audit timestamp, audit window, number of runs reviewed, compact aggregate metrics, stable IDs for findings/recommendations/anomalies, recurring finding IDs, and the outcome (`findings_reported` or `noop`) if absent. Keep records structured and bounded; never store logs, prompts, raw tool output, or other sensitive content. Query the projection's `diagnostics` table to inspect malformed or incomplete records. Ledger branches are append-only: do not edit them directly or invoke compaction.
 
 ## Guidelines
 
@@ -162,6 +202,6 @@ When updating repo memory:
 **Quality**: Be thorough, specific, actionable, accurate  
 **Efficiency**: Use repo memory, batch operations, respect timeouts
 
-Memory structure: `/tmp/gh-aw/repo-memory/default/{audit-history.jsonl,workflow-trends.json,known-issues.json,recommendations.json,anomalies.json,metrics-summary.json}`
+History is stored as bounded structured `workflow_run_audit` records in the configured Git-backed ledger.
 
 Always create discussion with findings and update repo memory.

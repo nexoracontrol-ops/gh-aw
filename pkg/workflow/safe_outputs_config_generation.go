@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -28,7 +29,7 @@ import (
 // they stay in sync with GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG.
 func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	if data.SafeOutputs == nil {
-		if data.CommentMemoryConfig == nil {
+		if data.CommentMemoryConfig == nil && (data.LedgerConfig == nil || !data.LedgerConfig.Enabled()) {
 			safeOutputsConfigLog.Print("No safe outputs configuration found, returning empty config")
 			return "", nil
 		}
@@ -43,29 +44,64 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	}
 
 	addSafeJobsConfig(safeOutputsConfig, data.SafeOutputs.Jobs)
+	if isWorkQueueParticipant(data) && len(data.SafeOutputs.Steps) > 0 {
+		safeOutputsConfig["raw_steps"] = map[string]any{"description": "Trusted Claim-scoped custom step preparation"}
+	}
 	addSafeScriptsConfig(safeOutputsConfig, data.SafeOutputs.Scripts)
 	if err := addSafeActionsConfig(safeOutputsConfig, data.SafeOutputs.Actions); err != nil {
 		return "", err
 	}
 	addMentionsConfig(safeOutputsConfig, data.SafeOutputs)
 	addPushRepoMemoryConfig(safeOutputsConfig, data.RepoMemoryConfig)
+	if ledgerConfig := buildLedgerMutationHandlerConfig(data.RepoMemoryConfig); ledgerConfig != nil {
+		safeOutputsConfig[ledgerMutationHandlerKey] = ledgerConfig
+		safeOutputsConfigLog.Print("Added ledger_mutation config so ledger audit entries are ingested")
+	}
+	addStandaloneLedgerConfigs(safeOutputsConfig, data.LedgerConfig)
 
 	if len(safeOutputsConfig) == 0 {
 		return "", nil
 	}
-	// The agent job never depends on the custom jobs listed in safe-outputs.needs (those
-	// dependencies are only wired onto the later safe_outputs handler job by
-	// buildSafeOutputsJobNeeds). Any templated expression referencing needs.<job> for one of
-	// those jobs would therefore be unresolvable inside the agent job and trip an actionlint
-	// "undefined property" error. Neutralize such expressions here; the handler job's own copy
-	// of the config (GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG) is unaffected and keeps the real value.
-	sanitizeAgentSafeOutputsConfig(safeOutputsConfig, data.SafeOutputs.Needs)
+	// Custom jobs listed in safe-outputs.needs are wired onto the later safe_outputs handler job,
+	// not automatically onto the agent job. Neutralize expressions for those jobs unless the
+	// agent already directly depends on them; the handler job's own config is unaffected.
+	unresolvableJobs := make([]string, 0, len(data.SafeOutputs.Needs))
+	for _, job := range data.SafeOutputs.Needs {
+		if !slices.Contains(data.AgentJobNeeds, job) {
+			unresolvableJobs = append(unresolvableJobs, job)
+		}
+	}
+	sanitizeAgentSafeOutputsConfig(safeOutputsConfig, unresolvableJobs)
 	configJSON, err := marshalSafeOutputsConfig(safeOutputsConfig)
 	if err != nil {
 		return "", fmt.Errorf("marshaling safe-outputs config: %w", err)
 	}
 	safeOutputsConfigLog.Printf("Safe outputs config generation complete: %d tool types configured", len(safeOutputsConfig))
 	return string(configJSON), nil
+}
+
+// addStandaloneLedgerConfigs adds the ledger_append and ledger_request_compaction configs for
+// standalone tools.ledger ledgers.
+func addStandaloneLedgerConfigs(safeOutputsConfig map[string]any, config *LedgerToolConfig) {
+	if config != nil && config.Enabled() {
+		ledgerConfigs := make([]map[string]any, 0, len(config.Ledgers))
+		for _, ledger := range config.Ledgers {
+			ledgerConfig := map[string]any{
+				"name":           ledger.Name,
+				"type":           ledger.Type,
+				"key":            ledger.Key,
+				"schema":         ledger.Schema,
+				"max_record_kb":  ledger.MaxRecordKB,
+				"max_segment_kb": ledger.MaxSegmentKB,
+				"max_patch_kb":   ledger.MaxPatchKB,
+			}
+			ledgerConfigs = append(ledgerConfigs, ledgerConfig)
+		}
+		safeOutputsConfig["ledger_append"] = map[string]any{"max": 100, "ledgers": ledgerConfigs}
+	}
+	if handlerConfig := buildLedgerRequestCompactionHandlerConfig(config); handlerConfig != nil {
+		safeOutputsConfig[ledgerRequestCompactionHandlerKey] = handlerConfig
+	}
 }
 
 // addStandardHandlerConfigs adds config for every registered standard safe-output
@@ -85,10 +121,14 @@ func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowD
 		// exclusion processing — it must not be forwarded to the runtime config.json.
 		delete(handlerCfg, "_protected_files_exclude")
 		if _, hasProtectedFiles := handlerCfg["protected_files"]; hasProtectedFiles {
+			excludeNames, excludePaths := splitProtectedFilesExcludes(excludeFiles)
 			fullManifestFiles := getAllManifestFiles(engineManifestFiles...)
 			fullPathPrefixes := getProtectedPathPrefixes(engineManifestPathPrefixes...)
-			handlerCfg["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeFiles...)
-			filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeFiles...)
+			handlerCfg["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeNames...)
+			if len(excludePaths) > 0 {
+				handlerCfg["protected_files_path_exclude"] = excludePaths
+			}
+			filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeNames...)
 			if len(filteredPrefixes) > 0 {
 				handlerCfg["protected_path_prefixes"] = filteredPrefixes
 			} else {
@@ -96,7 +136,7 @@ func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowD
 			}
 			// Compute which top-level dot-folder prefixes are excluded so the runtime
 			// dot-folder check can skip them.
-			if dotFolderExcludes := getDotFolderExcludes(excludeFiles); len(dotFolderExcludes) > 0 {
+			if dotFolderExcludes := getDotFolderExcludes(excludeNames); len(dotFolderExcludes) > 0 {
 				handlerCfg["protected_dot_folder_excludes"] = dotFolderExcludes
 			}
 		}
@@ -110,6 +150,17 @@ func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowD
 		}
 		safeOutputsConfig[handlerName] = handlerCfg
 	}
+}
+
+func splitProtectedFilesExcludes(excludes []string) (names, paths []string) {
+	for _, exclude := range excludes {
+		if path, ok := strings.CutPrefix(exclude, "/"); ok {
+			paths = append(paths, path)
+		} else {
+			names = append(names, exclude)
+		}
+	}
+	return names, paths
 }
 
 // addMentionsConfig adds mentions and max-bot-mentions configuration (consumed by the
@@ -173,6 +224,9 @@ func addSafeScriptsConfig(safeOutputsConfig map[string]any, scripts map[string]*
 		normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
 		safeOutputsConfigLog.Printf("Generating config for safe script: %s (normalized: %s)", scriptName, normalizedName)
 		safeScriptConfigMap := map[string]any{}
+		if scriptConfig.Max > 0 {
+			safeScriptConfigMap["max"] = scriptConfig.Max
+		}
 		if scriptConfig.Description != "" {
 			safeScriptConfigMap["description"] = scriptConfig.Description
 		}
@@ -258,10 +312,17 @@ func addPushRepoMemoryConfig(safeOutputsConfig map[string]any, repoMemoryConfig 
 			memoryConfig["format_json"] = true
 		}
 		if memory.Validation != nil {
-			memoryConfig["validation"] = map[string]any{
-				"script":  memory.Validation.Script,
-				"timeout": memoryValidationTimeoutSeconds(memory.Validation),
+			validationConfig := map[string]any{}
+			if memory.Validation.Script != "" {
+				validationConfig["script"] = memory.Validation.Script
+				validationConfig["script_required"] = true
 			}
+			if len(memory.Validation.JSONSchemas) > 0 {
+				validationConfig["json_schemas"] = memory.Validation.JSONSchemas
+				validationConfig["json_schemas_required"] = true
+			}
+			validationConfig["timeout"] = memoryValidationTimeoutSeconds(memory.Validation)
+			memoryConfig["validation"] = validationConfig
 		}
 		memories = append(memories, memoryConfig)
 	}

@@ -128,6 +128,9 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection { /
 	if section := buildDriveMemoryPromptSection(data.DriveMemoryConfig); section != nil {
 		sections = append(sections, *section)
 	}
+	if section := buildLedgerPromptSection(data.LedgerConfig); section != nil {
+		sections = append(sections, *section)
+	}
 
 	// 7. Repo memory instructions (if enabled)
 	if data.RepoMemoryConfig != nil && len(data.RepoMemoryConfig.Memories) > 0 {
@@ -136,12 +139,27 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection { /
 		if section != nil {
 			sections = append(sections, *section)
 		}
+		if memory := data.RepoMemoryConfig.ledgerEntry(); memory != nil {
+			sections = append(sections, PromptSection{
+				Content: "Use `ledger_append`, `ledger_query`, `ledger_get`, and `ledger_status` to record and inspect structured events. " +
+					"Do not edit ledger storage directly.",
+			})
+		}
 	}
 
 	// 8. Safe outputs instructions (if enabled)
 	if HasSafeOutputsEnabled(data.SafeOutputs) || data.CommentMemoryConfig != nil {
 		unifiedPromptLog.Print("Adding safe outputs section")
-		// Static intro from file (gh CLI warning, temporary ID rules, noop note)
+		cliOnlySafeOutputs := !engineSupportsMCPToolCalls(c.engineCatalog, data)
+		transportPromptFile := safeOutputsMCPTransportPromptFile
+		if cliOnlySafeOutputs {
+			transportPromptFile = safeOutputsCLIOnlyTransportPromptFile
+		}
+		sections = append(sections, PromptSection{
+			Content: transportPromptFile,
+			IsFile:  true,
+		})
+		// Static body from file (temporary ID rules, noop note).
 		sections = append(sections, PromptSection{
 			Content: safeOutputsPromptFile,
 			IsFile:  true,
@@ -155,7 +173,6 @@ func (c *Compiler) collectPromptSections(data *WorkflowData) []PromptSection { /
 		unifiedPromptLog.Printf("Adding MCP CLI tools section: servers=%v", getMCPCLIServerNames(data))
 		sections = append(sections, *section)
 	}
-
 	// 9. GitHub context (if GitHub tool is enabled)
 	if hasGitHubTool(data.ParsedTools) {
 		unifiedPromptLog.Print("Adding GitHub context section")
@@ -342,10 +359,12 @@ func (c *Compiler) generateUnifiedPromptCreationStep(yaml *strings.Builder, buil
 	type promptRenderItem struct {
 		ContentEnvVar   string `json:"content_env,omitempty"`
 		File            string `json:"file,omitempty"`
+		LedgerReplay    bool   `json:"ledger_replay,omitempty"`
 		ConditionEnvVar string `json:"condition_env,omitempty"`
 	}
 	type promptRenderConfig struct {
-		Items []promptRenderItem `json:"items"`
+		Items           []promptRenderItem `json:"items"`
+		SystemItemCount int                `json:"system_item_count"`
 	}
 
 	renderConfig := promptRenderConfig{}
@@ -372,6 +391,10 @@ func (c *Compiler) generateUnifiedPromptCreationStep(yaml *strings.Builder, buil
 	}
 	for _, section := range builtinSections {
 		if section.IsFile {
+			if section.Content == ledgerReplayPromptFile {
+				renderConfig.Items = append(renderConfig.Items, promptRenderItem{LedgerReplay: true})
+				continue
+			}
 			appendFile(section.Content, section.ConditionEnvVar)
 			continue
 		}
@@ -387,6 +410,7 @@ func (c *Compiler) generateUnifiedPromptCreationStep(yaml *strings.Builder, buil
 	if len(builtinSections) > 0 {
 		appendContent("</system>\n", "")
 	}
+	renderConfig.SystemItemCount = len(renderConfig.Items)
 
 	userBlankRun := 0
 	for chunkIdx, chunk := range userPromptChunks {

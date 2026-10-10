@@ -9,6 +9,16 @@ Use the `runs-on` frontmatter field to target a self-hosted runner instead of th
 
 Runners must be Linux with Docker support. macOS and Windows are not supported.
 
+To enforce self-hosted runners for every generated job, set `require_self_hosted_runners` in `.github/workflows/aw.json` or pass `--require-self-hosted-runners` for a one-off compile:
+
+```json title=".github/workflows/aw.json"
+{
+  "require_self_hosted_runners": true
+}
+```
+
+The compiler checks all generated jobs, including framework and safe-output jobs. Each must use the `self-hosted` label or a runner group. The `GH_AW_REQUIRE_SELF_HOSTED_RUNNERS=true` compiler environment variable also enables this enforcement.
+
 Self-hosted runners may require `sudo` depending on the selected engine and configuration. For the default GitHub Copilot engine, there are two distinct sudo considerations:
 
 - **AWF (Agentic Workflow Firewall)**: Runs rootless in the default network-isolation mode. Egress is enforced via Docker network topology — an internal Docker network (`awf-net`) with no internet route and a dual-homed Squid proxy as the sole egress path. No `sudo` and no `NET_ADMIN` are required on the runner for AWF in this mode. Container-level `iptables`, Squid proxy ACLs, and capability drops provide defense in depth, all managed inside the Docker daemon's domain.
@@ -189,7 +199,21 @@ Enterprises running in private clouds or air-gapped environments can redirect ac
 }
 ```
 
-Keys and values must use the `owner/repo@ref` format. Each source version must be mapped individually — wildcard and prefix matching are not supported. A console message is emitted once per applied mapping during compilation.
+Keys and values must use the `owner/repo@ref` format. Each source version must be mapped individually. A console message is emitted once per applied mapping during compilation.
+
+### Version-independent action mirrors (`action_pin_prefixes`)
+
+Use `action_pin_prefixes` to mirror an entire family of actions without updating the configuration when action versions change:
+
+```json title=".github/workflows/aw.json"
+{
+  "action_pin_prefixes": {
+    "actions/": "acme-corp/actions-"
+  }
+}
+```
+
+For example, `actions/checkout@<sha> # v4` becomes `acme-corp/actions-checkout@<sha> # v4`. The original repository is pinned first; the mirror must contain the same commits, and no network lookup of the mirror is needed. The longest matching prefix wins, and an exact `action_pins` entry takes precedence. A console message is emitted once per redirected repository.
 
 ### Container image substitutions (`container_pins`)
 
@@ -223,13 +247,13 @@ sandbox:
     images:
       squid: registry.example.com/approved/squid:v0.28.8@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       agent: registry.example.com/approved/agent:v0.28.8@sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      apiProxy: registry.example.com/approved/api-proxy:v0.28.8@sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      api-proxy: registry.example.com/approved/api-proxy:v0.28.8@sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 > [!NOTE]
 > The digest values in this example are placeholders. Replace them with the exact digests from your approved registry images.
 
-When this manifest is set, AWF uses these references as authoritative runtime role images. Keep values literal and digest-pinned; expressions are rejected at compile time. For role requirements and constraints (for example `cliProxy` with `tools.github.mode: gh-proxy`, or `buildTools` with `runner.topology: arc-dind`), see [Sandbox custom infrastructure images](/gh-aw/reference/sandbox/#custom-infrastructure-images-sandboxagentimages).
+When this manifest is set, AWF uses these references as authoritative runtime role images. Keep values literal and digest-pinned; expressions are rejected at compile time. For role requirements and constraints (for example `cli-proxy` with `tools.github.mode: gh-proxy`, or `build-tools` with `runner.topology: arc-dind`), see [Sandbox custom infrastructure images](/gh-aw/reference/sandbox/#custom-infrastructure-images-sandboxagentimages).
 
 ### Combined example
 
@@ -250,7 +274,7 @@ When this manifest is set, AWF uses these references as authoritative runtime ro
 Re-run `gh aw compile` after modifying `aw.json` to regenerate all affected lock files.
 
 > [!NOTE]
-> Neither `action_pins` nor `container_pins` is supported in individual workflow frontmatter. Both are repository-level settings in `aw.json` that apply across all workflows in the repository.
+> `action_pins`, `action_pin_prefixes`, and `container_pins` are repository-level settings in `aw.json`, not individual workflow frontmatter.
 
 ## Learn More
 

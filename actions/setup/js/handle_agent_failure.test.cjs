@@ -1,23 +1,34 @@
 // @ts-check
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { createRequire } from "module";
 import { syncRuntimePromptTemplates } from "./test_prompt_templates.js";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
+const previousRunnerTemp = process.env.RUNNER_TEMP;
+const promptRoot = mkdtempSync(join(realpathSync(process.cwd()), ".gh-aw-failure-prompts-"));
+process.env.RUNNER_TEMP = promptRoot;
 const { runtimePromptsDir } = syncRuntimePromptTemplates(import.meta.url);
+afterAll(() => {
+  if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+  else process.env.RUNNER_TEMP = previousRunnerTemp;
+  rmSync(promptRoot, { recursive: true, force: true });
+});
 
 describe("handle_agent_failure", () => {
   let main;
   let buildCodePushFailureContext;
   let buildPushRepoMemoryFailureContext;
   let buildReportIncompleteContext;
+  let buildFailureDiagnosticsContext;
+  let getFailedAgentStep;
   let buildFailureIssueTitle;
   let buildModelPricingFrontmatterSnippet;
   let fetchModelPricingFromModelsDev;
   let buildMissingModelPricingContext;
   let buildSecretVerificationContext;
-  let buildDockerSbxSecretsContext;
   let buildAssignmentErrorsContext;
   let buildAssignCopilotFailureContext;
   let setFailureIssueOutputs;
@@ -46,12 +57,13 @@ describe("handle_agent_failure", () => {
       buildCodePushFailureContext,
       buildPushRepoMemoryFailureContext,
       buildReportIncompleteContext,
+      buildFailureDiagnosticsContext,
+      getFailedAgentStep,
       buildFailureIssueTitle,
       buildModelPricingFrontmatterSnippet,
       fetchModelPricingFromModelsDev,
       buildMissingModelPricingContext,
       buildSecretVerificationContext,
-      buildDockerSbxSecretsContext,
       buildAssignmentErrorsContext,
       buildAssignCopilotFailureContext,
       setFailureIssueOutputs,
@@ -64,8 +76,211 @@ describe("handle_agent_failure", () => {
     delete global.github;
     delete global.context;
     delete process.env.GITHUB_SHA;
+    delete process.env.GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF;
     delete process.env.GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
     delete process.env.GH_AW_GROUP_REPORTS;
+  });
+
+  describe("invalidated PR merge-ref checkout", () => {
+    const closedAt = "2026-10-03T12:00:00Z";
+    const checkoutCompletedAt = "2026-10-03T12:00:01Z";
+    let getPR;
+    let listJobs;
+
+    beforeEach(() => {
+      global.context = {
+        repo: { owner: "owner", repo: "repo" },
+        eventName: "pull_request",
+        ref: "refs/pull/42/merge",
+        runId: 123,
+        payload: { pull_request: { number: 42, state: "open" } },
+      };
+      process.env.GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF = "true";
+      getPR = vi.fn().mockResolvedValue({ data: { state: "closed", closed_at: closedAt } });
+      listJobs = vi.fn().mockResolvedValue({
+        data: {
+          jobs: [
+            {
+              name: "agent",
+              conclusion: "failure",
+              steps: [{ name: "Checkout repository (gh-aw default)", conclusion: "failure", completed_at: checkoutCompletedAt }],
+            },
+          ],
+        },
+      });
+      global.github = {
+        paginate: vi.fn(async (request, params) => (await request(params)).data.jobs),
+        rest: { pulls: { get: getPR }, actions: { listJobsForWorkflowRun: listJobs }, issues: { create: vi.fn() } },
+      };
+    });
+
+    it.each([0, 1, 2])("preserves native checkout invalidation reporting with %i queue Claims instead of using Work payload issue numbers", async count => {
+      const claims = Array.from({ length: count }, (_, index) => ({ handle: `h${index + 1}`, claim_id: `c${index + 1}`, work_id: `w${index + 1}`, work: { issue_number: 999 }, result_refs: [] }));
+      vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", count ? "true" : "false");
+      vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "failure");
+      global.context.payload.inputs = {
+        work_queue_assignment: count ? JSON.stringify({ version: 3, dispatch_id: "d1", request_id: "r1", commit_id: "commit1", policy_epoch: "e1", pool: "default", worker_profile: "worker", claims }) : "stray malformed assignment",
+      };
+      const loader = vi.spyOn(require("./load_agent_output.cjs"), "loadAgentOutput").mockReturnValue({ success: true, items: [] });
+      try {
+        await main();
+        expect(getPR).toHaveBeenCalledWith({ owner: "owner", repo: "repo", pull_number: 42 });
+        expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+        expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("PR merge ref was invalidated"));
+      } finally {
+        loader.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.each(["42", null, undefined, {}, 42.5, Number.NaN])("does not resolve a native PR for non-integer numeric identity %j", async number => {
+      global.context.payload.pull_request.number = number;
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(getPR).not.toHaveBeenCalled();
+      expect(listJobs).not.toHaveBeenCalled();
+    });
+
+    it.each(["missing", "malformed"])("keeps trusted native failure reporting available when the queue snapshot is %s without accepting raw outputs", async state => {
+      const snapshot = join(promptRoot, `${state}.snapshot.json`);
+      const output = join(promptRoot, "untrusted-agent-output.json");
+      writeFileSync(output, JSON.stringify({ items: [{ type: "create_issue", title: "not an authorized effect" }] }));
+      if (state === "malformed") writeFileSync(snapshot, '{"version":');
+      vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+      vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+      vi.stubEnv("GH_AW_WORK_QUEUE_SNAPSHOT", snapshot);
+      vi.stubEnv("GH_AW_AGENT_OUTPUT", output);
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "failure");
+      try {
+        await main();
+        expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Unable to read queue-scoped agent output for failure diagnostics"));
+        expect(getPR).toHaveBeenCalledWith({ owner: "owner", repo: "repo", pull_number: 42 });
+        expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+        expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("PR merge ref was invalidated"));
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("preserves main's disabled loader-exception behavior instead of inventing queue diagnostics", async () => {
+      vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "false");
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "failure");
+      const loader = vi.spyOn(require("./load_agent_output.cjs"), "loadAgentOutput").mockImplementation(() => {
+        throw new Error("legacy loader exception");
+      });
+      try {
+        await main();
+        expect(global.core.warning).toHaveBeenCalledWith("Error in handle_agent_failure: legacy loader exception");
+        expect(getPR).not.toHaveBeenCalled();
+        expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+      } finally {
+        loader.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("reports a real native agent failure even when strict queue output parsing throws, without treating raw safe outputs as effects", async () => {
+      const snapshot = join(promptRoot, "failed-worker.snapshot.json");
+      const output = join(promptRoot, "failed-worker-output.json");
+      writeFileSync(snapshot, '{"version":');
+      writeFileSync(output, JSON.stringify({ items: [{ type: "create_issue", title: "untrusted safe output" }] }));
+      vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+      vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+      vi.stubEnv("GH_AW_WORK_QUEUE_SNAPSHOT", snapshot);
+      vi.stubEnv("GH_AW_AGENT_OUTPUT", output);
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "failure");
+      vi.stubEnv("GH_AW_WORKFLOW_NAME", "Queue worker");
+      vi.stubEnv("GH_AW_WORKFLOW_ID", "queue-worker");
+      vi.stubEnv("GH_AW_RUN_URL", "https://github.com/owner/repo/actions/runs/123");
+      getPR.mockResolvedValue({ data: { state: "open", closed_at: null } });
+      global.github.rest.search = { issuesAndPullRequests: vi.fn().mockResolvedValue({ data: { total_count: 0, items: [] } }) };
+      global.github.rest.issues.create.mockResolvedValue({ data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_native_failure" } });
+      try {
+        await main();
+        expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Unable to read queue-scoped agent output for failure diagnostics"));
+        expect(global.github.rest.issues.create).toHaveBeenCalledOnce();
+        expect(global.github.rest.issues.create).toHaveBeenCalledWith(expect.objectContaining({ owner: "owner", repo: "repo", title: expect.stringContaining("Queue worker") }));
+        expect(global.github.rest.issues.create.mock.calls[0][0].body).not.toContain("untrusted safe output");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("skips failure reporting when a PR closes before its merge-ref checkout fails", async () => {
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      try {
+        await main();
+        expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+        expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("PR merge ref was invalidated"));
+        expect(global.core.debug).toHaveBeenCalledWith("Checking PR #42 for merge-ref checkout invalidation");
+        expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref checkout timing: closed_at=2026-10-03T12:00:00.000Z, checkout_completed_at=2026-10-03T12:00:01.000Z");
+        expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation confirmed: closure preceded failed default checkout completion");
+      } finally {
+        delete process.env.GH_AW_AGENT_CONCLUSION;
+      }
+    });
+
+    it("does not classify a checkout that failed before the PR closed as invalidated", async () => {
+      getPR.mockResolvedValue({ data: { state: "closed", closed_at: "2026-10-03T12:00:02Z" } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation not confirmed: no failed default checkout completed at or after PR closure");
+    });
+
+    it("does not suppress a real agent failure after closure", async () => {
+      listJobs.mockResolvedValue({ data: { jobs: [{ name: "agent", conclusion: "failure", steps: [{ name: "Run agent", conclusion: "failure", completed_at: checkoutCompletedAt }] }] } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+    });
+
+    it("does not classify the actions-folder checkout as the default merge-ref checkout", async () => {
+      listJobs.mockResolvedValue({ data: { jobs: [{ name: "agent", conclusion: "failure", steps: [{ name: "Checkout actions folder", conclusion: "failure", completed_at: checkoutCompletedAt }] }] } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+    });
+
+    it("does not classify unrelated checkout steps with matching common names", async () => {
+      listJobs.mockResolvedValue({ data: { jobs: [{ name: "agent", conclusion: "failure", steps: [{ name: "Checkout repository", conclusion: "failure", completed_at: checkoutCompletedAt }] }] } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+    });
+
+    it("does not classify when compiler metadata says the default checkout was overridden", async () => {
+      process.env.GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF = "false";
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(getPR).not.toHaveBeenCalled();
+      expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation check skipped: requires a pull_request merge ref and compiler-confirmed default checkout");
+    });
+
+    it("does not classify open PRs or unrelated refs as invalidated", async () => {
+      getPR.mockResolvedValue({ data: { state: "open", closed_at: null } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(listJobs).not.toHaveBeenCalled();
+      expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation not confirmed: PR is not closed with a closure timestamp");
+      global.context.ref = "refs/heads/main";
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+    });
+
+    it("logs invalid closure timestamps without logging API payloads", async () => {
+      getPR.mockResolvedValue({ data: { state: "closed", closed_at: "invalid", body: "private PR content" } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation not confirmed: invalid PR closure timestamp");
+      expect(listJobs).not.toHaveBeenCalled();
+      expect(JSON.stringify(global.core.debug.mock.calls)).not.toContain("private PR content");
+    });
+
+    it("logs invalid checkout completion timestamps and keeps failures reportable", async () => {
+      listJobs.mockResolvedValue({ data: { jobs: [{ name: "agent", conclusion: "failure", steps: [{ name: "Checkout repository (gh-aw default)", conclusion: "failure", completed_at: "invalid" }] }] } });
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(global.core.debug).toHaveBeenCalledWith("PR merge-ref invalidation not confirmed: invalid checkout completion timestamp");
+    });
+
+    it("keeps reporting when PR state cannot be checked", async () => {
+      getPR.mockRejectedValue(new Error("API unavailable"));
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+    });
+
+    it("warns when permission errors prevent checking PR merge-ref invalidation", async () => {
+      getPR.mockRejectedValue(Object.assign(new Error("Resource not accessible by integration"), { status: 403 }));
+      expect(await require("./handle_agent_failure.cjs").isInvalidatedPRMergeCheckout()).toBe(false);
+      expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("actions: read and pull-requests: read"));
+    });
   });
 
   describe("getActionFailureIssueExpiresHours", () => {
@@ -103,6 +318,91 @@ describe("handle_agent_failure", () => {
     });
   });
 
+  describe("failure diagnostics", () => {
+    it("includes the last failed agent step when available", async () => {
+      global.github = {
+        paginate: vi.fn().mockResolvedValue([
+          {
+            name: "agent",
+            conclusion: "failure",
+            steps: [
+              { name: "Run agent", conclusion: "failure" },
+              { name: "Post Run agent", conclusion: "failure" },
+            ],
+          },
+        ]),
+        rest: { actions: { listJobsForWorkflowRun: vi.fn() } },
+      };
+      global.context.runId = 123;
+
+      await expect(getFailedAgentStep()).resolves.toBe("Post Run agent");
+    });
+
+    it("returns an empty string when no failed agent job is found", async () => {
+      global.github = {
+        paginate: vi.fn().mockResolvedValue([{ name: "other", conclusion: "failure", steps: [] }]),
+        rest: { actions: { listJobsForWorkflowRun: vi.fn() } },
+      };
+
+      await expect(getFailedAgentStep()).resolves.toBe("");
+      expect(global.core.debug).toHaveBeenCalledWith("No failed agent job found when looking up the failed agent step");
+    });
+
+    it("returns an empty string when the agent job has no failed steps", async () => {
+      global.github = {
+        paginate: vi.fn().mockResolvedValue([{ name: "agent", conclusion: "failure", steps: [{ name: "Run agent", conclusion: "success" }] }]),
+        rest: { actions: { listJobsForWorkflowRun: vi.fn() } },
+      };
+
+      await expect(getFailedAgentStep()).resolves.toBe("");
+      expect(global.core.debug).toHaveBeenCalledWith("No failed step found in the agent job");
+    });
+
+    it("warns when the workflow run jobs API is inaccessible", async () => {
+      const error = Object.assign(new Error("Resource not accessible by integration: user-generated response"), { status: 403 });
+      global.github = {
+        paginate: vi.fn().mockRejectedValue(error),
+        rest: { actions: { listJobsForWorkflowRun: vi.fn() } },
+      };
+
+      await expect(getFailedAgentStep()).resolves.toBe("");
+      expect(global.core.warning).toHaveBeenCalledWith("Could not identify the failed agent step; ensure the conclusion job grants actions: read.");
+      expect(JSON.stringify(global.core.warning.mock.calls)).not.toContain("user-generated response");
+    });
+
+    it("warns without exposing unexpected API error text", async () => {
+      global.github = {
+        paginate: vi.fn().mockRejectedValue(new Error("user-generated response")),
+        rest: { actions: { listJobsForWorkflowRun: vi.fn() } },
+      };
+
+      await expect(getFailedAgentStep()).resolves.toBe("");
+      expect(global.core.warning).toHaveBeenCalledWith("Could not identify the failed agent step because the workflow run jobs API request failed.");
+      expect(JSON.stringify(global.core.warning.mock.calls)).not.toContain("user-generated response");
+    });
+
+    it("renders a captured cause for generic agent failures", () => {
+      const result = buildFailureDiagnosticsContext({
+        failureCategories: ["agent_failure"],
+        failingStep: "Run agent",
+        engineFailureContext: "Driver exit code: 1\nLast error: engine failed",
+      });
+
+      expect(result).toContain("Failing step:** Run agent");
+      expect(result).not.toContain("No cause was captured");
+    });
+
+    it("states when no cause was captured", () => {
+      const result = buildFailureDiagnosticsContext({
+        failureCategories: ["agent_failure"],
+        failingStep: "",
+        engineFailureContext: "",
+      });
+
+      expect(result).toContain("No cause was captured from the agent report or engine logs.");
+    });
+  });
+
   it("does not handle an AI credits rate-limit signal when the agent succeeded", async () => {
     const fs = require("fs");
     const os = require("os");
@@ -136,6 +436,7 @@ describe("handle_agent_failure", () => {
     process.env.GH_AW_AGENT_CONCLUSION = "failure";
     process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR = "true";
     process.env.GH_AW_AIC = "1";
+    process.env.GH_AW_PROMPTS_DIR = runtimePromptsDir;
     const createIssueMock = vi.fn(async () => ({
       data: { number: 99, html_url: "https://github.com/owner/repo/issues/99", node_id: "I_99" },
     }));
@@ -162,6 +463,7 @@ describe("handle_agent_failure", () => {
       delete process.env.GH_AW_AGENT_CONCLUSION;
       delete process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR;
       delete process.env.GH_AW_AIC;
+      delete process.env.GH_AW_PROMPTS_DIR;
     }
   });
 
@@ -220,6 +522,36 @@ describe("handle_agent_failure", () => {
 
     it("falls back to generic failed title when no specific condition matches", () => {
       expect(buildFailureIssueTitle(baseOptions)).toBe("[aw] Test Workflow failed");
+      expect(buildFailureIssueTitle({ ...baseOptions, transportWedge: true })).toBe("[aw] Test Workflow stalled on an MCP tool call");
+    });
+
+    it.each([
+      ["engine_driver_failure", "[aw] Test Workflow engine driver failed before emitting a terminal safe output"],
+      ["safeoutputs_cli_error", "[aw] Test Workflow failed to invoke safeoutputs CLI"],
+      ["missing_terminal_safe_output", "[aw] Test Workflow finished without a terminal safe output"],
+      ["invalid_safe_outputs", "[aw] Test Workflow produced no valid safe outputs"],
+    ])("distinguishes %s from generic incompletion", (emptyOutputCause, title) => {
+      expect(buildFailureIssueTitle({ ...baseOptions, hasReportIncomplete: true, emptyOutputCause })).toBe(title);
+    });
+
+    it.each([
+      ["engine_outage", "[aw] Test Workflow experienced an engine outage"],
+      ["request_rejection", "[aw] Test Workflow had a request rejected"],
+      ["prompt_exhaustion", "[aw] Test Workflow reported incomplete result"],
+      ["unknown", "[aw] Test Workflow finished without a clear failure cause"],
+    ])("uses the classified terminal-output cause %s in the issue title", (terminalOutputFailureCause, title) => {
+      expect(buildFailureIssueTitle({ ...baseOptions, terminalOutputFailureCause })).toBe(title);
+    });
+
+    it("focuses on report_incomplete when missing terminal output is classified as prompt exhaustion", () => {
+      expect(
+        buildFailureIssueTitle({
+          ...baseOptions,
+          hasReportIncomplete: true,
+          emptyOutputCause: "missing_terminal_safe_output",
+          terminalOutputFailureCause: "prompt_exhaustion",
+        })
+      ).toBe("[aw] Test Workflow reported incomplete result");
     });
 
     it("prefers unknownModelAICredits over isTimedOut when both are true", () => {
@@ -236,6 +568,10 @@ describe("handle_agent_failure", () => {
 
     it("returns missing model pricing title without model name when model name is empty", () => {
       expect(buildFailureIssueTitle({ ...baseOptions, missingModelPricingError: true, missingModelPricingModelName: "" })).toBe("[aw] Test Workflow has no AI credits pricing for model");
+    });
+
+    it("sanitizes Copilot agent-not-found title content", () => {
+      expect(buildFailureIssueTitle({ ...baseOptions, copilotAgentNotFound: "agent` @octo\npayload" })).toBe('[aw] Test Workflow could not find configured Copilot agent "agent` ``@octo`` payload"');
     });
 
     it("prefers missingModelPricingError over unknownModelAICredits when both are true", () => {
@@ -542,13 +878,14 @@ describe("handle_agent_failure", () => {
     /** @type {string} */
     let promptsDir;
 
-    function buildExistingIssueBody({ branch, categories, expires = "2099-01-01T00:00:00.000Z", pullRequestNumber, workflowName = "Test Workflow", workflowId = "test-workflow" } = {}) {
+    function buildExistingIssueBody({ branch, categories, expires = "2099-01-01T00:00:00.000Z", pullRequestNumber, failureCause, workflowName = "Test Workflow", workflowId = "test-workflow" } = {}) {
       const prPart = pullRequestNumber ? `, pull_request: ${pullRequestNumber}` : "";
+      const failureCausePart = failureCause ? `, failure_cause: ${failureCause}` : "";
       return (
         `> Generated from [${workflowName}](https://github.com/owner/repo/actions/runs/123456)\n` +
         `> - [x] expires <!-- gh-aw-expires: ${expires} --> on Jan 1, 2099, 12:00 AM UTC\n\n` +
         `<!-- gh-aw-agentic-workflow: ${workflowName}, workflow_id: ${workflowId}, run: https://github.com/owner/repo/actions/runs/123456 -->\n` +
-        `<!-- gh-aw-failure-issue: true, workflow_id: ${workflowId}, branch: ${branch || ""}, failure_categories: ${categories.join("|")}${prPart} -->`
+        `<!-- gh-aw-failure-issue: true, workflow_id: ${workflowId}, branch: ${branch || ""}, failure_categories: ${categories.join("|")}${failureCausePart}${prPart} -->`
       );
     }
 
@@ -559,6 +896,30 @@ describe("handle_agent_failure", () => {
         `<!-- gh-aw-agentic-workflow: ${workflowName}, workflow_id: ${workflowId}, run: https://github.com/owner/repo/actions/runs/123456 -->`
       );
     }
+
+    it("reuses terminal-output issues by workflow and classified cause instead of volatile categories", () => {
+      const { isReusableFailureIssue } = require("./handle_agent_failure.cjs");
+      const body = buildExistingIssueBody({
+        branch: "feature/old",
+        categories: ["engine_driver_failure", "report_incomplete"],
+        failureCause: "engine_outage",
+      });
+
+      expect(
+        isReusableFailureIssue(body, {
+          workflowId: "test-workflow",
+          failureCategories: ["engine_driver_failure", "report_incomplete", "http_500_response_error"],
+          failureCause: "engine_outage",
+        })
+      ).toBe(true);
+      expect(
+        isReusableFailureIssue(body, {
+          workflowId: "test-workflow",
+          failureCategories: ["engine_driver_failure", "report_incomplete"],
+          failureCause: "request_rejection",
+        })
+      ).toBe(false);
+    });
 
     beforeEach(() => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-handle-agent-failure-match-"));
@@ -635,6 +996,43 @@ describe("handle_agent_failure", () => {
 
       expect(createCommentMock).toHaveBeenCalledOnce();
       expect(createIssueMock).not.toHaveBeenCalled();
+    });
+
+    it.each(["&amp;#38;#96;", "&\x00#96;", "&<!-- hidden -->#96;"])("keeps encoded diagnostics fenced in the final posted failure comment: %s", async entity => {
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_comment.md"), "{report_incomplete_context}");
+      const outputPath = path.join(tmpDir, "agent_output.json");
+      const payload = `${entity.repeat(3)}\n# untrusted heading\n${entity.repeat(3)}`;
+      fs.writeFileSync(outputPath, JSON.stringify({ items: [{ type: "report_incomplete", reason: "infrastructure_error", details: payload }] }));
+      vi.stubEnv("GH_AW_AGENT_OUTPUT", outputPath);
+      const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
+      global.github = {
+        rest: {
+          search: {
+            issuesAndPullRequests: vi.fn(async ({ q }) => ({
+              data: {
+                total_count: q.includes("is:pr") ? 0 : 1,
+                items: q.includes("is:pr") ? [] : [{ number: 42, body: buildExistingIssueBody({ branch: "feature/current", categories: ["report_incomplete"] }) }],
+              },
+            })),
+          },
+          issues: { create: vi.fn(), createComment: createCommentMock },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+      try {
+        await main();
+        expect(createCommentMock).toHaveBeenCalledOnce();
+        const body = createCommentMock.mock.calls[0][0].body;
+        const detail = body.match(/<details>\n<summary>Error details:<\/summary>\n\n(`+)text\n([\s\S]*?)\n\1\n\n<\/details>/);
+        expect(detail).not.toBeNull();
+        expect(detail[1].length).toBeGreaterThan(3);
+        expect(detail[2]).toContain("```");
+        expect(detail[2]).toContain("# untrusted heading");
+        expect(detail[2]).not.toContain(detail[1]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it("reuses the steering issue instead of searching for or creating a failure issue", async () => {
@@ -802,7 +1200,7 @@ describe("handle_agent_failure", () => {
       expect(createCommentMock).not.toHaveBeenCalled();
       expect(createIssueMock).toHaveBeenCalledOnce();
       const createCall = createIssueMock.mock.calls[0][0];
-      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2026-03-10" });
       expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"gh-aw-agentic-workflow:"') }));
       expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"workflow_id: test-workflow" in:body') }));
     });
@@ -843,7 +1241,7 @@ describe("handle_agent_failure", () => {
 
       const parentCreateCall = createIssueMock.mock.calls.map(([call]) => call).find(call => call.title === "[aw] Failed runs");
       expect(parentCreateCall).toBeDefined();
-      expect(parentCreateCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(parentCreateCall.headers).toEqual({ "X-GitHub-Api-Version": "2026-03-10" });
       expect(createCommentMock).not.toHaveBeenCalled();
       expect(searchMock).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining('"[aw] Failed runs"') }));
     });
@@ -1287,6 +1685,60 @@ describe("handle_agent_failure", () => {
       expect(createCall.title).toBe("[aw] Test Workflow reported incomplete result");
     });
 
+    it.each([
+      { used: 240.22396, budgetExceeded: true },
+      { used: 239.9, budgetExceeded: false },
+    ])("reports proxy HTTP 403 at usage $used with the correct budget or billing category", async ({ used, budgetExceeded }) => {
+      const createIssueMock = vi.fn(async () => ({
+        data: { number: 101, html_url: "https://github.com/owner/repo/issues/101", node_id: "I_123" },
+      }));
+      const tokenUsageDir = path.join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs");
+      fs.mkdirSync(tokenUsageDir, { recursive: true });
+      fs.writeFileSync(path.join(tokenUsageDir, "token-usage.jsonl"), `${JSON.stringify({ status: 200, ai_credits_total: used })}\n`);
+      fs.writeFileSync(path.join(tmpDir, "awf-config.json"), JSON.stringify({ apiProxy: { enabled: true, maxAiCredits: 240 } }));
+      fs.writeFileSync(path.join(tmpDir, "agent-stdio.log"), "[INFO] API proxy enabled: OpenAI=false, Copilot=true (github-token)\nAuthentication failed with provider at http://172.30.0.30:10002 (HTTP 403).\n");
+      const agentOutputPath = path.join(tmpDir, "agent_output.json");
+      fs.writeFileSync(agentOutputPath, JSON.stringify({ items: [{ type: "create_issue", title: "Report", body: "Partial results" }] }));
+      fs.writeFileSync(path.join(promptsDir, "agent_failure_issue.md"), "{ai_credits_rate_limit_error_context}{copilot_org_billing_error_context}{credential_auth_error_context}");
+      fs.copyFileSync(path.join(runtimePromptsDir, "ai_credits_rate_limit_error.md"), path.join(promptsDir, "ai_credits_rate_limit_error.md"));
+      fs.copyFileSync(path.join(runtimePromptsDir, "copilot_org_billing_error.md"), path.join(promptsDir, "copilot_org_billing_error.md"));
+      process.env.GH_AW_AGENT_OUTPUT = agentOutputPath;
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      process.env.GH_AW_FAILURE_REPORT_AS_ISSUE = "true";
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })) },
+          issues: { create: createIssueMock, createComment: vi.fn() },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+
+      try {
+        await main();
+      } finally {
+        delete process.env.GH_AW_AGENT_OUTPUT;
+        delete process.env.GH_AW_ENGINE_ID;
+        delete process.env.GH_AW_FAILURE_REPORT_AS_ISSUE;
+      }
+
+      expect(global.core.setFailed).not.toHaveBeenCalled();
+      expect(createIssueMock).toHaveBeenCalledOnce();
+      const { title, body } = createIssueMock.mock.calls[0][0];
+      if (budgetExceeded) {
+        expect(title).toBe("[aw] Test Workflow exceeded max AI credits");
+        expect(body).toContain("AI Credits Budget Exceeded");
+        expect(body).toContain("failure_categories: max_ai_credits_exceeded");
+        expect(body).not.toContain("Copilot organization billing is unavailable");
+        expect(body).not.toContain("copilot_org_billing_error");
+      } else {
+        expect(title).toBe("[aw] Test Workflow hit Copilot organization billing error");
+        expect(body).toContain("Copilot organization billing is unavailable");
+        expect(body).not.toContain("max_ai_credits_exceeded");
+      }
+    });
+
     it("continues searching later pages until it finds an exact metadata match", async () => {
       const createCommentMock = vi.fn(async () => ({ data: { id: 1001 } }));
       const createIssueMock = vi.fn();
@@ -1458,7 +1910,7 @@ describe("handle_agent_failure", () => {
       expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("Summarize-and-stop"));
       const createCall = createIssueMock.mock.calls[0][0];
       expect(createCall.title).toBe("[aw] Daily failure issue cap exceeded");
-      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2026-03-10" });
       expect(createCommentMock).toHaveBeenCalledOnce();
       expect(createCommentMock).toHaveBeenCalledWith(expect.objectContaining({ issue_number: 999 }));
       expect(global.github.rest.search.issuesAndPullRequests).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining("is:open") }));
@@ -1650,10 +2102,17 @@ describe("handle_agent_failure", () => {
     const fs = require("fs");
     const path = require("path");
     const { renderTemplate } = require("./messages_core.cjs");
-    const reportIncompleteMarker = "MARKER: cannot continue";
+    const reportIncompleteMarker = "MARKER: infrastructure failed";
 
     it("renders report_incomplete context in both comment and issue templates", () => {
-      const reportIncompleteContext = buildReportIncompleteContext([{ type: "report_incomplete", reason: reportIncompleteMarker }]);
+      const reportIncompleteItems = [{ type: "report_incomplete", reason: "infrastructure_error", details: reportIncompleteMarker }];
+      const reportIncompleteContext = buildReportIncompleteContext(reportIncompleteItems);
+      const failureDiagnosticsContext = buildFailureDiagnosticsContext({
+        failureCategories: ["report_incomplete"],
+        failingStep: "Run agent",
+        engineFailureContext: "",
+        items: reportIncompleteItems,
+      });
       const templateContext = {
         run_id: "123456",
         run_url: "https://github.com/owner/repo/actions/runs/123456",
@@ -1662,7 +2121,6 @@ describe("handle_agent_failure", () => {
         branch: "main",
         pull_request_info: "",
         secret_verification_context: "",
-        docker_sbx_secrets_context: "",
         credential_auth_error_context: "",
         inference_access_error_context: "",
         mcp_policy_error_context: "",
@@ -1683,6 +2141,7 @@ describe("handle_agent_failure", () => {
         permission_denied_context: "",
         tool_denials_exceeded_context: "",
         report_incomplete_context: reportIncompleteContext,
+        failure_diagnostics_context: failureDiagnosticsContext,
         missing_safe_outputs_context: "",
         engine_failure_context: "",
         timeout_context: "",
@@ -1692,8 +2151,41 @@ describe("handle_agent_failure", () => {
       const commentTemplate = fs.readFileSync(path.join(__dirname, "../md/agent_failure_comment.md"), "utf8");
       const issueTemplate = fs.readFileSync(path.join(__dirname, "../md/agent_failure_issue.md"), "utf8");
 
-      expect(renderTemplate(commentTemplate, templateContext)).toContain(reportIncompleteMarker);
-      expect(renderTemplate(issueTemplate, templateContext)).toContain(reportIncompleteMarker);
+      for (const template of [commentTemplate, issueTemplate]) {
+        const rendered = renderTemplate(template, templateContext);
+        expect(rendered).toContain(reportIncompleteMarker);
+        expect(rendered).toContain("The workflow recorded a `report_incomplete` signal");
+        expect(rendered).toContain("completion could not be confirmed");
+        expect(rendered).not.toContain("due to an infrastructure or tool failure");
+      }
+      expect(reportIncompleteContext).toContain("infrastructure_error");
+      expect(reportIncompleteContext).toContain(reportIncompleteMarker);
+      expect(failureDiagnosticsContext).toContain("Failing step:** Run agent");
+    });
+
+    it("renders denied commands and missing capability names from an empty-output outcome", () => {
+      const { buildEmptyOutputOutcome } = require("./empty_output_outcome.cjs");
+      const os = require("os");
+      const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "failure-empty-output-"));
+      try {
+        fs.writeFileSync(
+          path.join(rootDir, "agent-session.jsonl"),
+          [
+            { type: "tool.execution_start", data: { toolCallId: "denied", toolName: "bash", input: { command: "cat restricted-file" } } },
+            { type: "tool.execution_complete", data: { toolCallId: "denied", success: false, error: "Permission denied" } },
+            { type: "tool.execution_complete", data: { toolName: "github.get_file_contents", success: false, error: "Missing read access" } },
+          ]
+            .map(JSON.stringify)
+            .join("\n")
+        );
+        const report = buildReportIncompleteContext([buildEmptyOutputOutcome([], rootDir)]);
+        expect(report).toContain("cat restricted-file");
+        expect(report).toContain("Permission denied");
+        expect(report).toContain("github.get_file_contents");
+        expect(report).toContain("Missing read access");
+      } finally {
+        fs.rmSync(rootDir, { recursive: true, force: true });
+      }
     });
   });
 
@@ -1703,32 +2195,6 @@ describe("handle_agent_failure", () => {
       expect(buildSecretVerificationContext("", copilotMessage)).toBe("");
       expect(buildSecretVerificationContext("success", copilotMessage)).toBe("");
       expect(buildSecretVerificationContext("", "")).toBe("");
-    });
-
-    describe("buildDockerSbxSecretsContext", () => {
-      it("returns empty string when docker-sbx secret verification did not fail", () => {
-        expect(buildDockerSbxSecretsContext("")).toBe("");
-        expect(buildDockerSbxSecretsContext("success")).toBe("");
-      });
-
-      it("renders docker-sbx setup guidance from the dedicated markdown template", () => {
-        const originalPromptsDir = process.env.GH_AW_PROMPTS_DIR;
-        try {
-          process.env.GH_AW_PROMPTS_DIR = runtimePromptsDir;
-          const result = buildDockerSbxSecretsContext("failed");
-
-          expect(result).toContain("Docker sbx is not configured");
-          expect(result).toContain("DOCKER_USERNAME");
-          expect(result).toContain("DOCKER_PAT");
-          expect(result).toContain("sandbox.agent.runtime: docker-sbx");
-        } finally {
-          if (originalPromptsDir === undefined) {
-            delete process.env.GH_AW_PROMPTS_DIR;
-          } else {
-            process.env.GH_AW_PROMPTS_DIR = originalPromptsDir;
-          }
-        }
-      });
     });
 
     describe("buildAssignmentErrorsContext", () => {
@@ -2569,6 +3035,10 @@ describe("handle_agent_failure", () => {
       expect(shouldBuildEngineFailureContext("failure", false, false, true)).toBe(false);
     });
 
+    it("returns false for classified terminal-output failures to keep raw engine logs out of issues", () => {
+      expect(shouldBuildEngineFailureContext("failure", false, false, false, false, true)).toBe(false);
+    });
+
     it("returns false for non-failure conclusions", () => {
       expect(shouldBuildEngineFailureContext("timed_out", false, true)).toBe(false);
       expect(shouldBuildEngineFailureContext("success", false, false)).toBe(false);
@@ -2724,6 +3194,29 @@ describe("handle_agent_failure", () => {
       expect(buildEngineFailureContext()).toBe("");
     });
 
+    it("reports a nonzero driver exit even when the stdio log is missing", () => {
+      fs.writeFileSync(path.join(tmpDir, "agent_execution_exit_code.txt"), "127");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("```text\nDriver exit code: 127\n```");
+      expect(result).toContain("<details>\n<summary>Error details:</summary>");
+      expect(result).toContain("terminated before producing output");
+    });
+
+    it("reports the driver exit alongside stderr captured in the stdio log", () => {
+      fs.writeFileSync(path.join(tmpDir, "agent_execution_exit_code.txt"), "1");
+      fs.writeFileSync(stdioLogPath, "Error: Refusing to use symlink as bind mountpoint: /usr/local/bin/npm\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("Driver exit code: 1");
+      expect(result).toContain("Refusing to use symlink as bind mountpoint");
+    });
+
+    it("ignores invalid or successful driver exit codes", () => {
+      fs.writeFileSync(path.join(tmpDir, "agent_execution_exit_code.txt"), "1\nsecret");
+      expect(buildEngineFailureContext()).toBe("");
+      fs.writeFileSync(path.join(tmpDir, "agent_execution_exit_code.txt"), "0");
+      expect(buildEngineFailureContext()).toBe("");
+    });
+
     it("returns empty string when log file is empty", () => {
       fs.writeFileSync(stdioLogPath, "");
       expect(buildEngineFailureContext()).toBe("");
@@ -2740,6 +3233,7 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("Engine Failure");
       expect(result).toContain("quota exceeded");
       expect(result).toContain("Error details:");
+      expect(result).toContain("<details>\n<summary>Error details:</summary>\n\n```text\nquota exceeded\n```\n\n</details>");
       expect(result).toContain("> [!WARNING]");
     });
 
@@ -2837,16 +3331,17 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("Last agent output");
     });
 
-    it("strips ::add-mask:: command lines and redacts masked values from the last agent output", () => {
+    it("omits masked log tails and mask commands", () => {
       const logLines = ["   The Docker agent cgroup cannot be passed through.", "token is 79aab19823c27dbc1f3fcd49f16666ca8ab130b4b234b54f286cfcae347a844d", "::add-mask::79aab19823c27dbc1f3fcd49f16666ca8ab130b4b234b54f286cfcae347a844d"];
       fs.writeFileSync(stdioLogPath, logLines.join("\n") + "\n");
 
       const result = buildEngineFailureContext();
 
-      expect(result).toContain("Last agent output");
+      expect(result).not.toContain("Last agent output");
       expect(result).not.toContain("::add-mask::");
       expect(result).not.toContain("79aab19823c27dbc1f3fcd49f16666ca8ab130b4b234b54f286cfcae347a844d");
-      expect(result).toContain("token is ***");
+      expect(result).not.toContain("token is");
+      expect(result).toContain("Raw agent output is omitted");
     });
 
     it("surfaces the harness terminal error instead of infrastructure noise", () => {
@@ -2869,7 +3364,7 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("pids.max/pids.current");
     });
 
-    it("filters indented AWF infrastructure continuation lines from the fallback tail", () => {
+    it("omits infrastructure continuation lines and arbitrary agent output", () => {
       const logLines = [
         "[WARN] ⚠️  --pids-limit/container.pidsLimit is not supported by this microVM runtime and will be ignored.",
         "   The Docker agent cgroup cannot be passed through, so pids.max/pids.current are unavailable.",
@@ -2879,8 +3374,8 @@ describe("handle_agent_failure", () => {
 
       const result = buildEngineFailureContext();
 
-      expect(result).toContain("Last agent output");
-      expect(result).toContain("agent produced this final line");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("agent produced this final line");
       expect(result).not.toContain("pids.max/pids.current");
     });
 
@@ -2910,6 +3405,22 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("sup3rs3cr3t");
     });
 
+    it("redacts an entire runtime mask when built-in patterns match only its prefix", () => {
+      const secret = `sk-proj-${"a".repeat(64)}${"b".repeat(16)}`;
+      fs.writeFileSync(stdioLogPath, `::add-mask::${secret}\nError: authentication failed with ${secret}\n`);
+      const result = buildEngineFailureContext();
+      expect(result).toContain("authentication failed with ***");
+      expect(result).not.toContain("b".repeat(16));
+    });
+
+    it("cannot close the error code fence with embedded Markdown", () => {
+      fs.writeFileSync(stdioLogPath, "Error: ``` **untrusted error**\n");
+      const result = buildEngineFailureContext();
+      expect(result).toContain("<details>\n<summary>Error details:</summary>");
+      expect(result).toContain("````text\n");
+      expect(result).toMatch(/````\n\n<\/details>/);
+    });
+
     it("detects Error: prefix pattern (Node.js style)", () => {
       fs.writeFileSync(stdioLogPath, "Error: connect ECONNREFUSED 127.0.0.1:8080\n");
       const result = buildEngineFailureContext();
@@ -2917,7 +3428,7 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("connect ECONNREFUSED 127.0.0.1:8080");
     });
 
-    it("suppresses recovered no-deferred-marker retry errors and surfaces the terminal failure tail", () => {
+    it("suppresses recovered no-deferred-marker retry errors without publishing the log tail", () => {
       const logLines = [
         "[claude-harness] attempt 1: partial execution — will retry with --continue",
         "Error: No deferred tool marker found in the resumed session. Either the session was not deferred, the marker is stale (tool already ran), or it exceeds the tail-scan window. Provide a prompt to continue the conversation.",
@@ -2931,8 +3442,9 @@ describe("handle_agent_failure", () => {
       const result = buildEngineFailureContext();
 
       expect(result).toContain("Engine Failure");
-      expect(result).toContain("Last agent output");
-      expect(result).toContain("Connection error");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("Connection error");
+      expect(result).toContain("Review the workflow run logs");
       expect(result).not.toContain("No deferred tool marker");
       expect(result).not.toContain("Error details:");
     });
@@ -3007,6 +3519,16 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("transient infrastructure issue");
     });
 
+    it("surfaces AWF model-routing exit 78 as the failure cause", () => {
+      fs.writeFileSync(stdioLogPath, "[ERROR] Fatal error: AWF model routing failed (exit code 78); check router diagnostics for no_route or router errors\n");
+
+      const result = buildEngineFailureContext();
+
+      expect(result).toContain("Engine Failure");
+      expect(result).toContain("AWF model routing failed (exit code 78)");
+      expect(result).toContain("no_route or router errors");
+    });
+
     it("detects Fatal: prefix pattern", () => {
       fs.writeFileSync(stdioLogPath, "Fatal: out of memory\n");
       const result = buildEngineFailureContext();
@@ -3049,33 +3571,30 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("auth failed");
     });
 
-    it("falls back to last lines when no known error patterns match", () => {
+    it("links to diagnostics rather than copying logs when no known error patterns match", () => {
       const logLines = ["Starting agent...", "Running tool: list_branches", '{"branches": ["main"]}', "Running tool: get_file_contents", "Agent interrupted"];
       fs.writeFileSync(stdioLogPath, logLines.join("\n") + "\n");
       const result = buildEngineFailureContext();
       expect(result).toContain("Engine Failure");
-      expect(result).toContain("Last agent output");
-      expect(result).toContain("Agent interrupted");
+      expect(result).not.toContain("Last agent output");
+      for (const line of logLines) expect(result).not.toContain(line);
+      expect(result).toContain("Review the workflow run logs");
     });
 
-    it("fallback includes at most 10 non-empty lines", () => {
+    it("does not publish any raw log lines, including unregistered secrets", () => {
       const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`);
       fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
       const result = buildEngineFailureContext();
-      expect(result).toContain("line 20");
-      expect(result).toContain("line 11");
-      // Lines 1-10 should not appear in the tail
-      expect(result).not.toContain("line 10\n");
-      expect(result).not.toContain("line 1\n");
+      for (const line of lines) expect(result).not.toContain(line);
     });
 
-    it("fallback ignores empty lines when counting tail", () => {
+    it("does not publish short logs separated by empty lines", () => {
       const lines = ["line 1", "", "line 2", "", "line 3", "", "", "line 4"];
       fs.writeFileSync(stdioLogPath, lines.join("\n") + "\n");
       const result = buildEngineFailureContext();
-      expect(result).toContain("Last agent output");
-      expect(result).toContain("line 4");
-      expect(result).toContain("line 1");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("line 4");
+      expect(result).not.toContain("line 1");
     });
 
     it("shows startup-failure message when log contains only AWF infrastructure lines", () => {
@@ -3104,9 +3623,7 @@ describe("handle_agent_failure", () => {
       expect(result).not.toContain("Process exiting with code");
     });
 
-    it("filters infrastructure lines from fallback tail when mixed with real agent output", () => {
-      // Real agent output followed by AWF infrastructure shutdown lines.
-      // Only the real agent output should appear in the fallback.
+    it("does not publish mixed infrastructure and agent logs", () => {
       const logLines = [
         "Starting agent...",
         "● list_files",
@@ -3119,9 +3636,9 @@ describe("handle_agent_failure", () => {
       ];
       fs.writeFileSync(stdioLogPath, logLines.join("\n") + "\n");
       const result = buildEngineFailureContext();
-      expect(result).toContain("Last agent output");
-      expect(result).toContain("Starting agent");
-      expect(result).toContain("Found 12 files");
+      expect(result).not.toContain("Last agent output");
+      expect(result).not.toContain("Starting agent");
+      expect(result).not.toContain("Found 12 files");
       // Infrastructure lines must be excluded from the displayed output
       expect(result).not.toContain("awf-squid");
       expect(result).not.toContain("Command completed with exit code");
@@ -3240,6 +3757,8 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("EAI_AGAIN");
       expect(result).toContain("awmg-cli-proxy");
       expect(result).toContain("dependency failed to start: container awf-cli-proxy is unhealthy");
+      expect(result).toContain("<details>\n<summary>Error details:</summary>\n\n```text\n");
+      expect(result).toContain("\n```\n\n</details>");
       expect(result).toContain("https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md");
       expect(result).not.toContain("Last agent output");
       expect(result).not.toContain("Engine Failure");
@@ -3790,6 +4309,124 @@ describe("handle_agent_failure", () => {
     });
   });
 
+  describe("buildCopilotAgentNotFoundContext", () => {
+    let buildCopilotAgentNotFoundContext;
+    let detectCopilotAgentNotFoundFromLog;
+    const fs = require("fs");
+    const path = require("path");
+    const os = require("os");
+    let tmpDir;
+
+    beforeEach(() => {
+      vi.resetModules();
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aw-test-copilot-agent-not-found-"));
+      const promptsDir = path.join(tmpDir, "gh-aw", "prompts");
+      fs.mkdirSync(promptsDir, { recursive: true });
+      fs.copyFileSync(path.join(runtimePromptsDir, "copilot_agent_not_found.md"), path.join(promptsDir, "copilot_agent_not_found.md"));
+      process.env.RUNNER_TEMP = tmpDir;
+      ({ buildCopilotAgentNotFoundContext, detectCopilotAgentNotFoundFromLog } = require("./handle_agent_failure.cjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.RUNNER_TEMP;
+      delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.GH_AW_PLUGIN_DIAGNOSTICS_FILE;
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      fs.rmSync("/tmp/gh-aw/sandbox/agent/logs/plugin-diagnostics.log", { force: true });
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("detects a 'No such agent' failure with an available agents list", () => {
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      const logPath = path.join(tmpDir, "agent-stdio.log");
+      fs.writeFileSync(logPath, "No such agent: csharp-dotnet-development:expert-dotnet-software-engineer, available: foo, bar");
+      const detection = detectCopilotAgentNotFoundFromLog(logPath);
+      expect(detection).toEqual({
+        requestedAgent: "csharp-dotnet-development:expert-dotnet-software-engineer",
+        availableAgents: ["foo", "bar"],
+      });
+    });
+
+    it("detects a 'No such agent' failure with an empty available agents list", () => {
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      const logPath = path.join(tmpDir, "agent-stdio.log");
+      fs.writeFileSync(logPath, "No such agent: csharp-dotnet-development:expert-dotnet-software-engineer, available: ");
+      const detection = detectCopilotAgentNotFoundFromLog(logPath);
+      expect(detection).toEqual({
+        requestedAgent: "csharp-dotnet-development:expert-dotnet-software-engineer",
+        availableAgents: [],
+      });
+    });
+
+    it("returns null when the log does not contain the failure", () => {
+      process.env.GH_AW_ENGINE_ID = "copilot";
+      const logPath = path.join(tmpDir, "agent-stdio.log");
+      fs.writeFileSync(logPath, "everything is fine");
+      expect(detectCopilotAgentNotFoundFromLog(logPath)).toBeNull();
+    });
+
+    it("returns null for non-copilot engines even with a matching log line", () => {
+      process.env.GH_AW_ENGINE_ID = "claude";
+      const logPath = path.join(tmpDir, "agent-stdio.log");
+      fs.writeFileSync(logPath, "No such agent: foo, available: ");
+      expect(detectCopilotAgentNotFoundFromLog(logPath)).toBeNull();
+    });
+
+    it("returns no guidance when no failure was detected", () => {
+      expect(buildCopilotAgentNotFoundContext(null)).toBe("");
+    });
+
+    it("renders the requested agent and available agents list", () => {
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo:bar", availableAgents: ["baz"] });
+      expect(result).toContain("Configured Copilot agent not found");
+      expect(result).toContain("`foo:bar`");
+      expect(result).toContain("`baz`");
+    });
+
+    it("sanitizes agent identifiers before rendering them", () => {
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo` @octo\npayload", availableAgents: ["baz` @team"] });
+      expect(result).toContain("``foo` ``@octo`` payload``");
+      expect(result).toContain("``` baz` ``@team`` ```");
+      expect(result).not.toContain("` @octo");
+      expect(result).not.toContain("` @team");
+    });
+
+    it("renders a fallback message when no agents were reported as available", () => {
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo:bar", availableAgents: [] });
+      expect(result).toContain("none — Copilot CLI discovered no loadable agents");
+    });
+
+    it("includes plugin installation diagnostics when present", () => {
+      const diagnosticsPath = path.join(tmpDir, "plugin-diagnostics.log");
+      fs.writeFileSync(diagnosticsPath, "=== Agent plugin diagnostics: octo-org/plugin@sha ===\nMarkdown files found: 0");
+      process.env.GH_AW_PLUGIN_DIAGNOSTICS_FILE = diagnosticsPath;
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo:bar", availableAgents: [] });
+      expect(result).toContain("Plugin installation diagnostics");
+      expect(result).toContain("Markdown files found: 0");
+    });
+
+    it("reads the declared plugin diagnostics path when agent output is elsewhere", () => {
+      const diagnosticsPath = "/tmp/gh-aw/sandbox/agent/logs/plugin-diagnostics.log";
+      fs.mkdirSync(path.dirname(diagnosticsPath), { recursive: true });
+      fs.writeFileSync(diagnosticsPath, "Markdown files found: 0");
+      process.env.GH_AW_AGENT_OUTPUT = "/tmp/gh-aw/agent_output.json";
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo:bar", availableAgents: [] });
+      expect(result).toContain("Plugin installation diagnostics");
+      expect(result).toContain("Markdown files found: 0");
+    });
+
+    it("sanitizes and bounds plugin diagnostics with a safe code fence", () => {
+      const diagnosticsPath = path.join(tmpDir, "plugin-diagnostics.log");
+      fs.writeFileSync(diagnosticsPath, `file-\`\`\`\n@octo\n${"x".repeat(9000)}`);
+      process.env.GH_AW_PLUGIN_DIAGNOSTICS_FILE = diagnosticsPath;
+      const result = buildCopilotAgentNotFoundContext({ requestedAgent: "foo:bar", availableAgents: [] });
+      expect(result).toContain("````\nfile-```");
+      expect(result).toContain("`@octo`");
+      expect(result).toContain("[Content truncated due to length]");
+      expect(result).not.toContain("x".repeat(8500));
+    });
+  });
+
   describe("buildModelNotSupportedErrorContext", () => {
     let buildModelNotSupportedErrorContext;
     const fs = require("fs");
@@ -3871,6 +4508,16 @@ describe("handle_agent_failure", () => {
       fs.writeFileSync(path.join(promptsDir, "model_not_supported_error.md"), templateContent);
       const result = buildModelNotSupportedErrorContext(true);
       expect(result).toContain("Model Not Supported");
+    });
+
+    it("explains a previously available model may require provider investigation", () => {
+      const template = fs.readFileSync(new URL("../md/model_not_supported_error.md", import.meta.url), "utf8");
+      fs.writeFileSync(path.join(promptsDir, "model_not_supported_error.md"), template);
+      const result = buildModelNotSupportedErrorContext(true);
+      expect(result).toContain("compare the successful and failing runs' model catalogs");
+      expect(result).toContain("Copilot service request IDs");
+      expect(result).toContain("Do not share tokens");
+      expect(result).not.toContain("This is a **configuration issue**");
     });
 
     it("throws when template is missing", () => {
@@ -4251,6 +4898,65 @@ describe("handle_agent_failure", () => {
   // ──────────────────────────────────────────────────────
   // buildMissingToolContext
   // ──────────────────────────────────────────────────────
+
+  describe("buildReportIncompleteContext", () => {
+    it("explains collector-generated incompletion without assuming a prompt or infrastructure failure", () => {
+      const { buildEmptyOutputOutcome } = require("./empty_output_outcome.cjs");
+      const { mkdtempSync, rmSync } = require("fs");
+      const { tmpdir } = require("os");
+      const rootDir = mkdtempSync(join(tmpdir(), "failure-incomplete-wording-"));
+      try {
+        const result = buildReportIncompleteContext([buildEmptyOutputOutcome([], rootDir)]);
+        expect(result).toContain("The workflow recorded a `report_incomplete` signal");
+        expect(result).toContain("completion could not be confirmed");
+        expect(result).toContain("missing_terminal_safe_output");
+        expect(result).toContain("Failure classification: unknown");
+        expect(result).not.toContain("exhausted its prompt");
+        expect(result).not.toContain("due to an infrastructure or tool failure");
+      } finally {
+        rmSync(rootDir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps all reasons and multiline diagnostics inside collapsed code", () => {
+      const { buildReportIncompleteContext } = require("./handle_agent_failure.cjs");
+      const result = buildReportIncompleteContext([
+        { type: "report_incomplete", reason: "engine_driver_failure", details: "Driver exit code: 1\nTool failed" },
+        { type: "report_incomplete", reason: "infrastructure_error" },
+      ]);
+      expect(result).toContain("Task Could Not Be Completed");
+      expect(result).toContain("<details>\n<summary>Error details:</summary>\n\n```text\nengine_driver_failure\nDriver exit code: 1\nTool failed\n\ninfrastructure_error\n```\n\n</details>");
+      expect(result).not.toContain("**Reasons:**");
+      expect(result).toContain("structured incompletion signal");
+    });
+
+    it("uses a fence longer than backticks in incomplete error details", () => {
+      const { buildReportIncompleteContext } = require("./handle_agent_failure.cjs");
+      const result = buildReportIncompleteContext([{ type: "report_incomplete", reason: "tool_failure", details: "Error with ``` and ```` delimiters" }]);
+      expect(result).toContain("`````text\n");
+      expect(result).toMatch(/`````\n\n<\/details>/);
+    });
+
+    it("redacts configured secrets before bounding incomplete diagnostics", () => {
+      vi.stubEnv("GH_AW_SECRET_NAMES", "ERROR_RENDERING_TEST");
+      vi.stubEnv("SECRET_ERROR_RENDERING_TEST", "private-error-rendering-value");
+      try {
+        const { buildReportIncompleteContext } = require("./handle_agent_failure.cjs");
+        const result = buildReportIncompleteContext([{ type: "report_incomplete", reason: "tool_failure", details: `private-error-rendering-value\n${"x".repeat(9000)}` }]);
+        expect(result).not.toContain("private-error-rendering-value");
+        expect(result).toContain("[Content truncated due to length]");
+        expect(result).toContain("\n```\n\n</details>");
+        expect(result.length).toBeLessThan(9000);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("returns no details section when there are no incompletion signals", () => {
+      const { buildReportIncompleteContext } = require("./handle_agent_failure.cjs");
+      expect(buildReportIncompleteContext([])).toBe("");
+    });
+  });
 
   describe("buildMissingToolContext", () => {
     let buildMissingToolContext;
@@ -4976,11 +5682,12 @@ describe("handle_agent_failure", () => {
       expect(result).toContain("quota exceeded");
     });
 
-    it("still uses fallback tail when no terminal_reason and no error patterns", () => {
+    it("reports unexpected termination without including a raw log tail", () => {
       fs.writeFileSync(stdioLogPath, "Starting agent...\nAgent interrupted unexpectedly\n");
       const result = buildEngineFailureContext();
       expect(result).toContain("Engine Failure");
-      expect(result).toContain("Agent interrupted unexpectedly");
+      expect(result).not.toContain("Agent interrupted unexpectedly");
+      expect(result).toContain("Raw agent output is omitted");
     });
   });
 
@@ -5064,6 +5771,51 @@ describe("handle_agent_failure", () => {
 
       expect(createIssueMock).not.toHaveBeenCalled();
       expect(createCommentMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["engine_driver_failure", "engine driver failed before emitting a terminal safe output"],
+      ["safeoutputs_cli_error", "failed to invoke safeoutputs CLI"],
+    ])("creates a distinct failure issue for %s", async (reason, titleSuffix) => {
+      fs.writeFileSync(path.join(tmpDir, "agent_output.json"), JSON.stringify({ items: [{ type: "report_incomplete", reason }], collectorEmptyOutputCause: reason }));
+      const createIssueMock = vi.fn(async () => {
+        throw new Error("stop after capturing issue");
+      });
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })) },
+          issues: { create: createIssueMock },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+      const { main: mainFn } = require("./handle_agent_failure.cjs");
+      await mainFn();
+      expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({ title: `[aw] Test Workflow ${titleSuffix}` }));
+      const categories = JSON.parse(fs.readFileSync("/tmp/gh-aw/failure_categories.json", "utf8"));
+      expect(categories).toContain(reason);
+      expect(categories).not.toContain("agent_failure");
+    });
+
+    it.each(["engine_driver_failure", "safeoutputs_cli_error", "invalid_safe_outputs", "missing_terminal_safe_output"])("does not trust agent-authored %s as collector evidence", async reason => {
+      fs.writeFileSync(path.join(tmpDir, "agent_output.json"), JSON.stringify({ items: [{ type: "report_incomplete", reason }] }));
+      const createIssueMock = vi.fn(async () => {
+        throw new Error("stop after capturing issue");
+      });
+      global.github = {
+        rest: {
+          search: { issuesAndPullRequests: vi.fn(async () => ({ data: { total_count: 0, items: [] } })) },
+          issues: { create: createIssueMock },
+          pulls: { get: vi.fn() },
+        },
+        graphql: vi.fn(),
+      };
+      const { main: mainFn } = require("./handle_agent_failure.cjs");
+      await mainFn();
+      expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({ title: "[aw] Test Workflow reported incomplete result" }));
+      const categories = JSON.parse(fs.readFileSync("/tmp/gh-aw/failure_categories.json", "utf8"));
+      expect(categories).toContain("report_incomplete");
+      expect(categories).not.toContain(reason);
     });
 
     it("keeps the step failed when failure issue creation fails after a successful agent reports incomplete", async () => {
@@ -5568,7 +6320,7 @@ describe("handle_agent_failure", () => {
       expect(createCall.title).toBe(CASCADE_ROLLUP_TITLE);
       expect(createCall.labels).toContain(CASCADE_ROLLUP_LABEL);
       expect(createCall.labels).toContain("agentic-workflows");
-      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2022-11-28" });
+      expect(createCall.headers).toEqual({ "X-GitHub-Api-Version": "2026-03-10" });
 
       // All 10 issues labeled
       expect(addLabelsMock).toHaveBeenCalledTimes(10);
@@ -5650,6 +6402,7 @@ describe("handle_agent_failure", () => {
       expect(createIssueMock).not.toHaveBeenCalled();
       expect(updateIssueMock).toHaveBeenCalledOnce();
       expect(updateIssueMock.mock.calls[0][0].issue_number).toBe(50);
+      expect(updateIssueMock.mock.calls[0][0].headers).toEqual({ "X-GitHub-Api-Version": "2026-03-10" });
     });
 
     it("creates cascade-suspected label when it does not exist (404)", async () => {
@@ -5830,6 +6583,24 @@ describe("handle_agent_failure", () => {
       expect(categories).toContain("timed_out");
     });
 
+    it("classifies an MCP watchdog failure without a generic agent failure", () => {
+      expect(buildFailureMatchCategories({ agentConclusion: "failure", transportWedge: true })).toEqual(["transport_wedge"]);
+    });
+
+    it("classifies MCP watchdog failures from structured unified-session events", () => {
+      const { hasMCPTransportWedge, getAgentStdioLogPath, getAgentSessionPath } = require("./handle_agent_failure.cjs");
+      const event = { type: "agent.execution", data: { categories: ["transport_wedge"], errorCodes: [], errorTypes: [] } };
+      expect(hasMCPTransportWedge(JSON.stringify(event))).toBe(true);
+      expect(hasMCPTransportWedge(JSON.stringify({ type: "agent.execution", data: { categories: ["agent_failure"], errorCodes: [], errorTypes: [] } }))).toBe(false);
+      expect(hasMCPTransportWedge("not-json\n".repeat(10_000))).toBe(false);
+      expect(hasMCPTransportWedge('{"type":"item.failed","message":"transport_wedge: MCP tool call timed out after 120s"}')).toBe(false);
+      expect(hasMCPTransportWedge("[codex-harness] runtime guard requested termination (transport_wedge: MCP tool call timed out after 120s)")).toBe(false);
+      expect(getAgentStdioLogPath("/tmp/call-workflow/agent_output.json")).toBe("/tmp/call-workflow/agent-stdio.log");
+      expect(getAgentStdioLogPath("")).toBe("/tmp/gh-aw/agent-stdio.log");
+      expect(getAgentSessionPath("/tmp/call-workflow/agent_output.json")).toBe("/tmp/call-workflow/agent-session.jsonl");
+      expect(getAgentSessionPath("")).toBe("/tmp/gh-aw/agent-session.jsonl");
+    });
+
     it("returns missing_safe_outputs category", () => {
       const categories = buildFailureMatchCategories({
         hasMissingSafeOutputs: true,
@@ -5842,6 +6613,16 @@ describe("handle_agent_failure", () => {
         hasReportIncomplete: true,
       });
       expect(categories).toContain("report_incomplete");
+    });
+
+    it.each(["engine_driver_failure", "safeoutputs_cli_error", "missing_terminal_safe_output", "invalid_safe_outputs"])("keeps %s distinct for failure issue deduplication", emptyOutputCause => {
+      const categories = buildFailureMatchCategories({ agentConclusion: "failure", hasReportIncomplete: true, emptyOutputCause });
+      expect(categories).toContain(emptyOutputCause);
+      expect(categories).not.toContain("agent_failure");
+    });
+
+    it("does not use arbitrary agent text as a failure category", () => {
+      expect(buildFailureMatchCategories({ hasReportIncomplete: true, emptyOutputCause: "untrusted reason" })).toEqual(["report_incomplete"]);
     });
 
     it("does not add agent_failure when a specific category already exists", () => {
@@ -6020,10 +6801,28 @@ describe("handle_agent_failure", () => {
       delete process.env.GH_AW_FAILURE_CATEGORIES_FILTER;
       delete process.env.GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER;
       delete process.env.GH_AW_INFERENCE_ACCESS_ERROR;
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      delete process.env.GH_AW_GROUP_REPORTS;
 
       if (tmpDir && fs.existsSync(tmpDir)) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
+    });
+
+    it("does not create a grouped parent when the only failure category is excluded", async () => {
+      const { createIssueMock } = setupGithubMock();
+      process.env.GH_AW_AGENT_CONCLUSION = "success";
+      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "agent_output.json");
+      process.env.GH_AW_GROUP_REPORTS = "true";
+      process.env.GH_AW_FAILURE_EXCLUDED_CATEGORIES_FILTER = JSON.stringify(["missing_data"]);
+      fs.writeFileSync(process.env.GH_AW_AGENT_OUTPUT, JSON.stringify({ items: [{ type: "missing_data", reason: "required input unavailable" }] }));
+
+      await main();
+
+      expect(createIssueMock).not.toHaveBeenCalled();
+      expect(global.core.info).not.toHaveBeenCalledWith(expect.stringContaining('Searching for parent issue: "[aw] Failed runs"'));
+      expect(global.core.info).toHaveBeenCalledWith("Agent emitted 1 missing_data message(s) - activating failure handling");
+      expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining("Skipping failure issue creation: failure categories match exclude filter. Categories: [missing_data]"));
     });
 
     it.each([

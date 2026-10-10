@@ -70,6 +70,43 @@ func TestBuildAWFArgsAuditDir(t *testing.T) {
 	})
 }
 
+func TestBuildAWFArgsCopilotSessionStateDir(t *testing.T) {
+	tests := []struct {
+		name       string
+		engineName string
+		runtimeID  string
+		awfVersion string
+		expected   bool
+	}{
+		{name: "copilot engine", engineName: "copilot", expected: true},
+		{name: "copilot runtime alias", engineName: "custom-copilot", runtimeID: "copilot", expected: true},
+		{name: "copilot with older AWF", engineName: "copilot", awfVersion: "v0.25.14", expected: false},
+		{name: "non-copilot engine", engineName: "claude", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := BuildAWFArgs(AWFCommandConfig{
+				EngineName:      tt.engineName,
+				EngineRuntimeID: tt.runtimeID,
+				WorkflowData: &WorkflowData{
+					Name:         "test-workflow",
+					EngineConfig: &EngineConfig{ID: tt.engineName},
+					NetworkPermissions: &NetworkPermissions{
+						Firewall: &FirewallConfig{Version: tt.awfVersion},
+					},
+				},
+			})
+
+			if tt.expected {
+				assert.Equal(t, copilotAWFSessionStateDir, argValue(args, "--session-state-dir"))
+			} else {
+				assert.NotContains(t, args, "--session-state-dir")
+			}
+		})
+	}
+}
+
 // TestBuildAWFArgsAllowHostPorts tests that BuildAWFArgs includes --allow-host-ports
 // with port 80, 443, and the MCP gateway port so the AWF agent container can reach
 // the gateway through the firewall's iptables rules.
@@ -413,7 +450,7 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 		}
 	}
 
-	t.Run("does not include cli-proxy flags when feature flag is absent", func(t *testing.T) {
+	t.Run("does not include cli-proxy flags when gh-proxy mode is absent", func(t *testing.T) {
 		config := AWFCommandConfig{
 			EngineName:     "copilot",
 			WorkflowData:   baseWorkflow(nil, nil),
@@ -423,8 +460,8 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 		args := BuildAWFArgs(config)
 		argsStr := strings.Join(args, " ")
 
-		assert.NotContains(t, argsStr, "--difc-proxy-host", "Should not include --difc-proxy-host when feature flag is absent")
-		assert.NotContains(t, argsStr, "--difc-proxy-ca-cert", "Should not include --difc-proxy-ca-cert when feature flag is absent")
+		assert.NotContains(t, argsStr, "--difc-proxy-host", "Should not include --difc-proxy-host when gh-proxy mode is absent")
+		assert.NotContains(t, argsStr, "--difc-proxy-ca-cert", "Should not include --difc-proxy-ca-cert when gh-proxy mode is absent")
 		assert.NotContains(t, argsStr, "--enable-cli-proxy", "Should not include deprecated --enable-cli-proxy")
 		assert.NotContains(t, argsStr, "--cli-proxy-policy", "Should not include deprecated --cli-proxy-policy")
 	})
@@ -440,7 +477,9 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 				NetworkPermissions: &NetworkPermissions{
 					Firewall: &FirewallConfig{Enabled: true, Version: "v0.26.0"},
 				},
-				Features: map[string]any{"cli-proxy": true},
+				Tools: map[string]any{
+					"github": map[string]any{"mode": "gh-proxy"},
+				},
 			},
 			AllowedDomains: "github.com",
 		}
@@ -472,7 +511,9 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 						Type: SandboxTypeAWF,
 					},
 				},
-				Features: map[string]any{"cli-proxy": true},
+				Tools: map[string]any{
+					"github": map[string]any{"mode": "gh-proxy"},
+				},
 			},
 			AllowedDomains: "github.com",
 		}
@@ -519,9 +560,9 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 				NetworkPermissions: &NetworkPermissions{
 					Firewall: &FirewallConfig{Enabled: true, Version: "v0.26.0"},
 				},
-				Features: map[string]any{"cli-proxy": true},
 				Tools: map[string]any{
 					"github": map[string]any{
+						"mode":          "gh-proxy",
 						"min-integrity": "approved",
 					},
 				},
@@ -551,11 +592,9 @@ func TestBuildAWFArgsCliProxy(t *testing.T) {
 					Version: "v0.25.16", // older than AWFCliProxyMinVersion v0.25.17
 				},
 			},
-			Features: map[string]any{
-				"cli-proxy": true,
-			},
 			Tools: map[string]any{
 				"github": map[string]any{
+					"mode":          "gh-proxy",
 					"min-integrity": "approved",
 				},
 			},

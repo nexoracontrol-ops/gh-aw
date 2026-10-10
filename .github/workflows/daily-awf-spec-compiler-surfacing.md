@@ -11,10 +11,10 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-awf-spec-compiler-surfacing
-model: openai/gpt-5.3-codex
+model: copilot/gpt-6-sol
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
 sandbox:
   agent:
     id: awf
@@ -24,10 +24,31 @@ tools:
   github:
     mode: local
     toolsets: [default, issues, pull_requests]
-  repo-memory:
-    branch-name: memory/awf-feature-surfacing
-    file-glob: [".json", ".md"]
-    max-file-size: 65536
+  ledger:
+    awf-feature-reviews:
+      schema:
+        type: object
+        required: [record_type, run_id, reviewed_at, reviewed_sha, schema_sha256, open_feature_ids, outcome]
+        properties:
+          record_type:
+            enum: [awf_spec_surfacing_review]
+          run_id:
+            type: string
+          reviewed_at:
+            type: string
+          reviewed_sha:
+            type: string
+          schema_sha256:
+            type: string
+          open_feature_ids:
+            type: array
+            items:
+              type: string
+          outcome:
+            enum: [issue_created, noop]
+        additionalProperties: false
+      max-record-kb: 8
+      max-patch-kb: 10
   bash: true
 safe-outputs:
   create-issue:
@@ -69,27 +90,16 @@ Start with the main AWF schema, then expand to nearby specification/compiler sou
 - `pkg/parser/`
 - `pkg/workflow/`
 
-## Persistent Progress Tracking (repo-memory)
+## Persistent Review History
 
-Use repo-memory as the authoritative cross-run state in:
+Use the generic records projection at `/tmp/gh-aw/ledgers/awf-feature-reviews/ledger.db` as the authoritative cross-run history. Query recent
+review records and use the newest valid record's `reviewed_sha` as the previous review cursor and
+its `open_feature_ids` to avoid duplicate issues. If no valid record exists,
+use the last 7 days as the initial diff window.
 
-- `/tmp/gh-aw/repo-memory/default/awf-feature-surfacing/progress.json`
-- `/tmp/gh-aw/repo-memory/default/awf-feature-surfacing/latest-review.md`
-
-`default` is the repo-memory instance directory; `awf-feature-surfacing/` is this workflow's owned subdirectory.
-
-`progress.json` schema:
-
-```json
-{
-  "last_reviewed_sha": "",
-  "last_schema_sha256": "",
-  "open_feature_ids": [],
-  "updated_at": ""
-}
-```
-
-If `progress.json` is missing, initialize with empty values and continue.
+Each record contains the run ID, review timestamp, reviewed commit SHA, schema
+SHA-256, stable open feature IDs, and outcome (`issue_created` or `noop`). Do
+not store full diffs, source excerpts, or raw analysis notes in the ledger.
 
 ## Procedure
 
@@ -97,8 +107,20 @@ If `progress.json` is missing, initialize with empty values and continue.
 
 1. Get current commit SHA.
 2. Compute SHA-256 of `pkg/parser/schemas/main_workflow_schema.json`.
-3. Read `progress.json` from repo-memory.
-4. Build the diff window from `last_reviewed_sha` (if present) to `HEAD`; if absent, use the last 7 days.
+3. Query recent reviews and inspect their stable feature IDs:
+
+   ```sql
+   SELECT json_extract(payload, '$.run_id') AS run_id,
+          json_extract(payload, '$.reviewed_at') AS reviewed_at,
+          json_extract(payload, '$.reviewed_sha') AS reviewed_sha,
+          json_extract(payload, '$.schema_sha256') AS schema_sha256,
+          json_extract(payload, '$.open_feature_ids') AS open_feature_ids,
+          json_extract(payload, '$.outcome') AS outcome
+   FROM records
+   WHERE json_extract(payload, '$.record_type') = 'awf_spec_surfacing_review'
+   ORDER BY ordinal DESC LIMIT 100;
+   ```
+4. Build the diff window from the newest valid `reviewed_sha` (if present) to `HEAD`; if absent, use the last 7 days.
 
 ### 2) Detect candidate AWF feature changes
 
@@ -135,12 +157,13 @@ Use `###` headings and `<details>` for verbose evidence.
 
 If no actionable gap exists, return `noop` with a brief explanation.
 
-### 5) Persist repo-memory state
+### 5) Persist the review event
 
-Before finishing, write:
-
-- updated `progress.json` (new `last_reviewed_sha`, schema hash, open feature IDs, timestamp)
-- `latest-review.md` with a compact review summary and decision
+After creating the issue or using `noop`, query for a record whose
+`payload.run_id` matches `${{ github.run_id }}`. If absent, submit one
+`ledger_append` record with `record_type: awf_spec_surfacing_review`, the run ID,
+UTC timestamp, current commit SHA, schema SHA-256, stable open feature IDs, and
+outcome. Do not edit ledger branches directly or invoke compaction.
 
 ## Output Quality Bar
 

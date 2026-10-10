@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/scanfindings"
@@ -28,8 +29,23 @@ func renderConsole(data AuditData, logsPath string) {
 	renderConsoleComparison(data.Comparison)
 	renderConsoleFingerprint(data.BehaviorFingerprint)
 	renderConsoleMetrics(data.Metrics)
+	if data.Ledger != nil {
+		if data.Ledger.TransactionsAdded != nil {
+			fmt.Fprintf(os.Stderr, "  ledger: transactions_added=%d\n", *data.Ledger.TransactionsAdded)
+		}
+		if data.Ledger.Compaction != nil {
+			compaction := data.Ledger.Compaction
+			replacement := "none"
+			if compaction.Replacement != nil && *compaction.Replacement != "" {
+				replacement = *compaction.Replacement
+			}
+			fmt.Fprintf(os.Stderr, "    compaction: before=%d after=%d selected=%d records=%d replacement=%s retired=%d changed=%t\n",
+				compaction.Before, compaction.After, compaction.Selected, compaction.Records, replacement, compaction.Retired, compaction.Changed)
+		}
+	}
 	renderConsoleSession(data.SessionAnalysis)
 	renderConsoleTokenUsage(data.FirewallTokenUsage)
+	renderConsoleModelRouting(data.ModelRouting)
 	renderConsoleGitHubAPIUsage(data.GitHubRateLimitUsage)
 	renderConsoleJobs(data.Jobs)
 	renderConsolePrompt(data.PromptAnalysis)
@@ -94,7 +110,34 @@ func renderConsoleComparison(comparison *AuditComparisonData) {
 	if comparison.Recommendation != nil && comparison.Recommendation.Action != "" {
 		compLine += " | " + comparison.Recommendation.Action
 	}
+	if comparison.Delta != nil && comparison.Delta.ModelRouting != nil && comparison.Delta.ModelRouting.Changed {
+		compLine += " | model route changed: " + formatAuditComparisonRoute(comparison.Delta.ModelRouting.Before) +
+			" -> " + formatAuditComparisonRoute(comparison.Delta.ModelRouting.After)
+	}
 	fmt.Fprintln(os.Stderr, compLine)
+}
+
+func formatAuditComparisonRoute(route *AuditComparisonRoute) string {
+	if route == nil {
+		return "unavailable"
+	}
+	value := safeModelRoutingText(route.Model)
+	if route.Effort != "" {
+		value += ":" + safeModelRoutingText(route.Effort)
+	}
+	if route.Mode != "" {
+		value += " mode=" + safeModelRoutingText(route.Mode)
+	}
+	if route.RouterVersion != "" {
+		value += " router=" + safeModelRoutingText(route.RouterVersion)
+	}
+	if route.EffectiveEndpoint != "" {
+		value += " effective_endpoint=" + safeModelRoutingText(route.EffectiveEndpoint)
+	}
+	if route.SelectedEndpoint != "" {
+		value += " selected_endpoint=" + safeModelRoutingText(route.SelectedEndpoint)
+	}
+	return value
 }
 
 func renderConsoleFingerprint(fingerprint *BehaviorFingerprint) {
@@ -128,6 +171,9 @@ func renderConsoleMetrics(metrics MetricsData) {
 		line += fmt.Sprintf(" action_min=%.0f", metrics.ActionMinutes)
 	}
 	fmt.Fprintln(os.Stderr, line)
+	if friction := frictionSummaryLine(metrics.Friction); friction != "" {
+		fmt.Fprintln(os.Stderr, "  friction: "+friction)
+	}
 }
 
 func renderConsoleSession(session *SessionAnalysis) {
@@ -164,12 +210,151 @@ func renderConsoleTokenUsage(tokenUsage *TokenUsageSummary) {
 		tokenUsage.TotalRequests,
 		console.FormatNumber(tokenUsage.TotalSteeringEvents),
 	)
+	if len(tokenUsage.AgentUsage) > 0 {
+		fmt.Fprintln(os.Stderr, "  agent_usage:")
+		fmt.Fprintln(os.Stderr, "    agent | instances | outcome (completed/failed/incomplete) | requests | tokens (in/out) | credits | effort")
+		for _, agent := range tokenUsage.AgentUsage {
+			fmt.Fprintf(os.Stderr, "    %s %s | %d | %d/%d/%d | %d | %s/%s | %.3f | %s\n",
+				agent.AgentType, safeModelRoutingText(agent.AgentName), agent.InstanceCount,
+				agent.CompletedCount, agent.FailedCount, agent.IncompleteCount, agent.Requests,
+				console.FormatNumber(agent.InputTokens), console.FormatNumber(agent.OutputTokens),
+				agent.AIC, safeModelRoutingText(agent.Effort))
+		}
+	}
 	if len(tokenUsage.Warnings) > 0 {
 		fmt.Fprintln(os.Stderr, "  token_usage_warnings:")
 		for _, warning := range tokenUsage.Warnings {
 			fmt.Fprintf(os.Stderr, "    %s\n", warning)
 		}
 	}
+}
+
+func renderConsoleModelRouting(routing *ModelRoutingSummary) {
+	if routing == nil {
+		return
+	}
+	renderConsoleModelRoutingSelection(routing)
+	renderConsoleModelRoutingRequests(routing)
+	if routing.Failure != nil {
+		fmt.Fprintf(os.Stderr, "    failure: code=%s detail=%s\n",
+			safeModelRoutingText(routing.Failure.Code), safeModelRoutingText(routing.Failure.Detail))
+	}
+	fmt.Fprintf(os.Stderr, "    cost_aic: classifier=%.3f selected_model=%.3f deviated=%.3f\n",
+		routing.ClassifierCost.AIC, routing.SelectedModelCost.AIC, routing.DeviatedTrafficCost.AIC)
+	if routing.MainAgentCost.Requests > 0 || routing.MainAgentCost.AIC > 0 {
+		fmt.Fprintf(os.Stderr, "    main_agent_cost: requests=%d input=%d output=%d aic=%.3f\n",
+			routing.MainAgentCost.Requests, routing.MainAgentCost.InputTokens,
+			routing.MainAgentCost.OutputTokens, routing.MainAgentCost.AIC)
+	}
+	for _, agent := range routing.SubagentCosts {
+		fmt.Fprintf(os.Stderr, "    subagent_cost: %s effort=%s requests=%d failed=%d aic=%.3f\n",
+			safeModelRoutingText(agent.AgentName), safeModelRoutingText(agent.Effort),
+			agent.Requests, agent.FailedCount, agent.AIC)
+	}
+}
+
+func renderConsoleModelRoutingSelection(routing *ModelRoutingSummary) {
+	line := "  model_routing: status=" + routing.Status
+	if routing.Objective != "" {
+		line += " objective=" + routing.Objective
+		if routing.ObjectiveMode != "" {
+			line += " mode=" + routing.ObjectiveMode
+		}
+	}
+	if routing.SelectedModel != "" {
+		line += " selected=" + routing.SelectedModel
+		if routing.SelectedEffort != "" {
+			line += ":" + routing.SelectedEffort
+		}
+	}
+	if routing.Endpoint != "" {
+		line += " endpoint=" + routing.Endpoint
+	}
+	if routing.EffectiveEndpoint != "" {
+		line += " effective_endpoint=" + safeModelRoutingText(routing.EffectiveEndpoint)
+	}
+	if routing.SelectedEndpoint != "" {
+		line += " selected_endpoint=" + safeModelRoutingText(routing.SelectedEndpoint)
+	}
+	if routing.RouterName != "" {
+		line += " router=" + routing.RouterName
+		if routing.RouterVersion != "" {
+			line += "@" + routing.RouterVersion
+		}
+	}
+	if routing.LatencyMs > 0 {
+		line += fmt.Sprintf(" latency=%dms", routing.LatencyMs)
+	}
+	fmt.Fprintln(os.Stderr, safeModelRoutingText(line))
+	if routing.Labels.TaskType != "" || routing.Labels.Scope != "" || routing.Labels.TaskComplexity != "" || routing.Mode != "" {
+		fmt.Fprintf(os.Stderr, "    labels: task_type=%s scope=%s complexity=%s mode=%s\n",
+			safeModelRoutingText(routing.Labels.TaskType), safeModelRoutingText(routing.Labels.Scope),
+			safeModelRoutingText(routing.Labels.TaskComplexity), safeModelRoutingText(routing.Mode))
+	}
+	if routing.ClassifierModel != "" {
+		fmt.Fprintf(os.Stderr, "    classifier: %s effort=%s attempts=%d\n",
+			safeModelRoutingText(routing.ClassifierModel), safeModelRoutingText(routing.ClassifierEffort), routing.ClassifierAttempts)
+	}
+	if routing.DegradedClassification {
+		fmt.Fprintf(os.Stderr, "    degraded_classification: %t reason=%s\n",
+			routing.DegradedClassification, safeModelRoutingText(routing.DegradedReason))
+	}
+	if len(routing.TopChoices) > 0 {
+		choices := make([]string, 0, len(routing.TopChoices))
+		for _, choice := range routing.TopChoices {
+			choices = append(choices, strings.TrimSpace(strings.Join([]string{
+				choice.Model, choice.Effort,
+			}, ":")))
+		}
+		fmt.Fprintln(os.Stderr, "    top_choices: "+safeModelRoutingText(strings.Join(choices, ", ")))
+	}
+}
+
+func renderConsoleModelRoutingRequests(routing *ModelRoutingSummary) {
+	if len(routing.RoutedCounts) > 0 || len(routing.OutcomeCounts) > 0 {
+		fmt.Fprintf(os.Stderr, "    requests: routed=%s outcome=%s\n",
+			formatModelRoutingCounts(routing.RoutedCounts), formatModelRoutingCounts(routing.OutcomeCounts))
+	}
+	for _, deviation := range routing.Deviations {
+		fmt.Fprintf(os.Stderr, "    deviation: requested=%s:%s selected=%s:%s cause=%s count=%d\n",
+			safeModelRoutingText(deviation.RequestedModel), safeModelRoutingText(deviation.RequestedEffort),
+			safeModelRoutingText(deviation.SelectedModel), safeModelRoutingText(deviation.SelectedEffort),
+			safeModelRoutingText(deviation.Deviation), deviation.Count)
+	}
+	if routing.EndpointOnlyDeviationNormalized {
+		fmt.Fprintln(os.Stderr, "    endpoint-only deviations from AWF before v0.28.39 are counted as selected-model traffic")
+	}
+}
+
+func formatModelRoutingCounts(counts map[string]int) string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", safeModelRoutingText(key), counts[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func safeModelRoutingText(value string) string {
+	return strings.Map(func(char rune) rune {
+		switch char {
+		case '\r':
+			return ' '
+		case '\n':
+			return ' '
+		case '\t':
+			return ' '
+		default:
+			if unicode.IsControl(char) {
+				return -1
+			}
+			return char
+		}
+	}, value)
 }
 
 func renderConsoleGitHubAPIUsage(rateLimit *GitHubRateLimitUsage) {
@@ -311,7 +496,9 @@ func renderConsoleWarnings(warnings []ValidationIssue) {
 }
 
 func renderConsoleOperationalSections(data AuditData) {
+	renderConsoleWorkQueue(data.WorkQueue)
 	renderConsoleSkillActivations(data.SkillActivations)
+	renderConsoleGatewaySteeringEvents(data.GatewaySteeringEvents)
 	renderConsoleMissingTools(data.MissingTools)
 	renderConsoleMCPFailures(data.MCPFailures)
 	renderCompactMCPHealth(data.MCPServerHealth)
@@ -319,8 +506,90 @@ func renderConsoleOperationalSections(data AuditData) {
 	renderConsoleCreatedItems(data.CreatedItems)
 	renderConsoleToolUsage(data.ToolUsage)
 	renderConsoleMCPToolUsage(data.MCPToolUsage)
+	renderConsoleFriction(data.Friction)
 	if data.FirewallAnalysis != nil && data.FirewallAnalysis.TotalRequests > 0 {
 		renderCompactFirewall(data.FirewallAnalysis)
+	}
+
+}
+
+// renderConsoleFriction prints the per-driver breakdown and the individual
+// friction events behind the aggregate friction line.
+func renderConsoleFriction(friction *FrictionCostSummary) {
+	if friction == nil || len(friction.Drivers) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  friction_drivers:")
+	for _, driver := range friction.Drivers {
+		line := fmt.Sprintf("    source=%s driver=%s occurrences=%d counted=%d state=%s",
+			frictionSourceLabel(driver.Source), driver.Driver, driver.Occurrences, driver.CountedOccurrences, driver.State)
+		if cost := frictionCostDetails(driver.Cost, driver.State); cost != "" {
+			line += " " + cost
+		}
+		if driver.SuppressedOccurrences > 0 {
+			line += fmt.Sprintf(" deduped=%d", driver.SuppressedOccurrences)
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+	if len(friction.Events) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  friction_events:")
+	for i, event := range friction.Events {
+		if i >= maxConsoleFrictionEvents {
+			fmt.Fprintf(os.Stderr, "    ... %d more events\n", len(friction.Events)-maxConsoleFrictionEvents)
+			break
+		}
+		line := fmt.Sprintf("    source=%s driver=%s: %s x%d counted=%d state=%s",
+			frictionSourceLabel(event.Source), event.Driver, event.Label, event.Occurrences, event.CountedOccurrences, event.State)
+		aicState := event.State
+		if event.DimensionStates != nil && event.DimensionStates["aic"] != "" {
+			aicState = event.DimensionStates["aic"]
+		}
+		if cost := frictionCostDetails(event.Cost, aicState); cost != "" {
+			line += " " + cost
+		}
+		if event.SuppressedBy != "" {
+			line += " suppressed-by=" + event.SuppressedBy
+		}
+		if event.Timestamp != "" {
+			line += " (" + event.Timestamp + ")"
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+	if friction.EventsTruncated {
+		fmt.Fprintln(os.Stderr, "    (event list truncated during measurement)")
+	}
+}
+
+func frictionSourceLabel(source string) string {
+	if source == "" {
+		return "unknown"
+	}
+	return source
+}
+
+func frictionCostDetails(cost FrictionCost, aicState string) string {
+	var parts []string
+	switch aicState {
+	case FrictionStateMeasured, FrictionStateCausal, FrictionStateStatistical:
+		parts = append(parts, "aic="+formatAICValue(cost.AIC))
+	}
+	parts = append(parts, frictionCostDimensionParts(cost)...)
+	return strings.Join(parts, " ")
+}
+
+func renderConsoleGatewaySteeringEvents(events []GatewaySteeringEvent) {
+	if len(events) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  gateway_steering_events:")
+	for _, event := range events {
+		line := fmt.Sprintf("    %s: %s", event.Type, event.Message)
+		if event.Timestamp != "" {
+			line += " (" + event.Timestamp + ")"
+		}
+		fmt.Fprintln(os.Stderr, line)
 	}
 }
 

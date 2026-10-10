@@ -148,14 +148,14 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 	// the rootless location to ${RUNNER_TEMP}/gh-aw/bin/copilot where AWF expects it.
 	rootless := isArcDindTopology(workflowData)
 	compiledVersion := workflowData.CompiledVersion
-	npmSteps := GenerateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI", rootless, compiledVersion)
+	npmSteps := generateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI", rootless, compiledVersion, "")
 	if len(inlineDriverWriteStep) > 0 {
 		npmSteps = append(npmSteps, inlineDriverWriteStep)
 	}
 	if len(sdkInstallStep) > 0 {
 		npmSteps = append(npmSteps, sdkInstallStep)
 	}
-	steps := BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
+	steps := buildNpmEngineInstallStepsWithAWF(npmSteps, workflowData, true)
 
 	return appendCopilotLSPInstallSteps(steps, workflowData)
 }
@@ -373,7 +373,11 @@ func firstCommandToken(command string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	token := normalizeCommandToken(fields[0])
+	token := ""
+	for _, field := range fields {
+		token = normalizeCommandToken(field)
+		break
+	}
 	if token != "env" {
 		return token
 	}
@@ -458,29 +462,5 @@ func generateDockerComposeInstallStep() GitHubActionStep {
 		`          curl -fsSL "https://github.com/docker/compose/releases/download/v2.36.2/docker-compose-linux-$arch" -o "$DOCKER_CONFIG/cli-plugins/docker-compose"`,
 		`          chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"`,
 		`          docker compose version`,
-	})
-}
-
-// generateGVisorInstallStep creates a GitHub Actions step that downloads, installs,
-// and verifies the gVisor (runsc) container runtime. This step must run BEFORE the
-// AWF invocation step so that Docker can start the agent container under runsc.
-//
-// Key implementation notes:
-//   - Pins to constants.DefaultGVisorVersion rather than "latest" for reproducible,
-//     verifiable installs. Each binary is verified against its official SHA-512 file
-//     before being installed with root privileges, matching the pattern used by the
-//     adjacent AWF installer.
-//   - Uses uname -m directly (x86_64, aarch64) — gVisor download URLs use raw arch names.
-//   - Restarts Docker with `systemctl restart` (NOT reload): Docker's SIGHUP reload does
-//     not call setHostGatewayIP(), which breaks --add-host host.docker.internal:host-gateway.
-//   - Downloads both runsc and containerd-shim-runsc-v1; the shim is required for Docker's
-//     containerd integration.
-//   - Script source: actions/setup/sh/sudo_gvisor_install.sh (requires sudo).
-func generateGVisorInstallStep() GitHubActionStep {
-	version := constants.DefaultGVisorVersion
-	return GitHubActionStep([]string{
-		"      - name: Install gVisor (runsc)",
-		"        # runner-guard:ignore RGS-012 -- pinned release, SHA-512 verified artifacts, download-only step (no outbound secret transmission).",
-		`        run: bash "${RUNNER_TEMP}/gh-aw/actions/sudo_gvisor_install.sh" ` + version,
 	})
 }

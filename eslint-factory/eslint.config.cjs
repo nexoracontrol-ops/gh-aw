@@ -49,6 +49,9 @@ module.exports = [
       "gh-aw-custom/require-execfilesync-try-catch": "warn",
       "gh-aw-custom/require-fs-io-try-catch": "warn",
       "gh-aw-custom/require-fs-chmod-try-catch": "warn",
+      "gh-aw-custom/no-single-char-string-replace": "warn",
+      "gh-aw-custom/no-async-foreach-callback": "warn",
+      "gh-aw-custom/no-unguarded-async-timer-callback": "warn",
       "gh-aw-custom/no-setfailed-then-exit-zero": "warn",
       "gh-aw-custom/no-err-stack-then-string-fallback": "warn",
       "gh-aw-custom/no-caught-error-interpolation": "warn",
@@ -74,6 +77,7 @@ module.exports = [
       "gh-aw-custom/require-getexecoutput-exitcode-check": "warn",
       "gh-aw-custom/prefer-actions-exec-over-child-process": "warn",
       "gh-aw-custom/no-misplaced-error-code-definition": "warn",
+      "gh-aw-custom/require-finite-check-before-date-toisostring": "warn",
     },
   },
   {

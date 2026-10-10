@@ -1,9 +1,9 @@
 ---
 cache:
-  key: pr-prefetch-${{ github.event.pull_request.head.sha || github.event.issue.number }}
+  key: pr-prefetch-${{ github.event.pull_request.head.sha || format('{0}-{1}', github.event.issue.number || github.event.pull_request.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number), github.run_id) }}
   path: /tmp/gh-aw/agent
   restore-keys:
-  - pr-prefetch-${{ github.event.pull_request.number || github.event.issue.number }}-
+  - pr-prefetch-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number) }}-
 description: Reviews pull requests using Matt Pocock's engineering skills to provide targeted, high-quality improvement suggestions based on the type of changes
 emoji: 🔍
 engine:
@@ -65,7 +65,9 @@ skills:
 - mattpocock/skills/improve-codebase-architecture@801dca688564c529fa84f247f64472520d9ebe28
 - mattpocock/skills/grill-with-docs@801dca688564c529fa84f247f64472520d9ebe28
 - mattpocock/skills/codebase-design@801dca688564c529fa84f247f64472520d9ebe28
-timeout-minutes: 15
+# Raised from 15m: skill-driven PR reviews on larger diffs were hitting the
+# engine step's hard timeout mid-review (not a hang) - see #66819.
+timeout-minutes: 30
 tools:
   cli-proxy: true
   github:
@@ -85,7 +87,7 @@ You are a skilled engineering reviewer who applies [Matt Pocock's engineering sk
 
 ## Available Matt Pocock Skills
 
-The following skills have been installed via `gh skill` and are available under `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. Discover exactly which skills are present using the `find` command in Step 2.
+The following skills have been installed via `gh skill` and are available under `${GITHUB_WORKSPACE}/.github/skills/`. Discover exactly which skills are present using the `find` command in Step 2.
 
 - **`/diagnosing-bugs`** — Disciplined debugging loop: reproduce → minimise → hypothesise → instrument → fix → regression-test. Use for PRs that fix bugs or address performance regressions.
 - **`/tdd`** — Test-driven development: red-green-refactor loop. Use for PRs that add features or fix bugs, especially where test coverage is thin.
@@ -107,6 +109,10 @@ A successful review:
 - approves only when no actionable issue remains
 - uses `noop` instead of generic praise when there is nothing useful to say
 
+## Investigation Budget
+
+Treat the pre-fetched diff, `pr-triage` output, and the skill guidance below as your primary source of truth. Large, cross-cutting diffs can tempt open-ended tracing through the codebase to build architectural context — bound that exploration to roughly 20 tool calls beyond Steps 1-3. If you reach that budget without a clear picture, stop investigating and submit the best review supported by the evidence gathered so far (call out remaining uncertainty in the review body) rather than continuing to chase every reference; this is what previously caused engine-step timeouts on large diffs (#66819).
+
 ### Step 1: Load Pre-fetched PR Data
 
 > **⚠️ Do NOT call any GitHub MCP tools for PR data.** All PR information is pre-fetched: use `/tmp/gh-aw/agent/pr-meta.json`, `/tmp/gh-aw/agent/pr-diff.patch`, and `/tmp/gh-aw/agent/pr-review-comments.json` exclusively.
@@ -125,10 +131,10 @@ If the pre-fetched patch has 3000 lines, treat it as potentially truncated and f
 
 ### Step 2: Read Available Skills
 
-Discover the installed Matt Pocock skills from the install root `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. List what is available:
+Discover the installed Matt Pocock skills from the install root `${GITHUB_WORKSPACE}/.github/skills/`. List what is available:
 
 ```bash
-find "${RUNNER_TEMP}/gh-aw/mattpocock-skills" -name "SKILL.md" 2>/dev/null | head -30
+find "${GITHUB_WORKSPACE}/.github/skills" -name "SKILL.md" 2>/dev/null | head -30
 ```
 
 Use the inline skill guidance below by default. Only read a skill file when the inline guidance is insufficient for the specific PR.

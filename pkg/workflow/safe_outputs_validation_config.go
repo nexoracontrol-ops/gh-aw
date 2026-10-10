@@ -23,6 +23,8 @@ type FieldValidation struct {
 	PositiveInteger          bool     `json:"positiveInteger,omitempty"`
 	OptionalPositiveInteger  bool     `json:"optionalPositiveInteger,omitempty"`
 	AllowAuto                bool     `json:"allowAuto,omitempty"`
+	AllowNull                bool     `json:"allowNull,omitempty"`
+	AllowEmpty               bool     `json:"allowEmpty,omitempty"`
 	IssueOrPRNumber          bool     `json:"issueOrPRNumber,omitempty"`
 	IssueNumberOrTemporaryID bool     `json:"issueNumberOrTemporaryId,omitempty"`
 	Enum                     []string `json:"enum,omitempty"`
@@ -50,6 +52,7 @@ type TypeValidationConfig struct {
 	CustomValidation string                     `json:"customValidation,omitempty"`
 	DataEnabled      bool                       `json:"dataEnabled,omitempty"`
 	DataSchema       map[string]any             `json:"dataSchema,omitempty"`
+	CollapseData     bool                       `json:"collapseData,omitempty"`
 }
 
 // Constants for validation
@@ -141,7 +144,8 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		},
 	},
 	"create_issue": {
-		DefaultMax: 1,
+		DefaultMax:   1,
+		CollapseData: true,
 		Fields: map[string]FieldValidation{
 			"title":  {Required: true, Type: "string", Sanitize: true, MaxLength: 128},
 			"body":   {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength, MinLength: MinIssueBodyLength},
@@ -185,10 +189,11 @@ var ValidationConfig = map[string]TypeValidationConfig{
 	"jira_create_issue": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
-			"project_key": {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
-			"issue_type":  {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
-			"summary":     {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
-			"description": {Type: "string", MinLength: 1, MaxLength: 32767, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"project_key":  {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"issue_type":   {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"summary":      {Required: true, Type: "string", MinLength: 1, MaxLength: 255, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"description":  {Type: "string", MinLength: 1, MaxLength: 32767, Pattern: ".*\\S.*", PatternError: "must not be empty"},
+			"temporary_id": {Required: true, Type: "string", Pattern: "^#aw_[A-Za-z0-9_]{3,12}$", TemporaryID: true},
 		},
 	},
 	"jira_update_issue": {
@@ -240,7 +245,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		},
 	},
 	"add_labels": {
-		DefaultMax: 5,
+		DefaultMax: defaultMaxAddLabelsCalls,
 		Fields: map[string]FieldValidation{
 			"labels":      {Required: true, Type: "array"}, // Item-level validation/sanitization handled by JS issue-intent label normalization.
 			"item_number": {IssueNumberOrTemporaryID: true},
@@ -271,7 +276,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		DefaultMax: 5,
 		Fields: map[string]FieldValidation{
 			"issue_number": {IssueOrPRNumber: true},
-			"issue_type":   {Required: true, Type: "string", Sanitize: true, MaxLength: 128}, // Empty string clears the type
+			"issue_type":   {Required: true, Type: "string", Sanitize: true, MaxLength: 128, AllowEmpty: true}, // Empty string clears the type
 			"rationale":    {Type: "string", Sanitize: true, MaxLength: 280, StripOnError: true},
 			"confidence":   {Type: "string", Enum: []string{"LOW", "MEDIUM", "HIGH"}, StripOnError: true},
 			"suggest":      {Type: "boolean"},
@@ -328,7 +333,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"operation":    {Type: "string", Enum: []string{"replace", "append", "prepend", "replace-island"}},
 			"labels":       {Type: "array"},
 			"assignees":    {Type: "array", ItemType: "string", ItemSanitize: true, ItemMaxLength: MaxGitHubUsernameLength},
-			"milestone":    {OptionalPositiveInteger: true},
+			"milestone":    {OptionalPositiveInteger: true, AllowNull: true},
 			"issue_number": {IssueOrPRNumber: true},
 			"repo":         {Type: "string", MaxLength: 256}, // Optional: target repository in format "owner/repo"
 		},
@@ -428,6 +433,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"body":         {Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 			"issue_number": {OptionalPositiveInteger: true},
 			"duplicate_of": {IssueOrPRNumber: true},
+			"state_reason": {Type: "string", Enum: closeIssueStateReasonValues},
 			"rationale":    {Type: "string", Sanitize: true, MaxLength: 280, StripOnError: true},
 			"confidence":   {Type: "string", Enum: []string{"LOW", "MEDIUM", "HIGH"}, StripOnError: true},
 			"suggest":      {Type: "boolean"},
@@ -507,6 +513,48 @@ var ValidationConfig = map[string]TypeValidationConfig{
 			"memory_id": {Type: "string", Sanitize: true, MaxLength: 128},
 		},
 	},
+	"ledger_append": {
+		DefaultMax: 100,
+		Fields: map[string]FieldValidation{
+			"ledger":    {Type: "string", Sanitize: true, MaxLength: 64},
+			"temp_id":   {Type: "string", Pattern: `^#?[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`},
+			"record":    {Type: "object"},
+			"operation": {Type: "string", MaxLength: 32},
+			"value":     {AllowNull: true},
+			"key":       {Type: "string", MaxLength: 256},
+			"patch":     {Type: "object"},
+			"name":      {Type: "string", MaxLength: 256},
+			"amount":    {Type: "number"},
+			"work":      {Type: "object"},
+			"filter":    {Type: "object"},
+			"result":    {AllowNull: true},
+			"reason":    {Type: "string", MaxLength: 1024},
+			"subject":   {Type: "string", MaxLength: 512},
+			"note":      {Type: "string", MaxLength: 4096},
+			"citations": {Type: "array", ItemType: "object"},
+			"note_id":   {Type: "string", MaxLength: 128},
+			"vote":      {Type: "string", Enum: []string{"up", "down"}},
+		},
+	},
+	"ledger_request_compaction": {
+		DefaultMax: 1,
+		Fields: map[string]FieldValidation{
+			"ledger": {Type: "string", Sanitize: true, MaxLength: 64},
+			"reason": {Type: "string", Sanitize: true, MaxLength: 512},
+		},
+	},
+	// ledger_mutation entries are emitted by the trusted ledger MCP server after a
+	// durable append, never by the agent through a safe-output tool. They carry
+	// redacted record metadata only, so threat detection and the log-only handler
+	// can review ledger mutations alongside other safe outputs.
+	"ledger_mutation": {
+		DefaultMax: LedgerMutationDefaultMax,
+		Fields: map[string]FieldValidation{
+			"operation": {Required: true, Type: "string", Enum: []string{"append"}},
+			"timestamp": {Type: "string", MaxLength: 64},
+			"record":    {Required: true, Type: "object"},
+		},
+	},
 	"create_check_run": {
 		DefaultMax: 1,
 		Fields: map[string]FieldValidation{
@@ -521,7 +569,7 @@ var ValidationConfig = map[string]TypeValidationConfig{
 		},
 	},
 	"noop": {
-		DefaultMax: 1,
+		DefaultMax: 2,
 		Fields: map[string]FieldValidation{
 			"message": {Required: true, Type: "string", Sanitize: true, MaxLength: MaxBodyLength},
 		},

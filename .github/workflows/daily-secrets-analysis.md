@@ -2,7 +2,6 @@
 emoji: "🔒"
 description: Daily analysis of secret usage patterns across all compiled lock.yml workflow files
 on:
-  schedule: daily
   workflow_dispatch:
 permissions:
   contents: read
@@ -26,13 +25,18 @@ network:
     - node
 tracker-id: daily-secrets-analysis
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   github:
     mode: gh-proxy
     toolsets: [default, discussions]
   bash: true
+  cache-memory: true
 timeout-minutes: 20
 imports:
+  - shared/daily-report-worker.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily secrets] "
@@ -59,7 +63,7 @@ Generate a daily report analyzing secret usage in all `.lock.yml` files in the r
 3. Track changes in secret usage patterns
 4. Identify security issues or anomalies
 5. Post results as a discussion
-6. Close older daily secrets discussions
+6. Let the configured safe output automatically close older daily secrets discussions
 
 ## Current Context
 
@@ -192,9 +196,11 @@ fi
 
 If available, compare with historical data (this will work after first run):
 
+Read `/tmp/gh-aw/cache-memory/secrets-stats.json` if it exists and compare it with today's statistics before overwriting it. If no baseline exists, report that this is the first run.
+
 ```bash
 # Save current stats for next run
-cat > /tmp/gh-aw/agent/secrets-stats.json << EOF
+cat > /tmp/gh-aw/cache-memory/secrets-stats.json << EOF
 {
   "date": "$(date -I)",
   "total_workflows": $TOTAL_WORKFLOWS,
@@ -300,7 +306,7 @@ For detailed information about secret usage patterns, see:
    - Be posted in "audits" category
    - Expire after 3 days
    - Replace any existing daily secrets discussion (max: 1)
-3. **Close older discussions** older than 3 days using `close_discussion` safe output
+3. Older daily secrets discussions are closed automatically by `close-older-discussions: true` via `shared/daily-audit-discussion.md`; no manual closing is needed.
 
 ## Success Criteria
 

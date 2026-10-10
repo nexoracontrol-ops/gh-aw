@@ -7,7 +7,7 @@ sidebar:
 
 # GitHub Actions Compiler Threat Detection Specification
 
-**Version**: 1.0.36
+**Version**: 1.0.47
 **Status**: Candidate Recommendation  
 **Latest Version**: https://github.com/github/gh-aw/blob/main/specs/compiler-threat-detection-spec.md  
 **Editors**: GitHub Next (GitHub, Inc.)
@@ -32,6 +32,16 @@ Each version maps to the minimum compatible binary. A version change MUST update
 
 | Versions | Minimum gh-aw | Compatibility |
 |---|---:|---|
+| `1.0.47` | Unreleased | Audit-only; same-repository checkout for allow-listed App comments is a runtime trust control governed by Security Architecture Specification RS-05a, not a new compiler threat rule. |
+| `1.0.46` | Unreleased | Extends CTR-017 OTLP sandbox exclusions to evals AWF invocations. No lock-file schema change. |
+| `1.0.45` | Unreleased | Extends CTR-017 with host-only OTLP exporter configuration: regenerated agent and threat-detection AWF commands exclude collector endpoints and headers when AWF supports `--exclude-env`. No lock-file schema change. |
+| `1.0.44` | Unreleased | Clarifies CTR-001: `id-token: write` is exempt from repository-write rejection, and its OIDC trust-policy reminder is informational rather than a warning. No lock-file compatibility change. |
+| `1.0.43` | `v0.87.9` | Clarifies CTR-008 trusted `pull_request_target` checkouts: acknowledgment suppresses only the trigger warning, allowlisted checkouts require an exact literal repository/ref pair, and any configured `fetch` is rejected. |
+| `1.0.42` | `v0.87.9` | Audit-only; same-repository bot PR checkout authorization is a runtime trust control governed by the security architecture specification, not a new compiler threat rule. |
+| `1.0.41` | `v0.87.9` | Adds CTR-031; private-to-public flow opt-outs are rejected in strict mode and warned in non-strict mode because they can expose private data through public logs or destinations. |
+| `1.0.40` | `v0.87.9` | Adds CTR-030; activation sparse checkouts use the PR base SHA for pull-request and review events before loading runtime imports or skills. |
+| `1.0.38` | `v0.87.9` | Audit-only; safe-outputs workspace checkout discovery is a runtime trust boundary governed by the safe-outputs and checkout-behavior specifications, not a new CTR rule. |
+| `1.0.37` | `v0.87.9` | Adds CTR-028; PR-triggered agent jobs restore agent configuration from the base branch before any step that installs agent content. |
 | `1.0.36` | `v0.87.9` | Audit-only; Opengrep build-reproducibility findings (non-deterministic `npm`/`uv pip` installs, non-SHA-pinned Dockerfile image) are out of conformance scope per Section 1. |
 | `1.0.35` | `v0.87.9` | Audit-only; #681/#678/#676/#675, #679, #674/#669/#668/#667, #663, #657, #652/#651, and #680 are not new threat classes. |
 | `1.0.34` | `v0.87.9` | Adds CTR-027; allowlisted bot synchronization requires trusted same-repository provenance. |
@@ -51,6 +61,16 @@ Each version maps to the minimum compatible binary. A version change MUST update
 
 Generated workflows run with elevated permissions and consume untrusted content (issues, PRs, comments, external tool output). The catalog in Section 5 groups the threats a conforming compiler MUST detect into five classes: unauthorized privilege or scope expansion, unsafe or bypassed sandboxing, injection (template, shell, or subprocess argument), unsafe output and supply-chain routes, and compile-time drift between manifests, mappings, and the rules that reference them. Each class maps to one or more `CTR-*` rules with a stable trigger and compiler action.
 
+Runtime trust boundaries inside the agent workspace are out of scope for this specification. In particular, the safe-outputs repository checkout discovery path (`actions/setup/js/find_repo_checkout.cjs`) resolves an `owner/repo` target from agent-writable workspace state; its normative controls — manifest precedence, workspace confinement, per-invocation `safe.directory` scoping, read-only discovery, remote host constraint, and deferred durable trust — are specified as Threat T7 and requirements RCR1–RCR7 in the Safe Outputs MCP Gateway Specification and as §3.5 of the Checkout Behavior Specification. A conforming compiler is not required to detect this class, because the compiler emits no generated-workflow construct that selects the checkout directory.
+
+PR-branch checkout authorization in `actions/setup/js/checkout_pr_branch.cjs` is also a runtime trust control, not a compiler-detectable threat. The same-repository bot exception covers `pull_request` and `pull_request_target` `opened` or `synchronize` events with matching bot sender and actor plus equal runtime, PR head, and PR base repository IDs. For `issue_comment` and `pull_request_review_comment`, an explicitly `on.bots`-allow-listed App may bypass the collaborator check only when `sender.type` is `Bot`, the sender and comment author logins match exactly, the sender is canonically equivalent to the runtime actor (App slug or `[bot]` form), the runtime repository ID is positive, and the fetched PR head and base repository IDs both match it. Forks, unlisted bots, unverifiable or mismatched identities, and other actors retain the collaborator-permission check. The normative requirements are in the Security Architecture Specification, RS-05a; this control does not add a `CTR-*` rule.
+
+Sandbox bypass includes the provenance of the agent's own configuration. On pull-request triggers the workspace holds head-branch content that the PR author controls, so agent configuration folders and root instruction files are attacker-controlled inputs until the generated job replaces them with the base-branch snapshot captured before that content was checked out.
+
+Activation also reads workflow imports and skills before the agent job runs. Restoring agent configuration later cannot make instructions already loaded during activation trustworthy; the activation sparse checkout must select a trusted ref independently.
+
+Host-side OTLP exporter configuration is another secret-bearing trust boundary. Passing collector headers and endpoints through AWF's `--env-all` exposes collector credentials to sandboxed processes and can cause an agent CLI to export duplicate telemetry. CTR-017 covers compiler-generated exclusions for the agent, threat-detection, and evals sandboxes.
+
 ## 4. Governance and Responsibilities
 
 Maintainers own the rule catalog, its implementation mapping, and its test coverage; the daily optimizer (Section 6) reviews new candidate threats and reports coverage gaps. Every rule addition, deprecation, or mapping change MUST be reviewed against this specification in the same pull request that changes the implementation, per the Spec-to-Implementation Sync table in Section 2.
@@ -61,14 +81,14 @@ Each rule has a stable `CTR-*` ID, threat class, trigger, compiler action, diagn
 
 ### 5.1 Core Rule Catalog
 
-- **CTR-001 Privilege Escalation**: Reject unauthorized generated-job write permissions.
+- **CTR-001 Privilege Escalation**: Reject unauthorized generated-job write permissions. `id-token: write` MUST be exempt from repository-write rejection because it permits OIDC token issuance, not repository modification. Its audience and cloud-provider trust-policy reminder MUST be informational, MUST NOT increment the compiler warning count, and MUST NOT by itself fail warnings-as-errors validation. Missing required OIDC permissions and invalid `id-token: read` declarations MUST still be rejected.
 - **CTR-002 Unpinned Action Integrity**: Reject unpinned action references in strict contexts.
 - **CTR-003 Unsafe Tool Scope Expansion**: Reject or warn on policy-violating wildcard or overbroad tool scope.
 - **CTR-004 Sandbox Bypass Configuration**: Reject generated configuration that disables required sandboxing.
 - **CTR-005 Unsafe Output Route**: Reject direct write paths that bypass safe outputs.
 - **CTR-006 Template Injection**: Reject user-controlled expressions directly embedded in shell commands.
 - **CTR-007 Markdown Content Security**: Detect unsafe external markdown, including obfuscation, scripts, and social engineering.
-- **CTR-008 Pull Request Target Safety**: Reject unsafe `pull_request_target` checkout patterns.
+- **CTR-008 Pull Request Target Safety**: For `pull_request_target`, strict mode MUST warn about elevated permissions and secret access unless `on.pull_request_target.acknowledge-risk` is `true`. This acknowledgment suppresses only that warning; it MUST NOT authorize a checkout or suppress checkout diagnostics. An explicit `checkout: false` is accepted. Otherwise, every configured checkout MUST independently use either the supported base-repository/base-ref form or an exact, case-sensitive literal repository/ref pair in `on.pull_request_target.allowed-checkouts`. The allowlist path MUST reject expressions, wildcard refs, `refs/pull/...` refs, wiki checkouts, and omitted external refs. Neither the base-checkout nor allowlist path may accept any non-empty `fetch` value. An omitted checkout configuration is not equivalent to explicit `checkout: false`. In strict mode an unsafe checkout MUST be rejected; in non-strict mode it MUST produce a warning.
 - **CTR-009 Shell Expansion in Safe-Outputs**: Reject dangerous shell expansion in safe-output scripts.
 - **CTR-010 Expression Safety Allowlist**: Reject unauthorized or multiline GitHub Actions expressions.
 - **CTR-011 Network Firewall Configuration**: Reject missing firewall prerequisites and strict-mode wildcard domains.
@@ -77,7 +97,7 @@ Each rule has a stable `CTR-*` ID, threat class, trigger, compiler action, diagn
 - **CTR-014 Supply Chain Attack via Install Scripts**: Warn, or reject in strict mode, when Node install scripts are enabled.
 - **CTR-015 Allowed Label Glob Scope**: Reject bare `*` safe-output allowed-label patterns.
 - **CTR-016 Compile-Time Manifest Drift**: Reject new restricted secrets or action references absent from an existing manifest.
-- **CTR-017 Secret Leakage via Environment Variables**: Warn, or reject in strict mode, for uncontrolled secret-expression placement.
+- **CTR-017 Secret Leakage via Environment Variables**: Warn, or reject in strict mode, for uncontrolled secret-expression placement. When OTLP is enabled and the effective AWF version supports `--exclude-env`, generated agent, threat-detection, and evals AWF invocations using `--env-all` MUST exclude `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, and `GH_AW_OTLP_ENDPOINTS`. These values MUST remain available to host-side exporters. Both inline and external threat-detection paths and evals execution MUST preserve the exclusions. Workflows without OTLP MUST NOT gain these OTLP-specific exclusions unless independently required by another exclusion policy.
 - **CTR-018 Version Integrity Bypass**: Warn, or reject in strict mode, for `check-for-updates: false`.
 - **CTR-019 Cache-Memory Integrity Enforcement**: Require cache updates only after successful agent and threat-detection jobs.
 - **CTR-020 Conditional Import Security**: Reject `imports` entries containing `if`.
@@ -87,6 +107,10 @@ Each rule has a stable `CTR-*` ID, threat class, trigger, compiler action, diagn
 - **CTR-025 Framework Self-Prompt Misattribution**: Strip only a leading framework `<system>` block before analysis.
 - **CTR-026 Generated Job Timeout Expression Injection**: Reject non-positive or expression job timeout values.
 - **CTR-027 Allowlisted Bot Synchronization Provenance**: Deny bot-driven PR synchronization when the actor differs from the PR author unless the bot is explicitly allowlisted and active, the PR is from the base repository, the PR author satisfies the configured roles, and the actor is not Dependabot.
+- **CTR-028 Agent Configuration Restore Provenance**: For pull-request triggers, emit the base-branch restore of every engine's agent configuration folders and root instruction files after the PR checkout and before any generated step that installs agent content or executes the agent.
+- **CTR-029 Repository Dispatch App Authorization**: On `repository_dispatch`, authorize a GitHub App that is explicitly listed in `on.bots` when the collaborator lookup conclusively reports it absent; deny non-allowlisted actors, lookup failures, and App actors on every other trigger.
+- **CTR-030 Activation Checkout Provenance**: For `pull_request`, `pull_request_review`, and `pull_request_review_comment` events, emit an activation sparse checkout pinned to `github.event.pull_request.base.sha`, guarded by event name and pull-request payload presence. Match trigger names exactly so `pull_request_target` does not opt into this rule. Other events retain their existing checkout ref (including the resolved callee SHA for `workflow_call`); cross-repository `workflow_call` checkout remains same-repository-only when activation authentication can fall back to `GITHUB_TOKEN`.
+- **CTR-031 Private-to-Public Flow Opt-Out**: Reject `tools.github.private-to-public-flows` in strict mode in both its blanket and server-list forms; in non-strict mode, emit a security warning because the opt-out can expose private data through public Actions logs or agent-controlled public destinations.
 
 ### 5.2 Compiler Response Requirements
 
@@ -129,14 +153,14 @@ Every active rule MUST map to implementation and test coverage. References are p
 
 | Rule ID | Primary Implementation Areas | Test Coverage Targets |
 |---------|------------------------------|-----------------------|
-| CTR-001 Privilege Escalation | `pkg/workflow/*permissions*validation*.go`, `compiler_builtin_job_augmentation.go` | `*permissions*_test.go`, `compiler_custom_jobs_test.go` |
+| CTR-001 Privilege Escalation | `pkg/workflow/*permissions*validation*.go`, `permissions_compiler_validator.go`, `compiler_builtin_job_augmentation.go` | `*permissions*_test.go`, `compiler_custom_jobs_test.go`, `idtoken_write_info_test.go`, `compiler_threat_detection_formal_test.go`, `pkg/cli/compile_development_test.go` |
 | CTR-002 Unpinned Action Integrity | `pkg/workflow/*action*.go`, `tools_validation*.go`, strict-mode validation | `*action*_test.go`, `*tools*_test.go` |
 | CTR-003 Unsafe Tool Scope Expansion | `pkg/workflow/*action*.go`, `tools_validation*.go`, strict-mode validation | `*action*_test.go`, `*tools*_test.go` |
 | CTR-004 Sandbox Bypass Configuration | sandbox validation, `enclaves.go`, `enclave_github_proxy.go` | sandbox, enclave, and proxy tests |
 | CTR-005 Unsafe Output Route | safe-output compiler/validation; setup safe-output and manifest helpers | safe-output and setup helper tests |
 | CTR-006 Template Injection | template/heredoc validation, `mcp_renderer_guard.go` | template-injection and MCP tests |
 | CTR-007 Markdown Content Security | `markdown_security_scanner.go`, `pull_request_target_validation.go` | corresponding workflow and sanitizer tests |
-| CTR-008 Pull Request Target Safety | `markdown_security_scanner.go`, `pull_request_target_validation.go` | corresponding workflow and sanitizer tests |
+| CTR-008 Pull Request Target Safety | `pkg/workflow/pull_request_target_validation.go` | `pkg/workflow/pull_request_target_validation_test.go`; `specs/workflow-security/PullRequestTargetCheckout.tla` |
 | CTR-009 Shell Expansion in Safe-Outputs | safe-output shell/push validation, expression validation, firewall validation | corresponding workflow tests |
 | CTR-010 Expression Safety Allowlist | safe-output shell/push validation, expression validation, firewall validation | corresponding workflow tests |
 | CTR-011 Network Firewall Configuration | safe-output shell/push validation, expression validation, firewall validation | corresponding workflow tests |
@@ -145,7 +169,7 @@ Every active rule MUST map to implementation and test coverage. References are p
 | CTR-014 Supply Chain Attack via Install Scripts | name, install-script, and allowed-label validation | `argument_injection_test.go`, corresponding validation tests |
 | CTR-015 Allowed Label Glob Scope | name, install-script, and allowed-label validation | `argument_injection_test.go`, corresponding validation tests |
 | CTR-016 Compile-Time Manifest Drift | safe-update, strict env/update, cache, and expression builder | corresponding enforcement, secrets, update, and cache tests |
-| CTR-017 Secret Leakage via Environment Variables | safe-update, strict env/update, cache, and expression builder | corresponding enforcement, secrets, update, and cache tests |
+| CTR-017 Secret Leakage via Environment Variables | safe-update, strict env/update, cache, and expression builder; `pkg/workflow/awf_command_builder.go`, `threat_detection_external.go`, `evals_steps.go` | corresponding enforcement, secrets, update, and cache tests; `TestOTLPEnvExcludedFromAWFSandboxes` in `awf_env_test.go`, `TestEvalsOTLPEnvExcludedFromSandbox` in `evals_steps_test.go`, `TestCompiledOTLPEnvExcludedFromAgentDetectionAndEvals` in `threat_detection_isolation_test.go` |
 | CTR-018 Version Integrity Bypass | safe-update, strict env/update, cache, and expression builder | corresponding enforcement, secrets, update, and cache tests |
 | CTR-019 Cache-Memory Integrity Enforcement | safe-update, strict env/update, cache, and expression builder | corresponding enforcement, secrets, update, and cache tests |
 | CTR-020 Conditional Import Security | `pkg/parser/import_bfs.go` | `pkg/parser/import_bfs_test.go` |
@@ -155,6 +179,10 @@ Every active rule MUST map to implementation and test coverage. References are p
 | CTR-025 Framework Self-Prompt Misattribution | `actions/setup/js/setup_threat_detection.cjs` | `setup_threat_detection.test.cjs` |
 | CTR-026 Generated Job Timeout Expression Injection | custom-job properties and timeout resolution | custom-job and timeout tests |
 | CTR-027 Allowlisted Bot Synchronization Provenance | `actions/setup/js/check_membership.cjs`, `actions/setup/js/check_permissions_utils.cjs` | `actions/setup/js/check_membership.test.cjs`, `actions/setup/js/check_permissions_utils.test.cjs` |
+| CTR-028 Agent Configuration Restore Provenance | `pkg/workflow/pr.go`, `actions/setup/sh/save_base_github_folders.sh`, `actions/setup/sh/restore_base_github_folders.sh` | `pkg/workflow/compiler_pre_agent_steps_test.go`, `actions/setup/sh/restore_base_github_folders_test.sh` |
+| CTR-029 Repository Dispatch App Authorization | `actions/setup/js/check_membership.cjs`, `actions/setup/js/check_permissions_utils.cjs` | `actions/setup/js/check_membership.test.cjs` |
+| CTR-030 Activation Checkout Provenance | `pkg/workflow/compiler_activation_job.go` | `pkg/workflow/compiler_activation_job_test.go` |
+| CTR-031 Private-to-Public Flow Opt-Out | `pkg/workflow/strict_mode_private_to_public_flows_validation.go`, `pkg/workflow/compiler_validators.go` | `pkg/workflow/private_to_public_flows_test.go` |
 
 ### 7.2 Mapping Audit History
 
@@ -168,14 +196,14 @@ Each active rule MUST have at least one deterministic test that covers its prima
 
 | Test ID | Rule | Detection Trigger | Expected Compiler Action | Stable Diagnostic ID |
 |---------|------|--------------------|---------------------------|----------------------|
-| **T-CTR-001** | CTR-001 Privilege Escalation | Reject unauthorized generated-job write permissions | Reject unauthorized generated-job write permissions. | `CTR-001` |
+| **T-CTR-001** | CTR-001 Privilege Escalation | Unauthorized generated-job write permissions or an `id-token` declaration | Reject unauthorized repository writes, missing required OIDC permissions, and `id-token: read`; allow `id-token: write` with an informational reminder and no additional warning count. | `CTR-001` |
 | **T-CTR-002** | CTR-002 Unpinned Action Integrity | Reject unpinned action references in strict contexts | Reject unpinned action references in strict contexts. | `CTR-002` |
 | **T-CTR-003** | CTR-003 Unsafe Tool Scope Expansion | Reject or warn on policy-violating wildcard or overbroad tool scope | Reject or warn on policy-violating wildcard or overbroad tool scope. | `CTR-003` |
 | **T-CTR-004** | CTR-004 Sandbox Bypass Configuration | Reject generated configuration that disables required sandboxing | Reject generated configuration that disables required sandboxing. | `CTR-004` |
 | **T-CTR-005** | CTR-005 Unsafe Output Route | Reject direct write paths that bypass safe outputs | Reject direct write paths that bypass safe outputs. | `CTR-005` |
 | **T-CTR-006** | CTR-006 Template Injection | Reject user-controlled expressions directly embedded in shell commands | Reject user-controlled expressions directly embedded in shell commands. | `CTR-006` |
 | **T-CTR-007** | CTR-007 Markdown Content Security | Detect unsafe external markdown, including obfuscation, scripts, and social engineering | Detect unsafe external markdown, including obfuscation, scripts, and social engineering. | `CTR-007` |
-| **T-CTR-008** | CTR-008 Pull Request Target Safety | Reject unsafe `pull_request_target` checkout patterns | Reject unsafe `pull_request_target` checkout patterns. | `CTR-008` |
+| **T-CTR-008** | CTR-008 Pull Request Target Safety | A `pull_request_target` workflow acknowledges trigger risk, configures base or external checkouts, or sets `fetch` | Suppress only the strict trigger warning when acknowledged; accept only explicit disablement, trusted base checkouts, or exact allowlisted literal repository/ref pairs without `fetch`; otherwise reject in strict mode and warn in non-strict mode. | `CTR-008` |
 | **T-CTR-009** | CTR-009 Shell Expansion in Safe-Outputs | Reject dangerous shell expansion in safe-output scripts | Reject dangerous shell expansion in safe-output scripts. | `CTR-009` |
 | **T-CTR-010** | CTR-010 Expression Safety Allowlist | Reject unauthorized or multiline GitHub Actions expressions | Reject unauthorized or multiline GitHub Actions expressions. | `CTR-010` |
 | **T-CTR-011** | CTR-011 Network Firewall Configuration | Reject missing firewall prerequisites and strict-mode wildcard domains | Reject missing firewall prerequisites and strict-mode wildcard domains. | `CTR-011` |
@@ -184,7 +212,7 @@ Each active rule MUST have at least one deterministic test that covers its prima
 | **T-CTR-014** | CTR-014 Supply Chain Attack via Install Scripts | Warn, or reject in strict mode, when Node install scripts are enabled | Warn, or reject in strict mode, when Node install scripts are enabled. | `CTR-014` |
 | **T-CTR-015** | CTR-015 Allowed Label Glob Scope | Reject bare `*` safe-output allowed-label patterns | Reject bare `*` safe-output allowed-label patterns. | `CTR-015` |
 | **T-CTR-016** | CTR-016 Compile-Time Manifest Drift | Reject new restricted secrets or action references absent from an existing manifest | Reject new restricted secrets or action references absent from an existing manifest. | `CTR-016` |
-| **T-CTR-017** | CTR-017 Secret Leakage via Environment Variables | Warn, or reject in strict mode, for uncontrolled secret-expression placement | Warn, or reject in strict mode, for uncontrolled secret-expression placement. | `CTR-017` |
+| **T-CTR-017** | CTR-017 Secret Leakage via Environment Variables | Uncontrolled secret-expression placement, or OTLP-enabled agent/threat-detection/evals AWF generation with `--exclude-env` support | Warn, or reject in strict mode, for uncontrolled secret-expression placement; exclude all three host-side OTLP variables from agent, inline/external detection, and evals sandboxes while retaining them for host exporters; preserve behavior without OTLP. | `CTR-017` |
 | **T-CTR-018** | CTR-018 Version Integrity Bypass | Warn, or reject in strict mode, for `check-for-updates: false` | Warn, or reject in strict mode, for `check-for-updates: false`. | `CTR-018` |
 | **T-CTR-019** | CTR-019 Cache-Memory Integrity Enforcement | Require cache updates only after successful agent and threat-detection jobs | Require cache updates only after successful agent and threat-detection jobs. | `CTR-019` |
 | **T-CTR-020** | CTR-020 Conditional Import Security | Reject `imports` entries containing `if` | Reject `imports` entries containing `if`. | `CTR-020` |
@@ -194,6 +222,10 @@ Each active rule MUST have at least one deterministic test that covers its prima
 | **T-CTR-039** | CTR-025 Framework Self-Prompt Misattribution | Strip only a leading framework `<system>` block before analysis | Strip only a leading framework `<system>` block before analysis. | `CTR-025` |
 | **T-CTR-041** | CTR-026 Generated Job Timeout Expression Injection | Reject non-positive or expression job timeout values | Reject non-positive or expression job timeout values. | `CTR-026` |
 | **T-CTR-042** | CTR-027 Allowlisted Bot Synchronization Provenance | An allowlisted bot synchronizes a PR authored by another actor | Authorize only when the bot, repository provenance, and PR author satisfy all trust requirements; otherwise deny with `confused_deputy` or `bot_not_active`. | `CTR-027` |
+| **T-CTR-043** | CTR-028 Agent Configuration Restore Provenance | A pull-request-triggered workflow generates an agent job that installs agent content through `steps:` or `pre-agent-steps:` | Emit the base-branch restore of the engine's agent configuration folders and root instruction files after the PR checkout and before any agent-content install step and the agent execution step. | `CTR-028` |
+| **T-CTR-044** | CTR-029 Repository Dispatch App Authorization | An allowlisted GitHub App sends `repository_dispatch` and the collaborator lookup reports it absent | Authorize only the allowlisted App on `repository_dispatch`; deny non-allowlisted actors, lookup failures, and all other triggers. | `CTR-029` |
+| **T-CTR-045** | CTR-030 Activation Checkout Provenance | A workflow with pull-request and/or review triggers generates an activation sparse checkout | Pin supported PR events to the PR base SHA; preserve the existing fallback ref for other events and the same-repo guard when activation auth may use `GITHUB_TOKEN`. | `CTR-030` |
+| **T-CTR-046** | CTR-031 Private-to-Public Flow Opt-Out | A workflow configures `tools.github.private-to-public-flows` as `allow` or a server-ID list | Reject both forms in strict mode; emit a security warning in non-strict mode. | `CTR-031` |
 
 The core tests exercise their catalog trigger and assert the expected rejection, warning, rewrite, or runtime-safe output.
 

@@ -875,6 +875,61 @@ func TestInjectProxyEnvIntoCustomSteps(t *testing.T) {
 func TestBuildStartCliProxyStepYAML(t *testing.T) {
 	c := &Compiler{}
 
+	t.Run("uses the GitHub App token in gh-proxy mode", func(t *testing.T) {
+		data := &WorkflowData{
+			Tools: map[string]any{
+				"github": map[string]any{"mode": "gh-proxy"},
+			},
+			ParsedTools: &Tools{
+				GitHub: &GitHubToolConfig{
+					Mode: GitHubMCPModeGHProxy,
+					GitHubApp: &GitHubAppConfig{
+						AppID:      "${{ vars.APP_ID }}",
+						PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+					},
+				},
+			},
+		}
+
+		result := c.buildStartCliProxyStepYAML(data)
+		assert.Contains(t, result, "GH_TOKEN: ${{ steps.github-mcp-app-token.outputs.token }}")
+		assert.NotContains(t, result, "secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN")
+		assert.NotContains(t, result, "secrets.GITHUB_TOKEN")
+	})
+
+	t.Run("preserves explicit github-token without an App", func(t *testing.T) {
+		data := &WorkflowData{
+			Tools: map[string]any{
+				"github": map[string]any{
+					"mode":         "gh-proxy",
+					"github-token": "${{ secrets.CUSTOM_GITHUB_TOKEN }}",
+				},
+			},
+			ParsedTools: &Tools{
+				GitHub: &GitHubToolConfig{Mode: GitHubMCPModeGHProxy},
+			},
+		}
+
+		result := c.buildStartCliProxyStepYAML(data)
+		assert.Contains(t, result, "GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}")
+		assert.NotContains(t, result, "steps.github-mcp-app-token.outputs.token")
+	})
+
+	t.Run("preserves default token fallback without an App", func(t *testing.T) {
+		data := &WorkflowData{
+			Tools: map[string]any{
+				"github": map[string]any{"mode": "gh-proxy"},
+			},
+			ParsedTools: &Tools{
+				GitHub: &GitHubToolConfig{Mode: GitHubMCPModeGHProxy},
+			},
+		}
+
+		result := c.buildStartCliProxyStepYAML(data)
+		assert.Contains(t, result, "GH_TOKEN: ${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}")
+		assert.NotContains(t, result, "steps.github-mcp-app-token.outputs.token")
+	})
+
 	t.Run("emits visibility-aware default policy when no guard policy is configured", func(t *testing.T) {
 		data := &WorkflowData{
 			Tools: map[string]any{
@@ -952,6 +1007,43 @@ func TestBuildStartCliProxyStepYAML(t *testing.T) {
 		assert.Contains(t, result, "CLI_PROXY_IMAGE:", "should include CLI_PROXY_IMAGE")
 		assert.Contains(t, result, "start_cli_proxy.sh", "should reference the start script")
 	})
+}
+
+func TestGitHubMCPAppTokenFailsClosedForGhProxy(t *testing.T) {
+	app := &GitHubAppConfig{
+		AppID:           "${{ vars.APP_ID }}",
+		PrivateKey:      "${{ secrets.APP_PRIVATE_KEY }}",
+		IgnoreIfMissing: true,
+	}
+	data := &WorkflowData{
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+		Tools: map[string]any{
+			"github": map[string]any{"mode": "gh-proxy"},
+		},
+		ParsedTools: &Tools{
+			GitHub: &GitHubToolConfig{
+				Mode:      GitHubMCPModeGHProxy,
+				GitHubApp: app,
+			},
+		},
+	}
+
+	steps := (&Compiler{}).generateGitHubMCPAppTokenMintingSteps(data)
+	require.NotEmpty(t, steps)
+	stepYAML := strings.Join(steps, "")
+	assert.NotContains(t, stepYAML, "if: ${{")
+	assert.Contains(t, stepYAML, "id: github-mcp-app-token")
+	assert.True(t, app.IgnoreIfMissing, "proxy-specific failure behavior must not mutate parsed configuration")
+
+	assert.False(t, isGitHubCLIModeEnabled(&WorkflowData{
+		Features: map[string]any{"cli-proxy": true},
+	}), "the removed features.cli-proxy flag must not enable GitHub CLI mode")
+
+	data.NetworkPermissions.Firewall.Enabled = false
+	disabledSteps := (&Compiler{}).generateGitHubMCPAppTokenMintingSteps(data)
+	assert.Contains(t, strings.Join(disabledSteps, ""), "if: ${{", "skip fail-closed override when no CLI proxy starts")
 }
 
 // TestResolveProxyContainerImage verifies that the helper builds the correct container
@@ -1032,7 +1124,7 @@ func TestIsCliProxyNeeded_IntegrityReactionsImplicitEnable(t *testing.T) {
 			desc:     "integrity-reactions should implicitly enable the CLI proxy",
 		},
 		{
-			name: "explicit cli-proxy still works",
+			name: "gh-proxy mode and integrity reactions enabled",
 			data: &WorkflowData{
 				NetworkPermissions: &NetworkPermissions{
 					Firewall: &FirewallConfig{
@@ -1040,27 +1132,16 @@ func TestIsCliProxyNeeded_IntegrityReactionsImplicitEnable(t *testing.T) {
 						Version: awfVersion,
 					},
 				},
-				Features: map[string]any{"cli-proxy": true},
-			},
-			expected: true,
-			desc:     "explicit cli-proxy feature flag should still enable the CLI proxy",
-		},
-		{
-			name: "both flags enabled",
-			data: &WorkflowData{
-				NetworkPermissions: &NetworkPermissions{
-					Firewall: &FirewallConfig{
-						Enabled: true,
-						Version: awfVersion,
-					},
+				Features: map[string]any{"integrity-reactions": true},
+				Tools: map[string]any{
+					"github": map[string]any{"mode": "gh-proxy"},
 				},
-				Features: map[string]any{"cli-proxy": true, "integrity-reactions": true},
 			},
 			expected: true,
-			desc:     "both flags together should enable the CLI proxy",
+			desc:     "gh-proxy mode and integrity reactions should enable the CLI proxy",
 		},
 		{
-			name: "tools.github.mode local overrides legacy cli-proxy feature",
+			name: "tools.github.mode local disables cli proxy",
 			data: &WorkflowData{
 				NetworkPermissions: &NetworkPermissions{
 					Firewall: &FirewallConfig{
@@ -1073,10 +1154,9 @@ func TestIsCliProxyNeeded_IntegrityReactionsImplicitEnable(t *testing.T) {
 						"mode": "local",
 					},
 				},
-				Features: map[string]any{"cli-proxy": true},
 			},
 			expected: false,
-			desc:     "explicit tools.github.mode=local should disable cli proxy even when legacy feature is set",
+			desc:     "explicit tools.github.mode=local should disable cli proxy",
 		},
 		{
 			name: "tools.github.mode gh-proxy enables cli proxy without legacy feature",

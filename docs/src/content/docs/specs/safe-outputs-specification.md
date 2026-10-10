@@ -7,9 +7,9 @@ sidebar:
 
 # Safe Outputs MCP Gateway Specification
 
-**Version**: 1.29.3<br>
+**Version**: 1.29.8<br>
 **Status**: Working Draft<br>
-**Publication Date**: 2026-09-12<br>
+**Publication Date**: 2026-10-01<br>
 **Editor**: GitHub Agentic Workflows Team<br>
 **This Version**: [safe-outputs-specification](/gh-aw/specs/safe-outputs-specification/)<br>
 **Latest Published Version**: This document
@@ -191,6 +191,7 @@ An implementation satisfying ALL normative requirements (MUST, SHALL, REQUIRED s
 - Complete security architecture implementation (privilege separation, threat mitigations)
 - Support for all mandatory safe output types (defined in Section 7)
 - Universal feature implementation (max limits, staged mode, footers, sanitization)
+- Runtime target authorization for every safe output type that accepts a configured `target`
 - Protocol exchange pattern adherence (MCP stdio container transport, NDJSON persistence)
 - Content integrity mechanism enforcement (schema validation, domain filtering)
 - Execution guarantee provision (atomicity, ordering, idempotency)
@@ -260,7 +261,11 @@ Verification that configuration parsing, validation, and enforcement match speci
 - Inheritance rules (type-specific overriding global)
 - Default value application
 
-*Note*: A normative conformance test suite is RECOMMENDED for future specification versions but not currently provided.
+**Method M5: Target Authorization Regression Testing**
+
+Validation that configured targets are enforced at runtime before privileged API calls. Target authorization tests MUST verify that omitted and explicit `target: "triggering"` configurations use trusted invocation context, fixed numeric targets use the configured number, only `target: "*"` may select agent-supplied target identifiers, and fail-safe runtime assertions abort if a non-wildcard resolved target diverges from the authorized target.
+
+*Note*: Implementations SHOULD maintain an automated conformance suite that maps each target-authorized safe output type to its specification section, runtime handler, and regression tests.
 
 ---
 
@@ -314,7 +319,7 @@ The Safe Outputs MCP Gateway implements defense-in-depth through strict architec
 
 **Requirement AR1: Agent Isolation**
 
-Agents MUST execute without GitHub write permissions. Only read-level tokens SHALL be accessible to agent processes. Write-capable tokens MUST reside exclusively in safe output job contexts.
+Agents MUST execute without GitHub write permissions. Only read-level tokens SHALL be accessible to agent processes. Safe-output write credentials MUST remain confined to downstream safe-output processing jobs. Mention/team allowlist resolution MUST be deferred to the trusted `safe_outputs` job; ingestion in the `agent` job MUST perform no privileged mention or team lookups and MUST NOT receive mention-specific credentials.
 
 **Verification**:
 
@@ -391,14 +396,14 @@ Safe Output Processors MAY target external APIs. Credentials for each external s
 
 - **Method**: Manual security audit and code review
 - **Tool**: Security review of workflow structure and GitHub Actions architecture
-- **Criteria**: No GITHUB_TOKEN or credentials are accessible from agent job context; tokens only exist in safe output job contexts
+- **Criteria**: Safe-output and mention-resolution credentials are inaccessible to agent processes; mention resolution occurs only in trusted safe-output processing after the agent artifact has been transferred
 - **Manual Check**: Audit all communication channels (artifacts, environment variables, network, filesystem) to confirm no credential leakage
 
 **Formal Definition**:
 
 ```
 ∀ t ∈ [agent_start, agent_end]:
-  accessible_credentials(agent_context, t) ∩ safe_output_credentials = ∅
+  accessible_credentials(agent_context, t) ∩ (safe_output_credentials ∪ mention_resolution_credentials) = ∅
 ```
 
 **Requirement AR5: Steering Issue Provenance**
@@ -548,7 +553,49 @@ This specification addresses five primary threat scenarios:
 
 *Residual Risk*: A compromised runner may directly manipulate the `.git` directory within the restored cache tarball. Mitigation: restrict runner access to trusted environments and enable repository-level security policies.
 
+**Threat T7: Workspace Checkout Spoofing**
 
+*Attack Vector*: The agent has write access to `$GITHUB_WORKSPACE`, while the safe-outputs MCP server that resolves repository checkouts holds the GitHub token and later performs `git add`/`commit`/`push` in the resolved directory. An adversary directing the agent can plant a directory containing a `.git/config` whose `remote.origin.url` names a different repository, so that the workspace scan used to locate a checkout resolves an attacker-chosen directory.
+
+*Examples*:
+
+- Planting `repos/<name>/.git/config` with a spoofed `remote.origin.url` so patch generation runs over agent-authored history
+- Planting repository-local git configuration (`core.fsmonitor`, `core.sshCommand`, `core.pager`, aliases) intended to execute in the token-bearing process during discovery
+- Relying on a global relaxation of git's dubious-ownership protection to make every workspace directory usable by subsequent privileged git commands
+
+*Architectural Mitigations*:
+
+| Layer | Mechanism | Effectiveness |
+|-------|-----------|---------------|
+| **Manifest precedence** | Compiler-emitted checkout manifest is consulted before any workspace scan | High for declared checkouts |
+| **Scan confinement** | Discovery scans only under `$GITHUB_WORKSPACE`; manifest paths that are absolute or escape the workspace root are rejected | High |
+| **Scoped trust** | `safe.directory` is injected per invocation for the single `git config --get remote.origin.url` read instead of mutating process-wide git trust | High |
+| **Read-only discovery** | Discovery invokes only `git config --get`, which does not run hooks, pagers, or filesystem-monitor processes | High |
+| **Allowlist precedence** | `target-repo`/`allowed-repos` validation (SP6, SP7) occurs before discovery results are used and before any push | High when configured |
+| **Deferred trust** | Durable `safe.directory` trust is granted only to the resolved, allowlist-validated checkout directory at the point of the git write operations | Medium |
+
+*Residual Risk*: A spoofed `remote.origin.url` can still redirect an allowlisted operation to a different workspace directory, so the pushed content is agent-controlled — as it is for any safe output. Two further residuals remain: a `.git` gitdir-link file may point its git directory outside the workspace even though the worktree path is confined, and pushes use the local remote name `origin` rather than a remote URL reconstructed from `GITHUB_SERVER_URL`. Mitigation: configure `allowed-repos`/`allowed-github-references` so the target set is explicit, prefer `checkout:` entries (which populate the manifest and take precedence over the scan) over ad-hoc workspace clones, and rely on branch protection and review for the receiving repository.
+
+**Threat T8: Private-to-Public Data Exposure**
+
+*Attack Vector*: A workflow opts out of the gateway's cross-visibility protections, allowing data read from a private repository to reach public Actions logs or a public repository selected by the agent.
+
+*Examples*:
+
+- An agent includes private issue or source content in a safe-output body targeting a public repository.
+- A safe-output failure or diagnostic includes private data in a public workflow log.
+- A blanket or server-specific `private-to-public-flows` opt-out disables the default sink-visibility guard.
+
+*Architectural Mitigations*:
+
+| Layer | Mechanism | Effectiveness |
+|-------|-----------|---------------|
+| **Default policy** | Private workflows enforce public sink visibility restrictions unless an explicit opt-out is configured | High |
+| **Compiler gate** | Strict mode rejects both blanket and server-list opt-outs; non-strict mode emits a security warning | High when strict mode is enabled |
+| **Target authorization** | Safe-output handlers continue to enforce configured repository and per-type allowlists | High |
+| **Auditability** | The opt-out and resulting safe-output operations are retained in compiler and workflow audit records | Medium |
+
+*Residual Risk*: A non-strict workflow can still intentionally configure the opt-out, and public logs remain visible to repository readers. Mitigation: use strict mode for workflows processing private data, keep the default sink-visibility policy enabled, and review any non-strict warning before deployment.
 
 **Repository Reference Format**
 
@@ -580,6 +627,8 @@ When evaluating cross-repository operations, implementations MUST apply these ru
 - Wildcards (*, ?) are NOT supported
 - Pattern matching is NOT supported
 - Each repository MUST be explicitly listed
+
+Internal work-queue Claim adapters use the authenticated worker profile's `effect_scope` as a singleton repository allowlist. Declared adapters MUST specify a fixed literal `target-repo`, validated by `work_queue_claim_adapters.cjs`. Every selected repository, including native adapter runtime fallbacks and independently resolved mutation targets, MUST match the profile allowlist through `assertClaimAuthorized` before effects execute. Repository allowlist rejection carries error code E004 while preserving the queue protocol message `work_queue_effect_scope_denied`. This queue-specific authorization does not replace type-specific or global allowlists for user-facing safe-output handlers.
 
 **Security Properties**
 
@@ -1686,6 +1735,27 @@ Result:
 
 Beyond common parameters, individual safe output types support specialized configuration.
 
+#### Protected-File Exclusions
+
+The `create-pull-request` and `push-to-pull-request-branch` handlers accept `protected-files` as either the existing policy string or an object containing `policy` and `exclude`:
+
+```yaml
+safe-outputs:
+  create-pull-request:
+    protected-files:
+      policy: fallback-to-issue
+      exclude: ["/pyproject.toml"]
+```
+
+The object form MUST preserve the policy values and defaults supported by the corresponding handler's string form. Each `exclude` entry MUST be interpreted as follows:
+
+- An entry without a leading slash MUST retain the existing basename or path-prefix matching behavior.
+- An entry beginning with `/` MUST match only the exact repository-relative path after removing the leading slash. For example, `"/pyproject.toml"` excludes the root `pyproject.toml`, but not `lib/foo/pyproject.toml`.
+
+Implementations MUST apply exact-path exclusions in both patch-time and post-apply protected-file checks. Before comparing paths, implementations MUST normalize patch paths to repository-relative paths and decode Git C-style quoted paths, including octal UTF-8 byte escapes. An exact-path exclusion MUST NOT remove protection for other paths with the same basename.
+
+Protected-file exclusions only affect the protected-file check. Implementations MUST evaluate `allowed-files` independently and MUST NOT treat a protected-file exclusion as permission to modify a path that fails the `allowed-files` check.
+
 **Representative Examples**:
 
 **Issue Creation Extensions**:
@@ -1723,7 +1793,7 @@ submit-pull-request-review:
   target-repo: owner/repo        # Cross-repository target
   allowed-repos: [...]           # Additional allowed repositories
   allowed-events: [COMMENT]      # Preferred default for non-blocking bot reviews
-  supersede-older-reviews: true  # Best-effort dismissal of older same-workflow REQUEST_CHANGES reviews (including legacy blockers)
+  supersede-older-reviews: true  # Best-effort dismissal of older same-workflow blockers after a clean COMMENT review without inline findings
   footer: "always" | "none" | "if-body"     # Footer on review body
 ```
 
@@ -2061,10 +2131,22 @@ Requirements:
 
 Requirements:
 
-- Detect @mentions: `@[a-zA-Z0-9_-]+`
-- Check against allowed-aliases list
-- Neutralize unauthorized: `@user` becomes `@ user` (add space)
+- Ingestion MUST preserve mentions for mention-aware output types without performing allowlist lookups.
+- The trusted safe-output processor MUST detect @mentions: `@[a-zA-Z0-9_-]+`
+- Check each mention against the resolved allowed-aliases list
+- Neutralize unauthorized mentions before publication
 - Preserve mentions in code blocks
+
+**Ingestion credential requirements**:
+
+- Ingestion MUST use only the default GitHub Actions context and MUST NOT resolve collaborators, comment authors, or team membership. It MUST preserve mention candidates for the trusted safe-output processor to filter before any write operation.
+- Mention resolution MUST run in the trusted `safe_outputs` job. Its lookup token MUST come only from `safe-outputs.mentions.github-app`, then `safe-outputs.mentions.github-token`, then `github.token`; it MUST NOT inherit `safe-outputs.github-token`, `safe-outputs.github-app`, per-output credentials, or `GH_AW_GITHUB_TOKEN`.
+- When `safe-outputs.mentions.github-app` is configured, the compiler MUST mint its dedicated installation token in `safe_outputs` before **Process Safe Outputs**. The token MUST use the configured installation owner and repository scope, request `issues: read` whenever `add-comment` is enabled, and request `members: read` when `mentions.allowed-teams` is configured. Explicit permission overrides MAY select only `read` or `none`; the compiler MUST reject `write` and other levels.
+- With `ignore-if-missing: true`, missing app credentials MUST skip minting and mention resolution MUST fall back to `safe-outputs.mentions.github-token`, then `github.token`. Mention credentials MUST NOT change downstream safe-output write credentials.
+- Allowed team members' raw `@login` mentions MUST remain unmodified during untrusted ingestion and MUST be filtered in the trusted safe-output processor before publication.
+- A mention token referencing `steps.<id>.outputs.*` MUST be produced by an earlier step in the `safe_outputs` job.
+- Mention credentials MUST NOT be serialized into agent-visible validation or handler configuration.
+- Compiler debug logging SHOULD identify the mention-resolution token source without logging credential values or token expressions.
 
 **Transformation T6: Markdown Safety**
 
@@ -2368,6 +2450,13 @@ These extensions apply to safe-output processor messages for `add_comment` (incl
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
 
+**Security Requirements**:
+
+- Body undergoes full sanitization; `@mentions` are neutralized except for the parent item's author and configured mention aliases
+- Length, mention, and link limits (see Enforced Constraints) validated before and after footer injection
+- Cross-repo validation against `allowed-repos`
+- Agent-supplied `comment_id` rejected unless `target` is `"*"` and the ID is listed in `allows-comment-ids`; never honored for discussion comments
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -2412,6 +2501,18 @@ safe-outputs:
 - Discussion-related safe outputs (`create-discussion`, `close-discussion`, `update-discussion`) independently add `discussions:write` permission when configured
 - Cross-repository commenting requires appropriate permissions in target repository
 - When `safe-outputs.add-comment.target` is `"*"`, requests MUST include at least one of `item_number`, `pr_number`, or `pr`; `item_number` is the canonical field.
+
+**Target Authorization**:
+
+**AC-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**AC-002**: For `target: "triggering"`, the processor MUST use only the issue, pull request, or discussion number from trusted triggering-event context and MUST ignore any agent-supplied `item_number`, `pr_number`, or `pr`.
+
+**AC-003**: For a fixed numeric `target`, the processor MUST use the configured item number and MUST ignore any conflicting agent-supplied identifier.
+
+**AC-004**: Only `target: "*"` MAY select an item from the agent-supplied identifier.
+
+**AC-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 ---
 
@@ -2464,6 +2565,7 @@ safe-outputs:
 9. **Owner-Qualified Head Reference**: When `head-repo` differs from `target-repo`, the created pull request MUST use an owner-qualified head reference identifying the head repository owner and pushed branch. Unqualified same-name branch references MUST NOT be used in fork-backed mode.
 10. **Ephemeral Fork Branch Model**: When `head-repo` differs from `target-repo`, implementations SHOULD create or refresh an ephemeral branch in `head-repo` from the resolved upstream base SHA, apply the agent changes, and open the pull request back to the upstream base. Implementations MAY support explicit synchronization of that ephemeral branch with a newer upstream base, but implicit reuse of arbitrary pre-existing fork branches MUST NOT occur.
 11. **Summary and Manifest Provenance**: Successful executions MUST record `head_repo` in the safe-output summary and machine-readable manifest.
+12. **`head_repo` Required for Same-Organization Forks**: The owner-qualified head reference (requirement 9) alone is insufficient when `head-repo` and `target-repo` share the same owner/organization, because multiple repositories under that owner can define the same branch name. Whenever `head-repo` differs from `target-repo` — including when both share the same owner/organization — every pull request creation or update API call MUST include the `head_repo` parameter naming the head repository, in addition to the owner-qualified `head` reference.
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
@@ -2727,6 +2829,8 @@ This section provides complete definitions for all remaining safe output types. 
 - Cross-repository targets MUST be validated against the `allowed-repos` allowlist
 - Issue number MUST be validated as a positive integer belonging to the target repository
 
+**Target Authorization**:
+
 **UI-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
 
 **UI-002**: For `target: "triggering"`, the processor MUST use only the issue number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`.
@@ -2764,14 +2868,14 @@ This section provides complete definitions for all remaining safe output types. 
 **Configuration**:
 
 - `linear-token`: REQUIRED trusted secret expression containing a Linear personal API key
-- `linear-create-issue.team-id`: OPTIONAL Linear team model UUID or GitHub Actions expression, falling back to `LINEAR_TEAM_ID`
+- `linear-create-issue.team-id`: OPTIONAL Linear team model UUID, key, name, or GitHub Actions expression, falling back to `LINEAR_TEAM_ID`
 - `linear-create-issue.project-id`: OPTIONAL trusted Linear project URL identifier or model UUID, falling back to `LINEAR_PROJECT_ID`
 - `linear-create-issue.max`: Operation limit (default: 1)
 - `linear-create-issue.staged`: Staged mode override
 
 **MCP Tool**: `linear_create_issue`
 
-The MCP input object MUST require `title` and `body`, MUST reject additional properties, and MUST limit them to 128 and 65,000 characters respectively. The body MUST contain at least 20 characters. The trusted team UUID, optional project identifier, and credential MUST NOT be MCP inputs.
+The MCP input object MUST require `title` and `body`, MUST reject additional properties, and MUST limit them to 128 and 65,000 characters respectively. The body MUST contain at least 20 characters. The trusted team identifier, optional project identifier, and credential MUST NOT be MCP inputs. Team UUIDs MUST be passed directly to `issueCreate`; other identifiers MUST be resolved case-insensitively against available team keys, then names, before issue creation.
 
 **Operational Semantics**:
 
@@ -2868,11 +2972,13 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 4. **Cross-Repository**: When `target-repo` is configured, operates on that repository (must be in `allowed-repos`).
 5. **Footer Injection**: Appends attribution footer to the closing comment when configured.
 6. **Body Suppression**: When `allow-body` is `false`, the handler MUST NOT post a closing comment. Any `body` value provided by the agent SHALL be discarded before the close operation is executed. The implementation MUST log a warning if a non-empty `body` value was discarded.
-7. **Native Duplicate Marking**: When `duplicate_of` is provided and `state_reason` is `duplicate`, the handler SHALL call the GitHub `markAsDuplicate` GraphQL mutation to create a native "marked this as a duplicate of #X" timeline event. If the mutation fails (e.g., missing permissions or invalid reference), a warning is logged and the close operation continues. The `duplicate_of` value MUST be parsed and resolved to a valid issue node ID before calling the mutation.
+7. **Issue-Intent Close**: When issue-intent metadata is present, the handler MUST submit the close through the issue-intent endpoint. If that request is rejected or otherwise fails, the safe-output item MUST fail and the handler MUST NOT retry through the legacy close endpoint, except for HTTP 404 or 501 responses, which MAY use the legacy endpoint as an availability fallback.
+8. **Native Duplicate Marking**: When `duplicate_of` is provided and `state_reason` is `duplicate`, the handler SHALL call the GitHub `markAsDuplicate` GraphQL mutation to create a native "marked this as a duplicate of #X" timeline event. If the mutation fails (e.g., missing permissions or invalid reference), a warning is logged and the close operation continues. The `duplicate_of` value MUST be parsed and resolved to a valid issue node ID before calling the mutation.
 
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
 - `footer`: Footer override
@@ -2886,6 +2992,22 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - Cross-repository targets MUST be validated against the `allowed-repos` allowlist
 - The handler MUST verify the caller has `issues: write` permission before executing
 - The `duplicate_of` canonical issue reference MUST be resolved and validated before the GraphQL mutation is called; an unparseable value MUST be logged and skipped rather than causing an error
+
+**Target Authorization**:
+
+**CI-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**CI-002**: For `target: "triggering"`, the processor MUST use only the issue number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`.
+
+**CI-003**: For a fixed numeric `target`, the processor MUST use the configured issue number and MUST ignore any conflicting agent-supplied `issue_number`.
+
+**CI-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
+
+**CI-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**CI-006**: When issue-intent metadata is present, a non-404/non-501 failure from the issue-intent close request MUST fail the safe-output item and MUST NOT invoke the legacy close endpoint.
+
+**CI-007**: The handler MAY invoke the legacy close endpoint only when the issue-intent close request returns HTTP 404 or 501, indicating that the intent endpoint may be unavailable.
 
 **Required Permissions**:
 
@@ -2943,6 +3065,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue number. Controls the **parent** issue; `sub_issue_number` is always agent-supplied.
 - `staged`: Staged mode override
 
 **Security Requirements**:
@@ -2951,6 +3074,19 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - Both issue numbers MUST exist in the target repository before modification
 - The handler MUST enforce the maximum sub-issue count limit to prevent unbounded growth
 - Cross-repository operations MUST be rejected; only same-repository linking is permitted
+- The effective parent and sub-issue numbers, after applying `target`, MUST be validated as different; implementations MUST NOT rely solely on comparing the raw agent-supplied `parent_issue_number` to `sub_issue_number` before `target` is applied
+
+**Target Authorization**:
+
+**LSI-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**LSI-002**: For `target: "triggering"`, the processor MUST use only the parent issue number from trusted triggering-event context and MUST ignore any agent-supplied `parent_issue_number`.
+
+**LSI-003**: For a fixed numeric `target`, the processor MUST use the configured parent issue number and MUST ignore any conflicting agent-supplied `parent_issue_number`.
+
+**LSI-004**: Only `target: "*"` MAY select the parent issue from the agent-supplied `parent_issue_number`.
+
+**LSI-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Required Permissions**:
 
@@ -3219,6 +3355,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+
+**Target Authorization**:
+
+**CPR-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**CPR-002**: For `target: "triggering"`, the processor MUST use only the pull request number from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+
+**CPR-003**: For a fixed numeric `target`, the processor MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+
+**CPR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
+
+**CPR-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -3363,12 +3518,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
 - `required-labels`: Labels that must ALL be present on the pull request
 - `required-title-prefix`: Title prefix the pull request must start with
 - `allowed-branches`: Source branch glob patterns; the PR's branch must match at least one
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repository allowlist
 - `staged`: Staged mode override
+
+**Target Authorization**:
+
+**MPR-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**MPR-002**: For `target: "triggering"`, the processor MUST use only the pull request number from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+
+**MPR-003**: For a fixed numeric `target`, the processor MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+
+**MPR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
+
+**MPR-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Required Permissions**:
 
@@ -3401,6 +3569,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 1  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+
+**Target Authorization**:
+
+**MRR-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**MRR-002**: For `target: "triggering"`, the processor MUST use only the pull request number from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+
+**MRR-003**: For a fixed numeric `target`, the processor MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+
+**MRR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
+
+**MRR-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Required Permissions**:
 
@@ -3466,6 +3653,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - The handler MUST refuse pushes unless the resolved pull request head repository exactly matches the configured `head-repo` (or `target-repo` when `head-repo` is omitted)
 - Arbitrary contributor forks MUST remain unsupported write targets even when the upstream repository itself is allowlisted
 - Successful executions MUST record `head_repo` in the safe-output summary and machine-readable manifest
+- When the Convertible fallback (WTD2) opens a review or fallback pull request from `head-repo`, the `head_repo` parameter MUST be included on the pull request creation API call whenever `head-repo` differs from `target-repo`, including when both share the same owner/organization
 
 ---
 
@@ -3533,6 +3721,35 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number. Constrains which PR's review threads may be resolved; `thread_id` (or `comment_id`) always identifies the specific thread.
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the pull request for the resolution to be processed
+- `required-title-prefix`: Title prefix that the pull request MUST have for the resolution to be processed
+
+**Operational Semantics**:
+
+1. **Node Lookup**: Before resolving, the processor MUST look up `thread_id` through GraphQL and verify that it identifies a `PullRequestReviewThread` or a `PullRequestReviewComment`. A review-comment ID is mapped to its containing review thread; an ID of another node type MUST be rejected.
+2. **Target and Filter Checks**: The processor MUST derive the thread's pull request and repository from GitHub's response, then enforce repository allowlists, the configured target, and required label/title filters before mutation. Agent-supplied repository or pull request metadata MUST NOT override the resolved node's parent.
+3. **Resolution**: The processor MUST use GitHub's `resolveReviewThread` GraphQL mutation only for a verified, unresolved thread. Already-resolved threads and stale or missing thread IDs are successful no-ops; staged mode MUST preview without calling the mutation.
+4. **Comment-ID Lookup**: When `thread_id` contains a review-comment ID, the processor MUST search the parent pull request's review threads and comments, following GraphQL cursors until the comment is found or all pages are exhausted. If no containing thread is found, the operation MUST fail without mutation.
+5. **Permission Failure**: If GitHub rejects the mutation because the integration token cannot access the thread, the processor MUST report a skipped operation with guidance to configure a suitable `github-token`; unrelated API errors MUST remain failures.
+
+**Target Authorization**:
+
+**RPT-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**RPT-002**: For `target: "triggering"`, the processor MUST resolve the invocation context (including forwarded `workflow_dispatch`/`repository_dispatch` invocations) and reject the operation unless the resolved thread's pull request matches the triggering pull request.
+
+**RPT-003**: For a fixed numeric `target`, the processor MUST reject the operation unless the resolved thread's pull request matches the configured pull request number.
+
+**RPT-004**: Only `target: "*"` MAY resolve threads on any pull request within the allowed repositories, without matching a specific triggering or fixed pull request.
+
+**RPT-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. This requirement applies uniformly, including in legacy same-repository mode.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -3549,6 +3766,8 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - Higher default max (10) enables resolving multiple threads per review cycle
 - GitHub can reject `resolveReviewThread` with `Resource not accessible by integration` for some `GITHUB_TOKEN` contexts even with `pull-requests: write`; gh-aw treats this specific response as a soft-skip warning for this handler
 - For reliable resolution, configure `safe-outputs.resolve-pull-request-review-thread.github-token` with a token that can resolve review threads in the target repository
+- The safe-output message field is `thread_id`; it accepts a review-thread GraphQL node ID or a review-comment node ID that can be mapped to its containing thread.
+- A thread ID normally needs one GraphQL lookup and, if unresolved and not staged, one GraphQL mutation. A comment ID can require paginated GraphQL reads across the pull request's review threads and comments. Configured label/title filters also read pull request metadata before the mutation.
 
 ---
 
@@ -3570,6 +3789,16 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 
 - `pull-requests: write` - Review comment reply creation
 - `metadata: read` - Repository metadata (automatically granted)
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `target`: `"triggering"` (default) or `"*"` (requires explicit `pull_request_number` per message)
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the pull request for the reply to be processed
+- `required-title-prefix`: Title prefix that the pull request MUST have for the reply to be processed
+- `footer`: Whether to append footer attribution (default: `true`)
 
 **Notes**:
 
@@ -3605,7 +3834,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - Requires both `issues: write` and `pull-requests: write` to support labeling both entity types
 - Labels must exist in repository; non-existent labels generate warnings
 
-**Target Authorization Requirements**:
+**Target Authorization**:
 
 - **AL-001**: An omitted `target` configuration MUST be interpreted as `target: "triggering"`.
 - **AL-002**: With `target: "triggering"`, the handler MUST use only the issue or pull request number from trusted triggering-event context. It MUST ignore agent-supplied `item_number` and equivalent aliases.
@@ -3641,7 +3870,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - Same permissions as `add_labels`
 - Missing labels are silently ignored (no error)
 
-**Target Authorization Requirements**:
+**Target Authorization**:
 
 - **RML-001**: An omitted `target` configuration MUST be interpreted as `target: "triggering"`.
 - **RML-002**: With `target: "triggering"`, the handler MUST use only the issue or pull request number from trusted triggering-event context. It MUST ignore agent-supplied `item_number` and equivalent aliases.
@@ -3658,6 +3887,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 3  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 3)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+
+**Target Authorization**:
+
+**ARV-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**ARV-002**: For `target: "triggering"`, the processor MUST use only the pull request number from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+
+**ARV-003**: For a fixed numeric `target`, the processor MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+
+**ARV-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
+
+**ARV-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Required Permissions**:
 
@@ -3703,6 +3951,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 | `allowed` | `string[]` | `[]` | Restrict assignments to milestones with these titles |
 | `auto_create` | `boolean` | `false` | Auto-create milestones from the `allowed` list if they don't exist |
 | `max` | `number` | `1` | Maximum number of assignments |
+| `target` | `string` | `"triggering"` | `"triggering"`, `"*"`, or a fixed issue number |
 | `target-repo` | `string` | — | Cross-repository target (`owner/repo`) |
 | `github-token` | `string` | — | Custom token for elevated permissions |
 
@@ -3715,6 +3964,18 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 | `milestone_title` | No* | Milestone title (e.g., `"v1.0"`). Resolved to a number internally. Either this or `milestone_number` is required. |
 
 \* At least one of `milestone_number` or `milestone_title` must be provided.
+
+**Target Authorization**:
+
+**AM-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**AM-002**: For `target: "triggering"`, the processor MUST use only the issue number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`.
+
+**AM-003**: For a fixed numeric `target`, the processor MUST use the configured issue number and MUST ignore any conflicting agent-supplied `issue_number`.
+
+**AM-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
+
+**AM-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Notes**:
 
@@ -3732,6 +3993,30 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 1  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the target issue or pull request before assignment
+
+**Target Authorization**:
+
+**ATA-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**ATA-002**: For `target: "triggering"`, the processor MUST use only the issue or pull request number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`/`pull_number`.
+
+**ATA-003**: For a fixed numeric `target`, the processor MUST use the configured issue or pull request number and MUST ignore any conflicting agent-supplied `issue_number`/`pull_number`.
+
+**ATA-004**: Only `target: "*"` MAY select an issue or pull request from the agent-supplied `issue_number`/`pull_number`; only in this mode MUST the processor reject a message that specifies both fields as mutually exclusive.
+
+**ATA-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Required Labels**:
+
+**ATA-006**: When `required-labels` is configured, the processor MUST check the current labels on the resolved target issue or pull request immediately before assignment. If any configured label is missing, the processor MUST skip agent assignment.
 
 **Required Permissions**:
 
@@ -3762,6 +4047,19 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Configuration Options**:
 
 - `unassign-first` (boolean, default: false): If true, unassigns all current assignees before assigning new ones. Useful for reassigning issues from one user to another.
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request number
+
+**Target Authorization**:
+
+**ATU-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**ATU-002**: For `target: "triggering"`, the processor MUST use only the issue or pull request number from trusted triggering-event context and MUST ignore any agent-supplied identifier.
+
+**ATU-003**: For a fixed numeric `target`, the processor MUST use the configured issue or pull request number and MUST ignore any conflicting agent-supplied identifier.
+
+**ATU-004**: Only `target: "*"` MAY select an issue or pull request from the agent-supplied identifier.
+
+**ATU-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
 
 **Required Permissions**:
 
@@ -3791,6 +4089,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+
+**Target Authorization**:
+
+**UFU-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**UFU-002**: For `target: "triggering"`, the processor MUST use only the issue or pull request number from trusted triggering-event context and MUST ignore any agent-supplied identifier. This applies equally when the triggering context is an issue or a pull request.
+
+**UFU-003**: For a fixed numeric `target`, the processor MUST use the configured issue or pull request number and MUST ignore any conflicting agent-supplied identifier.
+
+**UFU-004**: Only `target: "*"` MAY select an issue or pull request from the agent-supplied identifier.
+
+**UFU-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -3800,6 +4117,92 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 *GitHub App*:
 
 - `issues: write` - User unassignment operations
+- `metadata: read` - Repository metadata (automatically granted)
+
+---
+
+#### Type: set_issue_type
+
+**Purpose**: Set or clear the type of an issue.
+
+**Default Max**: 5
+**Cross-Repository Support**: Yes
+**Mandatory**: No
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 5)
+- `allowed`: Optional allowlist of issue type names
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue number
+- `required-labels`: Labels that must all be present on the issue
+- `required-title-prefix`: Title prefix the issue must start with
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repository allowlist
+
+**Target Authorization**:
+
+**SIT-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**SIT-002**: For `target: "triggering"`, the processor MUST use only the issue number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`.
+
+**SIT-003**: For a fixed numeric `target`, the processor MUST use the configured issue number and MUST ignore any conflicting agent-supplied `issue_number`.
+
+**SIT-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
+
+**SIT-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Required Permissions**:
+
+*GitHub Actions Token*:
+
+- `issues: write` - Issue type operations
+
+*GitHub App*:
+
+- `issues: write` - Issue type operations
+- `metadata: read` - Repository metadata (automatically granted)
+
+---
+
+#### Type: set_issue_field
+
+**Purpose**: Set one custom issue field value.
+
+**Default Max**: 5
+**Cross-Repository Support**: Yes
+**Mandatory**: No
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 5)
+- `allowed-fields`: Optional allowlist of custom issue field names
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue number
+- `required-labels`: Labels that must all be present on the issue
+- `required-title-prefix`: Title prefix the issue must start with
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repository allowlist
+
+**Target Authorization**:
+
+**SIF-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**SIF-002**: For `target: "triggering"`, the processor MUST use only the issue number from trusted triggering-event context and MUST ignore any agent-supplied `issue_number`.
+
+**SIF-003**: For a fixed numeric `target`, the processor MUST use the configured issue number and MUST ignore any conflicting agent-supplied `issue_number`.
+
+**SIF-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
+
+**SIF-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Required Permissions**:
+
+*GitHub Actions Token*:
+
+- `issues: write` - Custom issue field operations
+
+*GitHub App*:
+
+- `issues: write` - Custom issue field operations
 - `metadata: read` - Repository metadata (automatically granted)
 
 ---
@@ -3815,10 +4218,23 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 5)
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request/discussion number. Constrains the **parent item** that the resolved `comment_id` must belong to.
 - `discussions`: Control `discussions:write` permission (default: false)
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
 - `allowed-reasons`: Allowed reasons for hiding comments
+
+**Target Authorization**:
+
+**HC-001**: If `target` is omitted, the processor MUST interpret it as `target: "triggering"`.
+
+**HC-002**: For `target: "triggering"`, the processor MUST resolve the comment's parent item and reject the operation unless both the parent item's number and kind (issue/pull request vs. discussion) match the triggering context. Matching only the numeric ID and repository MUST NOT be treated as sufficient, since issue/pull request numbers and discussion numbers are independent sequences that can collide.
+
+**HC-003**: For a fixed numeric `target`, the processor MUST reject the operation unless the resolved comment's parent item number matches the configured target.
+
+**HC-004**: Only `target: "*"` MAY hide a comment on any parent item within the allowed repositories, without matching a specific triggering or fixed item.
+
+**HC-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization.
 
 **Required Permissions**:
 
@@ -4769,6 +5185,58 @@ All errors MUST be logged to:
 - Job summary (visible in workflow run summary)
 - STDERR (for local development)
 
+### 9.6 Repository Checkout Resolution Integrity
+
+Safe outputs that operate on a local git tree (`create_pull_request`, `push_to_pull_request_branch`) MUST resolve the directory for an `owner/repo` target before performing any git write operation. Because `$GITHUB_WORKSPACE` is agent-writable while the resolving process holds the GitHub token (Threat T7), implementations MUST satisfy the following requirements.
+
+**Requirement RCR1: Manifest Precedence**
+
+The compiler-emitted checkout manifest MUST be consulted first. A workspace scan MUST be attempted only when no usable manifest entry exists for the target slug.
+
+**Requirement RCR2: Workspace Confinement**
+
+Discovery MUST be confined to `$GITHUB_WORKSPACE`. Manifest paths that are absolute or that escape the workspace root MUST be rejected, and the scan MUST NOT follow symbolic links out of the workspace.
+
+**Requirement RCR3: Scoped Ownership Trust**
+
+The scan MUST NOT relax git's dubious-ownership protection process-wide. Where a scanned repository must be read despite differing directory ownership (for example, the safe-outputs MCP server container reading clones created by the runner user), the implementation MUST scope the `safe.directory` override to the single read-only `git config --get remote.origin.url` invocation, and MUST NOT mutate the process environment. Durable trust MAY be granted only to the resolved checkout directory, after allowlist validation, at the point of the git write operations.
+
+**Requirement RCR4: Read-Only Discovery**
+
+Discovery MUST use git commands that neither execute repository-supplied programs nor mutate repository state. Commands that run hooks, pagers, filesystem monitors, or credential helpers MUST NOT be used to identify a scanned repository.
+
+**Requirement RCR5: Remote Host Constraint**
+
+A scanned repository MUST be bound to an `owner/repo` slug only when its `remote.origin.url` names the GitHub instance the workflow runs against (the host of `GITHUB_SERVER_URL`, or `github.com`). Remotes on any other host MUST be ignored by the scan, so that a planted repository configuration cannot claim an allowlisted slug. Manifest entries are exempt because they are compiler-generated.
+
+**Requirement RCR6: Allowlist Precedence**
+
+Cross-repository allowlist validation (SP6, SP7) MUST succeed before a discovery result is used and before any push, so that discovery can never widen the configured target set.
+
+**Requirement RCR7: Non-Disclosing Failures**
+
+When resolution fails, the error returned to the agent MUST identify the requested slug and the supported remediation (a `checkout:` entry or a workspace clone) and MUST NOT include scanned filesystem paths or credentials.
+
+### 9.7 Private-to-Public Flow Containment
+
+Safe-output processing MUST preserve the default separation between data read from private repositories and public logs or repositories. The `tools.github.private-to-public-flows` compiler setting is an explicit opt-out from this protection and does not weaken safe-output target authorization.
+
+**Requirement PPF1: Default Sink Visibility**
+
+When a workflow can process private data, the gateway MUST enforce public sink visibility restrictions unless `private-to-public-flows` is explicitly configured. The default MUST NOT permit an agent to select a public destination for private data solely because the destination is reachable with the workflow token.
+
+**Requirement PPF2: Compiler Enforcement**
+
+The compiler MUST reject `tools.github.private-to-public-flows` in strict mode for both the blanket `allow` form and the server-ID list form. In non-strict mode, the compiler MUST emit a security warning that identifies public Actions logs and public destinations as exposure channels.
+
+**Requirement PPF3: Server-ID Validation**
+
+When the server-ID list form is used, every ID MUST resolve to a declared MCP server before the workflow is compiled. Unknown IDs MUST be rejected regardless of strict-mode setting.
+
+**Requirement PPF4: Target Authorization Preservation**
+
+An accepted opt-out MUST NOT bypass safe-output target authorization. Repository allowlists, per-type allowlists, permission checks, content validation, and audit recording MUST continue to apply to every safe-output operation.
+
 ---
 
 ## 10. Execution Guarantees
@@ -5633,6 +6101,33 @@ This specification revision aligns with directly relevant `CHANGELOG.md` entries
 - **v0.40.1**: append-only status comment behavior was documented for smoke workflow execution.
 - **Earlier changelog entry**: status comments were decoupled from default AI reaction behavior; explicit `on.status-comment` configuration is required when status comments are desired.
 - **Earlier changelog entry**: `command` trigger was renamed to `slash_command` with deprecation compatibility.
+
+**Version 1.29.8** (2026-10-01):
+
+- **Specified**: Issue-intent close failures MUST fail closed rather than bypassing review through the legacy close endpoint; only HTTP 404 and 501 responses MAY use the legacy endpoint as an availability fallback.
+- **Updated**: Publication metadata to 1.29.8.
+
+**Version 1.29.7** (2026-09-29):
+
+- **Added**: Threat T8 "Private-to-Public Data Exposure" to Section 3.2, covering public Actions logs and public safe-output destinations.
+- **Specified**: The compiler gate and target-authorization requirements for `tools.github.private-to-public-flows` opt-outs.
+- **Updated**: Publication metadata to 1.29.7.
+
+**Version 1.29.6** (2026-09-23):
+
+- **Added**: Threat T7 "Workspace Checkout Spoofing" to Section 3.2, covering agent-planted repository configurations in `$GITHUB_WORKSPACE` that claim an allowlisted `owner/repo` slug.
+- **Added**: Section 9.6 "Repository Checkout Resolution Integrity" with requirements RCR1–RCR7 (manifest precedence, workspace confinement, scoped ownership trust, read-only discovery, remote host constraint, allowlist precedence, non-disclosing failures).
+- **Updated**: Publication metadata to 1.29.6.
+
+**Version 1.29.5** (2026-09-22):
+
+- **Specified**: The `head_repo` parameter MUST be included on `create_pull_request` and `push_to_pull_request_branch` fallback/review pull request creation API calls whenever `head-repo` differs from `target-repo`, including when both repositories share the same owner/organization. The owner-qualified `head` reference alone does not disambiguate the source repository in that case.
+- **Updated**: Publication metadata to 1.29.5.
+
+**Version 1.29.4** (2026-09-21):
+
+- **Added**: Conformance verification requirements for systematic target authorization regression testing and fail-safe runtime assertions.
+- **Updated**: Publication metadata to 1.29.4.
 
 **Version 1.29.3** (2026-09-12):
 

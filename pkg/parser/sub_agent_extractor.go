@@ -141,11 +141,11 @@ func validateSubAgentFrontmatterSyntax(agent InlineSubAgent) []string {
 // GetEngineSubAgentExt returns the file extension used for inline sub-agent files
 // for a given engine.
 //
-//	claude / codex / gemini → .md
+//	claude / codex / gemini / pi → .md
 //	others                  → .agent.md  (Copilot default)
 func GetEngineSubAgentExt(engineID string) string {
 	switch strings.ToLower(engineID) {
-	case "claude", "codex", "gemini":
+	case "claude", "codex", "gemini", "pi":
 		return ".md"
 	default:
 		return ".agent.md"
@@ -164,6 +164,32 @@ type InlineSubAgent struct {
 	// frontmatter block (---...---) followed by the sub-agent's prompt body,
 	// but the format is not enforced — it varies by engine.
 	Content string
+}
+
+// SubAgentModel identifies a declared model and the agent requesting it.
+type SubAgentModel struct {
+	Name  string
+	Model string
+}
+
+// ExtractSubAgentModels reads model declarations from inline agent frontmatter.
+// Malformed frontmatter is handled by the existing advisory validation.
+func ExtractSubAgentModels(body string) []SubAgentModel {
+	_, agents, err := ExtractInlineSubAgents(body)
+	if err != nil {
+		return nil
+	}
+	var models []SubAgentModel
+	for _, agent := range agents {
+		parsed, err := ExtractFrontmatterFromContent(agent.Content)
+		if err != nil {
+			continue
+		}
+		if model, ok := parsed.Frontmatter["model"].(string); ok && strings.TrimSpace(model) != "" {
+			models = append(models, SubAgentModel{Name: agent.Name, Model: strings.TrimSpace(model)})
+		}
+	}
+	return models
 }
 
 // subAgentSeparatorRegex matches the inline sub-agent start marker line.

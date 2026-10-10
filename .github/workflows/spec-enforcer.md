@@ -36,7 +36,7 @@ safe-outputs:
 description: Generates and maintains specification-driven test suites for each Go package, relying on README.md specifications rather than source code
 emoji: 📋
 max-turns: 100
-model: openai/gpt-5.3-codex
+model: openai/gpt-5.6-sol
 engine:
   id: codex
   model-provider: openai
@@ -59,9 +59,6 @@ evals:
     question: Did the agent process at least one Go package for specification-driven test generation?
   - id: pr_created_or_noop
     question: Was a pull request created with new or updated test suites, or was noop used when no packages required test generation?
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Package Specification Enforcer

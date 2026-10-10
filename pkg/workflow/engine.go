@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/typeutil"
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
+	"gopkg.in/yaml.v3"
 )
 
 var engineLog = logger.New("workflow:engine")
@@ -45,9 +47,11 @@ type EngineConfig struct {
 	ID                 string
 	Version            string
 	LLMProvider        LLMProvider // Inference provider override for this engine (engine.provider / engine.model-provider)
+	ContextWindow      int         // Model context window metadata for engines that need explicit model catalog entries
 	PermissionMode     string
 	MaxTurns           string
 	MaxToolDenials     string // Maximum repeated tool denials before stopping inference (copilot SDK mode only)
+	MaxToolCalls       string // Maximum dispatched tool calls (Copilot SDK mode only)
 	MaxRuns            int    // Maximum number of LLM invocations per run (AWF apiProxy.maxRuns)
 	MaxTurnCacheMisses int    // Maximum number of consecutive cache misses per run (AWF apiProxy.maxCacheMisses)
 	MaxContinuations   int    // Maximum number of continuations for autopilot mode (copilot engine only; > 1 enables --autopilot)
@@ -65,6 +69,7 @@ type EngineConfig struct {
 	Agent              string // Agent identifier for copilot --agent flag (copilot engine only)
 	APITarget          string // Custom API endpoint hostname (e.g., "api.acme.ghe.com" or "api.enterprise.githubcopilot.com")
 	Bare               bool   // When true, disables automatic loading of context/instructions (copilot: --no-custom-instructions, claude: --bare, codex: --no-system-prompt, gemini: GEMINI_SYSTEM_MD=/dev/null)
+	DynamicWorkflows   *bool  // When false, disables dynamic workflows for engines that support them
 	// Inline definition fields (populated when engine.runtime is specified in frontmatter)
 	IsInlineDefinition bool   // true when the engine is defined inline via engine.runtime + optional engine.provider
 	InlineProviderID   string // engine.provider.id  (e.g. "openai", "anthropic")
@@ -82,6 +87,9 @@ type EngineConfig struct {
 	// Extensions is a list of engine-specific plugin names to install before launching the engine.
 	// Currently used by the Pi engine: each entry is passed to `pi install <extension>`.
 	Extensions []string
+
+	ModelRouting   *CopilotModelRoutingConfig
+	FallbackModels []string
 
 	// CopilotSDK enables the GitHub Copilot SDK integration.
 	// When true the compiler enables a harness-managed Copilot CLI headless sidecar
@@ -169,11 +177,91 @@ type EngineAuthConfig struct {
 // Ecosystem identifiers in the Allowed list are expanded to their corresponding domain lists.
 // See GetAllowedDomains() for the list of supported ecosystem identifiers.
 type NetworkPermissions struct {
-	Allowed           []string        `yaml:"allowed,omitempty"` // List of allowed domains or ecosystem identifiers (e.g., "defaults", "github", "python")
-	AllowedInput      bool            `yaml:"allowed-input,omitempty"`
-	Blocked           []string        `yaml:"blocked,omitempty"`  // List of blocked domains (takes precedence over allowed)
-	Firewall          *FirewallConfig `yaml:"firewall,omitempty"` // AWF firewall configuration (see firewall.go)
-	ExplicitlyDefined bool            `yaml:"-"`                  // Internal flag: true if network field was explicitly set in frontmatter
+	Allowed           []string         `yaml:"allowed,omitempty"` // List of allowed domains or ecosystem identifiers (e.g., "defaults", "github", "python")
+	AllowedInput      bool             `yaml:"allowed-input,omitempty"`
+	Blocked           []string         `yaml:"blocked,omitempty"` // List of blocked domains (takes precedence over allowed)
+	HostedWeb         *HostedWebPolicy `yaml:"hosted-web,omitempty" json:"hosted-web,omitempty"`
+	InvalidHostedWeb  bool             `yaml:"-" json:"-"`         // Internal flag: true if hosted-web had an unsupported raw shape
+	HostedWebRawValue string           `yaml:"-" json:"-"`         // Internal diagnostic for unsupported hosted-web values
+	Firewall          *FirewallConfig  `yaml:"firewall,omitempty"` // AWF firewall configuration (see firewall.go)
+	ExplicitlyDefined bool             `yaml:"-"`                  // Internal flag: true if network field was explicitly set in frontmatter
+}
+
+// clone returns a deep-enough copy of n so callers can safely mutate the
+// returned value's slices (e.g. Allowed) without affecting the original.
+func (n *NetworkPermissions) clone() *NetworkPermissions {
+	if n == nil {
+		return &NetworkPermissions{}
+	}
+	result := *n
+	if n.Allowed != nil {
+		result.Allowed = append([]string(nil), n.Allowed...)
+	}
+	if n.Blocked != nil {
+		result.Blocked = append([]string(nil), n.Blocked...)
+	}
+	if n.HostedWeb != nil {
+		hostedWeb := *n.HostedWeb
+		hostedWeb.Allowed = append([]string(nil), n.HostedWeb.Allowed...)
+		hostedWeb.Blocked = append([]string(nil), n.HostedWeb.Blocked...)
+		result.HostedWeb = &hostedWeb
+	}
+	return &result
+}
+
+// HostedWebPolicy controls provider-hosted web search and fetch tools.
+// Its domain lists are deliberately independent from network.allowed because hosted
+// retrieval executes outside the AWF network boundary.
+type HostedWebPolicy struct {
+	Enabled bool     `yaml:"-" json:"-"`
+	Allowed []string `yaml:"allowed,omitempty" json:"allowed,omitempty"`
+	Blocked []string `yaml:"blocked,omitempty" json:"blocked,omitempty"`
+	MaxUses int      `yaml:"max-uses,omitempty" json:"max-uses,omitempty"`
+}
+
+// UnmarshalYAML accepts hosted-web: false to disable provider-hosted web tools.
+// An object policy enables them.
+func (p *HostedWebPolicy) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		if node.Tag == "!!bool" && node.Value == "false" {
+			*p = HostedWebPolicy{}
+			return nil
+		}
+		return errors.New("network.hosted-web must be false or an object policy")
+	}
+	if node.Kind != yaml.MappingNode {
+		return errors.New("network.hosted-web must be false or an object policy")
+	}
+
+	type hostedWebPolicy HostedWebPolicy
+	var policy hostedWebPolicy
+	if err := node.Decode(&policy); err != nil {
+		return err
+	}
+	*p = HostedWebPolicy(policy)
+	p.Enabled = true
+	return nil
+}
+
+// UnmarshalJSON accepts hosted-web: false to disable provider-hosted web tools.
+// An object policy enables them.
+func (p *HostedWebPolicy) UnmarshalJSON(data []byte) error {
+	if string(data) == "false" {
+		*p = HostedWebPolicy{}
+		return nil
+	}
+	if !bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+		return errors.New("network.hosted-web must be false or an object policy")
+	}
+
+	type hostedWebPolicy HostedWebPolicy
+	var policy hostedWebPolicy
+	if err := json.Unmarshal(data, &policy); err != nil {
+		return err
+	}
+	*p = HostedWebPolicy(policy)
+	p.Enabled = true
+	return nil
 }
 
 // EngineNetworkConfig combines engine configuration with top-level network permissions
@@ -185,10 +273,17 @@ type EngineNetworkConfig struct {
 type engineTopLevelConfig struct {
 	maxTurns           string
 	maxToolDenials     string
+	maxToolCalls       string
 	maxAICredits       int64
 	maxTurnCacheMisses int
 	maxRuns            int
 	model              string
+}
+
+// DynamicWorkflowsEnabled reports whether dynamic workflows are enabled in the engine configuration.
+// The feature requires explicit opt-in for every engine.
+func (e *EngineConfig) DynamicWorkflowsEnabled() bool {
+	return e != nil && e.DynamicWorkflows != nil && *e.DynamicWorkflows
 }
 
 // GetMaxAICredits returns the configured engine AI credits budget, falling back to the default.
@@ -238,6 +333,7 @@ func parseTopLevelEngineConfig(frontmatter map[string]any) engineTopLevelConfig 
 	topLevel := engineTopLevelConfig{
 		maxTurns:           parseMaxTurnsValue(frontmatter["max-turns"]),
 		maxToolDenials:     parseMaxToolDenialsValue(frontmatter["max-tool-denials"]),
+		maxToolCalls:       parseMaxToolCallsValue(frontmatter["max-tool-calls"]),
 		maxAICredits:       parseMaxAICreditsValue(frontmatter["max-ai-credits"]),
 		maxTurnCacheMisses: parseMaxTurnCacheMissesValue(frontmatter["max-turn-cache-misses"]),
 		maxRuns:            parseMaxRunsValue(frontmatter["max-turns"]),
@@ -245,7 +341,9 @@ func parseTopLevelEngineConfig(frontmatter map[string]any) engineTopLevelConfig 
 	if topLevel.maxRuns == 0 {
 		topLevel.maxRuns = parseMaxRunsValue(frontmatter["max-runs"])
 	}
-	topLevel.model, _ = frontmatter["model"].(string)
+	if model, ok := frontmatter["model"].(string); ok {
+		topLevel.model = model
+	}
 	return topLevel
 }
 
@@ -255,6 +353,7 @@ func extractStringEngineConfig(engineStr string, topLevel engineTopLevelConfig) 
 		ID:                 engineStr,
 		MaxTurns:           topLevel.maxTurns,
 		MaxToolDenials:     topLevel.maxToolDenials,
+		MaxToolCalls:       topLevel.maxToolCalls,
 		MaxRuns:            topLevel.maxRuns,
 		MaxTurnCacheMisses: topLevel.maxTurnCacheMisses,
 		MaxAICredits:       topLevel.maxAICredits,
@@ -296,7 +395,10 @@ func extractInlineProviderConfig(config *EngineConfig, provider any) string {
 		if id, ok := providerTyped["id"].(string); ok {
 			config.InlineProviderID = id
 		}
-		model, _ := providerTyped["model"].(string)
+		var model string
+		if parsedModel, ok := providerTyped["model"].(string); ok {
+			model = parsedModel
+		}
 		if authObj, ok := providerTyped["auth"].(map[string]any); ok {
 			if authDef := parseNonEmptyAuthDefinition(authObj); authDef != nil {
 				config.InlineProviderAuth = authDef
@@ -323,8 +425,10 @@ func parseNonEmptyAuthDefinition(authObj map[string]any) *AuthDefinition {
 func applyInlineEngineFields(config *EngineConfig, engineObj map[string]any, topLevel engineTopLevelConfig) {
 	applyEngineBareField(config, engineObj)
 	applyEnginePermissionMode(config, engineObj)
+	applyEngineContextWindowField(config, engineObj)
 	config.MaxTurns = topLevel.maxTurns
 	config.MaxToolDenials = topLevel.maxToolDenials
+	config.MaxToolCalls = topLevel.maxToolCalls
 	config.MaxRuns = topLevel.maxRuns
 	config.MaxTurnCacheMisses = topLevel.maxTurnCacheMisses
 	config.MaxAICredits = topLevel.maxAICredits
@@ -347,6 +451,15 @@ func extractReferencedEngineConfig(engineObj map[string]any, topLevel engineTopL
 func applyReferencedEngineFields(config *EngineConfig, engineObj map[string]any, topLevel engineTopLevelConfig) {
 	applyEngineProviderFields(config, engineObj)
 	applyEnginePermissionMode(config, engineObj)
+	applyEngineContextWindowField(config, engineObj)
+	applyEngineModelRoutingField(config, engineObj)
+	if models, ok := engineObj["fallback-models"].([]any); ok {
+		for _, model := range models {
+			if name, ok := model.(string); ok {
+				config.FallbackModels = append(config.FallbackModels, name)
+			}
+		}
+	}
 	applyEngineTurnFields(config, engineObj, topLevel)
 	applyEngineConcurrencyField(config, engineObj)
 	applyEngineStringFields(config, engineObj)
@@ -358,6 +471,29 @@ func applyReferencedEngineFields(config *EngineConfig, engineObj map[string]any,
 	applyEngineExtensionsField(config, engineObj)
 	applyEngineBooleanFields(config, engineObj)
 	applyEngineTopLevelOverrides(config, topLevel)
+}
+
+func applyEngineModelRoutingField(config *EngineConfig, engineObj map[string]any) {
+	routing, ok := engineObj["model-routing"].(map[string]any)
+	if !ok {
+		return
+	}
+	modelRouting := &CopilotModelRoutingConfig{}
+	if goal, ok := routing["goal"].(string); ok {
+		modelRouting.Goal = goal
+	}
+	if mode, ok := routing["mode"].(string); ok {
+		modelRouting.Mode = mode
+	}
+	if models, ok := routing["allowed-models"].([]any); ok {
+		modelRouting.AllowedModels = make([]string, 0, len(models))
+		for _, model := range models {
+			if modelName, ok := model.(string); ok {
+				modelRouting.AllowedModels = append(modelRouting.AllowedModels, modelName)
+			}
+		}
+	}
+	config.ModelRouting = modelRouting
 }
 
 func resolveEngineModel(engineObj map[string]any, topLevel engineTopLevelConfig, fallback string) string {
@@ -392,6 +528,12 @@ func applyEnginePermissionMode(config *EngineConfig, engineObj map[string]any) {
 	}
 }
 
+func applyEngineContextWindowField(config *EngineConfig, engineObj map[string]any) {
+	if contextWindow, ok := engineObj["context-window"]; ok {
+		config.ContextWindow = parsePositiveIntValue(contextWindow, "context-window")
+	}
+}
+
 func applyEngineTurnFields(config *EngineConfig, engineObj map[string]any, topLevel engineTopLevelConfig) {
 	if maxTurns, hasMaxTurns := engineObj["max-turns"]; hasMaxTurns {
 		config.MaxTurns = parseMaxTurnsValue(maxTurns)
@@ -400,6 +542,7 @@ func applyEngineTurnFields(config *EngineConfig, engineObj map[string]any, topLe
 		config.MaxTurns = topLevel.maxTurns
 	}
 	config.MaxToolDenials = topLevel.maxToolDenials
+	config.MaxToolCalls = topLevel.maxToolCalls
 	if maxCont, hasMaxCont := engineObj["max-continuations"]; hasMaxCont {
 		if val, ok := typeutil.ParseIntValue(maxCont); ok {
 			config.MaxContinuations = val
@@ -491,8 +634,11 @@ func applyEngineDriverField(config *EngineConfig, engineObj map[string]any) {
 	}
 
 	// Pick the first match. Validation will reject the map when len > 1.
-	runtime := matched[0]
-	source, _ := driverMap[runtime].(string)
+	runtime := matched[0] //nolint:uncheckedsliceindex // The empty case returns above.
+	source, ok := driverMap[runtime].(string)
+	if !ok {
+		return
+	}
 	// Preserve runtime even for empty source so validateInlineEngineDriver
 	// can reject it with a clear error rather than silently bypassing checks.
 	config.InlineDriver = &InlineEngineDriver{
@@ -612,6 +758,7 @@ func applyEngineExtensionsField(config *EngineConfig, engineObj map[string]any) 
 
 func applyEngineBooleanFields(config *EngineConfig, engineObj map[string]any) {
 	applyEngineBareField(config, engineObj)
+	applyEngineDynamicWorkflowsField(config, engineObj)
 	if sdkVal, ok := engineObj["copilot-sdk"].(bool); ok {
 		config.CopilotSDK = sdkVal
 		engineLog.Printf("Extracted copilot-sdk: %v", config.CopilotSDK)
@@ -619,6 +766,13 @@ func applyEngineBooleanFields(config *EngineConfig, engineObj map[string]any) {
 	if config.Driver != "" && config.ID == "copilot" && !config.CopilotSDK {
 		config.CopilotSDK = true
 		engineLog.Print("Enabled copilot-sdk because driver is configured for copilot engine")
+	}
+}
+
+func applyEngineDynamicWorkflowsField(config *EngineConfig, engineObj map[string]any) {
+	if enabled, ok := engineObj["dynamic-workflows"].(bool); ok {
+		config.DynamicWorkflows = &enabled
+		engineLog.Printf("Extracted dynamic-workflows: %v", enabled)
 	}
 }
 
@@ -633,17 +787,21 @@ func applyEngineTopLevelOverrides(config *EngineConfig, topLevel engineTopLevelC
 	if topLevel.maxTurns != "" {
 		config.MaxTurns = topLevel.maxTurns
 	}
+	if topLevel.maxToolCalls != "" {
+		config.MaxToolCalls = topLevel.maxToolCalls
+	}
 	config.MaxRuns = topLevel.maxRuns
 	config.MaxTurnCacheMisses = topLevel.maxTurnCacheMisses
 	config.MaxAICredits = topLevel.maxAICredits
 }
 
 func buildTopLevelOnlyEngineConfig(topLevel engineTopLevelConfig) (string, *EngineConfig, string) {
-	if topLevel.maxTurns != "" || topLevel.maxToolDenials != "" || topLevel.maxAICredits != 0 ||
+	if topLevel.maxTurns != "" || topLevel.maxToolDenials != "" || topLevel.maxToolCalls != "" || topLevel.maxAICredits != 0 ||
 		topLevel.maxRuns > 0 || topLevel.maxTurnCacheMisses > 0 || topLevel.model != "" {
 		return "", &EngineConfig{
 			MaxTurns:           topLevel.maxTurns,
 			MaxToolDenials:     topLevel.maxToolDenials,
+			MaxToolCalls:       topLevel.maxToolCalls,
 			MaxRuns:            topLevel.maxRuns,
 			MaxTurnCacheMisses: topLevel.maxTurnCacheMisses,
 			MaxAICredits:       topLevel.maxAICredits,

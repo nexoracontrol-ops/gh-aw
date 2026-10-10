@@ -24,6 +24,11 @@ const workflowCallRepo = "${{ steps.resolve-host-repo.outputs.target_repo }}"
 // Uses target_checkout_ref (job.workflow_sha) for immutable pinning to the exact executing revision.
 const workflowCallRef = "${{ steps.resolve-host-repo.outputs.target_checkout_ref }}"
 
+// pullRequestActivationRef pins activation-time runtime imports and skills to base
+// branch content for pull request events, while preserving existing checkout refs
+// for non-PR events in mixed-trigger workflows.
+const pullRequestActivationRef = "${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && github.event.pull_request != null && github.event.pull_request.base.sha || github.sha }}"
+
 // sameRepoCondition is the if: condition injected into the .github checkout step when
 // no custom activation token is configured. It restricts the checkout to same-repo
 // workflow_call invocations to prevent failures when GITHUB_TOKEN cannot read a private
@@ -40,6 +45,115 @@ func TestActivationArtifactUploadRunsAfterSuccessOrFailure(t *testing.T) {
 	uploadStep := extractWorkflowStepByName(t, steps, "Upload activation artifact")
 	assert.Contains(t, uploadStep, "if: success() || failure()")
 	assert.NotContains(t, uploadStep, "if: always()")
+	for _, filename := range []string{"system.txt", "user.txt", "prompt.txt"} {
+		assert.Contains(t, uploadStep, "/tmp/gh-aw/aw-prompts/"+filename)
+	}
+}
+
+func TestDynamicWorkflowsSavedWhenPRCheckoutDisabled(t *testing.T) {
+	enabled, disabled := true, false
+	engine := NewClaudeEngine()
+	engine.id = "dynamic-test"
+	compiler := NewCompiler()
+	require.NoError(t, compiler.engineRegistry.Register(engine))
+	data := &WorkflowData{
+		Name: "Dynamic workflows",
+		AI:   "dynamic-test",
+		EngineConfig: &EngineConfig{
+			ID:               "dynamic-test",
+			DynamicWorkflows: &enabled,
+		},
+		CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+	}
+	job, err := compiler.buildActivationJob(data, false, "", "dynamic.lock.yml")
+	require.NoError(t, err)
+	steps := strings.Join(job.Steps, "")
+	save := extractWorkflowStepByName(t, steps, "Save agent config folders for base branch restoration")
+	assert.Contains(t, save, `GH_AW_AGENT_FOLDERS: ".agents .claude .github"`)
+	assert.Contains(t, extractWorkflowStepByName(t, steps, "Upload activation artifact"), "/tmp/gh-aw/base")
+	assert.Less(t, strings.Index(steps, "Save agent config folders for base branch restoration"), strings.Index(steps, "Upload activation artifact"))
+}
+
+func TestClaudeWorkflowsNotSavedWhenDynamicWorkflowsDisabled(t *testing.T) {
+	disabled := false
+	data := &WorkflowData{
+		Name: "Claude workflows",
+		AI:   "claude",
+		EngineConfig: &EngineConfig{
+			ID:               "claude",
+			DynamicWorkflows: &disabled,
+		},
+		CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+	}
+	job, err := NewCompiler().buildActivationJob(data, false, "", "claude.lock.yml")
+	require.NoError(t, err)
+
+	assert.NotContains(t, strings.Join(job.Steps, ""), "Save agent config folders for base branch restoration")
+}
+
+func TestCopilotDynamicWorkflowsSnapshotWithPRCheckoutDisabled(t *testing.T) {
+	enabled, disabled := true, false
+	for _, tt := range []struct {
+		name    string
+		setting *bool
+		want    bool
+	}{
+		{name: "default"},
+		{name: "enabled", setting: &enabled, want: true},
+		{name: "disabled", setting: &disabled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Name: "Copilot workflows",
+				AI:   "copilot",
+				EngineConfig: &EngineConfig{
+					ID:               "copilot",
+					DynamicWorkflows: tt.setting,
+				},
+				CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+			}
+			job, err := NewCompiler().buildActivationJob(data, false, "", "copilot.lock.yml")
+			require.NoError(t, err)
+			steps := strings.Join(job.Steps, "")
+			if tt.want {
+				save := extractWorkflowStepByName(t, steps, "Save agent config folders for base branch restoration")
+				assert.Contains(t, save, `GH_AW_AGENT_FOLDERS: ".agents .github"`)
+				assert.Contains(t, extractWorkflowStepByName(t, steps, "Upload activation artifact"), "/tmp/gh-aw/base")
+			} else {
+				assert.NotContains(t, steps, "Save agent config folders for base branch restoration")
+			}
+		})
+	}
+}
+
+func TestWorkQueueSnapshotIsPreparedAndUploaded(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		Name:  "Work Queue",
+		Tools: map[string]any{"work-queue": true},
+	}
+	job, err := compiler.buildActivationJob(data, false, "", "queue.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	steps := strings.Join(job.Steps, "")
+	snapshotStep := extractWorkflowStepByName(t, steps, "Snapshot work queue state")
+	assert.Contains(t, snapshotStep, "write_work_queue_snapshot.cjs")
+	uploadStep := extractWorkflowStepByName(t, steps, "Upload activation artifact")
+	assert.Contains(t, uploadStep, "/tmp/gh-aw/work-queue.snapshot.json")
+	assert.Contains(t, job.Permissions, "contents: read")
+	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Equal(t, "${{ steps.work_queue_snapshot.outputs.work_queue_origin }}", job.Outputs["work_queue_origin"])
+}
+
+func TestWorkQueueWorkerActivationCanPublishOnlyTrustedBindingBeforeEffects(t *testing.T) {
+	data := &WorkflowData{Tools: map[string]any{"work-queue": map[string]any{"worker": true}}, StaleCheckDisabled: true}
+	require.NoError(t, validateWorkQueueConfiguration(data))
+	job, err := NewCompiler().buildActivationJob(data, false, "", "worker.lock.yml")
+	require.NoError(t, err)
+	assert.Contains(t, job.Permissions, "contents: write")
+	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Contains(t, strings.Join(job.Steps, ""), `GH_AW_WORK_QUEUE_ROLE: "worker"`)
 }
 
 func TestActivationInfoArtifactUpload(t *testing.T) {
@@ -84,6 +198,7 @@ func TestOperationalValueGraderScopesActionsReadToActivation(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, job)
 	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Equal(t, "${{ steps.generate_aw_info.outputs.aw_context }}", job.Outputs["aw_context"])
 	assert.Equal(t, "${{ steps.generate_aw_info.outputs.run_created_at }}", job.Outputs["run_created_at"])
 
 	steps := strings.Join(job.Steps, "")
@@ -138,6 +253,19 @@ func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 			wantSameRepoCondition: true, // no custom token → restrict to same-repo only
 		},
 		{
+			name: "workflow_call mixed with pull_request pins pull_request activation checkout to base sha",
+			onSection: `"on":
+  pull_request:
+    types: [opened]
+  workflow_call:`,
+			wantRepository:        workflowCallRepo,
+			wantRef:               "${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && github.event.pull_request != null && github.event.pull_request.base.sha || steps.resolve-host-repo.outputs.target_checkout_ref }}",
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: true,
+		},
+		{
 			name: "workflow_call with inlined-imports - standard checkout without cross-repo expression",
 			onSection: `"on":
   workflow_call:`,
@@ -160,6 +288,68 @@ func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 			wantPersistFalse:      true,
 			wantFetchDepth1:       true,
 			wantSameRepoCondition: false, // non-workflow_call trigger → no same-repo condition
+		},
+		{
+			name: "pull_request trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request:
+    types: [opened, ready_for_review, labeled]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request mixed with issue trigger pins only pull_request events to base sha",
+			onSection: `"on":
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_review trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request_review:
+    types: [submitted]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_review_comment trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request_review_comment:
+    types: [created]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_target does not match pull_request base checkout pin",
+			onSection: `"on":
+  pull_request_target:
+    types: [opened]`,
+			wantRepository:        "",
+			wantRef:               "",
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
 		},
 		{
 			name: "issue_comment only - no repository field",
@@ -1046,6 +1236,7 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 	tests := []struct {
 		name                  string
 		activationToken       string
+		activationApp         *GitHubAppConfig
 		onSection             string
 		wantSameRepoCondition bool
 	}{
@@ -1062,6 +1253,34 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 			onSection: `"on":
   workflow_call:`,
 			wantSameRepoCondition: true,
+		},
+		{
+			name:            "explicit GITHUB_TOKEN with workflow_call - same-repo guard present",
+			activationToken: "${{ secrets.GITHUB_TOKEN }}",
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: true,
+		},
+		{
+			name: "GitHub App with ignore-if-missing and workflow_call - same-repo guard present",
+			activationApp: &GitHubAppConfig{
+				AppID:           "${{ vars.APP_ID }}",
+				PrivateKey:      "${{ secrets.APP_KEY }}",
+				IgnoreIfMissing: true,
+			},
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: true,
+		},
+		{
+			name: "required GitHub App with workflow_call - no same-repo guard",
+			activationApp: &GitHubAppConfig{
+				AppID:      "${{ vars.APP_ID }}",
+				PrivateKey: "${{ secrets.APP_KEY }}",
+			},
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: false,
 		},
 		{
 			name:            "default GITHUB_TOKEN without workflow_call - no same-repo guard",
@@ -1081,6 +1300,7 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 			data := &WorkflowData{
 				On:                    tt.onSection,
 				ActivationGitHubToken: tt.activationToken,
+				ActivationGitHubApp:   tt.activationApp,
 			}
 
 			result := c.generateCheckoutGitHubFolderForActivation(data)

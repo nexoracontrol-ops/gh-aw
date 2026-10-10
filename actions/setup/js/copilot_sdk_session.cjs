@@ -5,24 +5,17 @@
  *
  * Runs a single Copilot agentic session using the @github/copilot-sdk.
  * Serializes all SDK session events to a JSONL file so that
- * unified_timeline.cjs can render them in the step summary.
+ * unified_session.cjs can collect them for the unified session step summary.
  *
- * Event mapping:
- *   SDK "user.message"            → JSONL "user.message"
- *   SDK "tool.execution_start"    → JSONL "tool.execution_start"  (toolName, mcpServerName, mcpToolName?, toolCallId?, input?, command?)
- *   SDK "tool.execution_complete" → JSONL "tool.execution_complete" (toolName, mcpServerName, toolCallId?, success, result)
- *   SDK "assistant.message"       → JSONL "assistant.message"     (content)
- *   SDK "assistant.turn_start"    → watchdog disarmed (inAssistantTurn = true)
- *   SDK "assistant.turn_end"      → watchdog re-enabled (inAssistantTurn = false)
- *   SDK "session.task_complete"   → JSONL "session.task_complete" (success, summary)
- *   SDK "subagent.started"        → JSONL "subagent.started"      (agentName, agentDisplayName, toolCallId)
- *   SDK "subagent.completed"      → JSONL "subagent.completed"    (agentName, toolCallId)
- *   SDK "subagent.failed"         → JSONL "subagent.failed"       (agentName, toolCallId, error)
+ * Retains native non-ephemeral events and selected ephemeral conversation,
+ * accounting, failure and workflow observations. Tool names and inputs are
+ * enriched only from observed evidence; canonical conversion is performed by
+ * copilot_session.cjs. Assistant turn events also control the idle watchdog.
  *
  * The JSONL file is written to:
  *   /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
  * which mirrors the path that copy_copilot_session_state.sh produces and that
- * unified_timeline.cjs reads.
+ * unified_session.cjs reads.
  *
  * Consumed directly by copilot_sdk_driver.cjs (the built-in gh-aw driver) and
  * available to any custom driver that wants the same session lifecycle and JSONL
@@ -35,10 +28,15 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { isDeepStrictEqual } = require("node:util");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
+const { buildCopilotSDKToolCallBudget } = require("./copilot_sdk_tool_budget.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
-const { extractShellCommandFromToolData, extractStructuredToolInput } = require("./tool_call_details.cjs");
+const { COPILOT_WORKFLOW_EVENT_TYPES } = require("./copilot_workflow_events.cjs");
+const { copilotSessionContext } = require("./copilot_session.cjs");
+
+const CAPTURED_EPHEMERAL_EVENTS = new Set([...COPILOT_WORKFLOW_EVENT_TYPES, "assistant.usage", "assistant.message_delta", "assistant.reasoning_delta", "model.call_failure"]);
 
 // Default timeout for a single sendAndWait call: 10 minutes.
 // This is intentionally generous — the headless Copilot CLI has its own internal
@@ -78,7 +76,7 @@ const SDK_POST_COMPLETION_IDLE_MS_DEFAULT = 30 * 1000;
  * Extract the prompt text from a resolved args array.
  * Looks for the first occurrence of "-p <value>" or "--prompt <value>".
  *
- * @param {string[]} args - Resolved args (after resolvePromptFileArgs has run).
+ * @param {string[]} args - Resolved CLI arguments.
  * @returns {string | null} The prompt text, or null if not found.
  */
 function extractPromptFromArgs(args) {
@@ -99,7 +97,7 @@ function extractPromptFromArgs(args) {
  * both modes uniformly.
  *
  * All SDK events are serialised to a JSONL file under the session state directory
- * so that unified_timeline.cjs can render them in the step summary.
+ * so that unified_session.cjs can collect them for the step summary.
  *
  * @param {{
  *   sdkUri: string,
@@ -107,6 +105,7 @@ function extractPromptFromArgs(args) {
  *   logger: (msg: string) => void,
  *   attempt?: number,
  *   model?: string,
+ *   reasoningEffort?: string,
  *   connectionToken?: string,
  *   providers?: import("@github/copilot-sdk").NamedProviderConfig[],
  *   models?: import("@github/copilot-sdk").ProviderModelConfig[],
@@ -136,6 +135,7 @@ async function runWithCopilotSDK({
   logger,
   attempt = 0,
   model,
+  reasoningEffort,
   connectionToken,
   providers,
   models: providerModels,
@@ -166,7 +166,7 @@ async function runWithCopilotSDK({
   }
   log(`max-tool-denials threshold: ${maxToolDenialsLimit}`);
 
-  // Session state directory — mirrors the target path used by unified_timeline.cjs.
+  // Session state directory — mirrors the source path used by unified_session.cjs.
   // /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
   // GH_AW_SESSION_STATE_BASE_DIR may be set in tests to redirect writes to an isolated directory.
   const defaultSessionStateBase = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
@@ -237,7 +237,7 @@ async function runWithCopilotSDK({
    * Map from toolCallId → {toolName, mcpServerName} for enriching tool.execution_complete
    * events and for tracking in-flight tool calls when the idle-timeout fires.
    * Declared at function scope so the catch block can check pendingToolCalls.size.
-   * @type {Map<string, {toolName: string, mcpServerName: string}>}
+   * @type {Map<string, Record<string, any>>}
    */
   const pendingToolCalls = new Map();
 
@@ -257,6 +257,7 @@ async function runWithCopilotSDK({
   // pendingToolCalls may legitimately be empty before the model dispatches its
   // first tool call of the new turn.
   let inAssistantTurn = false;
+  const activeAssistantTurns = new Set();
 
   /**
    * Best-effort write of a driver-level event to events.jsonl and stderr.
@@ -322,14 +323,21 @@ async function runWithCopilotSDK({
       onDenied: requestSummary => recordToolDenial(`permission denied: ${requestSummary}`),
       workspaceRoot: process.env.GITHUB_WORKSPACE,
     });
+    const toolCallBudget = buildCopilotSDKToolCallBudget(toolConfig?.maxToolCalls, event => {
+      writeDriverEvent(event.exhausted ? "guard.tool_call_budget_exceeded" : "guard.tool_call_budget_debit", event);
+    });
 
     // Build session config using the multi-provider surface.
+    /** @type {any} */
+    const sdkReasoningEffort = reasoningEffort;
     /** @type {import("@github/copilot-sdk").SessionConfig} */
     const sessionConfig = {
       model: model || resolveModelWithFallback(process.env, "COPILOT_MODEL") || undefined,
+      ...(sdkReasoningEffort ? { reasoningEffort: sdkReasoningEffort } : {}),
       providers,
       models: providerModels,
       onPermissionRequest,
+      ...(toolCallBudget ? { hooks: { onPreToolUse: toolCallBudget.onPreToolUse } } : {}),
       ...buildCopilotSDKSessionToolConfig(toolConfig, sdk, webFetchOptions),
     };
     log(`creating session with model="${sessionConfig.model || "(none)"}" providers=${providers?.length ?? 0} models=${providerModels?.length ?? 0}`);
@@ -343,82 +351,64 @@ async function runWithCopilotSDK({
     eventsStream = fs.createWriteStream(eventsPath, { flags: "a" });
     // Snapshot to a non-null local for closure-safe writes (JSDoc nullability narrowing).
     const stream = eventsStream;
+    const assistantEvents = [];
     log(`serialising SDK events to ${eventsPath}`);
 
     /**
      * Write one JSONL entry to the events file and stderr.
-     * Uses the event's own ISO-8601 timestamp when available.
+     * Retains the native envelope, including an absent timestamp.
      *
      * @param {string} type
      * @param {any} data
      * @param {string | undefined} [timestamp]
+     * @param {Record<string, any>} [native]
      */
-    function writeEvent(type, data, timestamp) {
-      const entry = { type, timestamp: timestamp ?? new Date().toISOString(), data };
+    function writeEvent(type, data, timestamp, native = {}) {
+      const entry = { ...native, type, ...(timestamp !== undefined ? { timestamp } : {}), data };
       const jsonl = JSON.stringify(entry) + "\n";
       stream.write(jsonl);
       process.stderr.write(jsonl);
     }
 
-    // Subscribe to all session events and serialise the ones we care about.
     session.on(event => {
-      // Skip transient events that are not persisted by the server.
-      if (event.ephemeral) return;
+      if (event.ephemeral && !CAPTURED_EPHEMERAL_EVENTS.has(event.type)) return;
+      const data = { ...event.data };
+      const context = copilotSessionContext(event);
+      const scope = JSON.stringify([context.agentId, context.parentToolUseId]);
+      const toolKey = JSON.stringify([scope, data.toolCallId]);
 
       switch (event.type) {
-        case "user.message":
-          writeEvent("user.message", {}, event.timestamp);
-          break;
-
         case "tool.execution_start": {
-          const toolName = event.data?.toolName ?? "unknown";
-          const mcpServerName = event.data?.mcpServerName ?? "";
-          const toolCallId = event.data?.toolCallId;
-          const command = extractShellCommandFromToolData(event.data);
-          // The structured input carries the tool arguments (e.g. the skill name for
-          // the built-in `skill` tool); graders and log parsers need it to identify
-          // what was invoked, so persist it alongside the derived command text.
-          const input = extractStructuredToolInput(event.data);
-          if (toolCallId) {
-            pendingToolCalls.set(toolCallId, { toolName, mcpServerName });
+          if (!Object.hasOwn(data, "input")) {
+            for (const key of ["arguments", "parameters", "args", "toolInput"]) {
+              if (!Object.hasOwn(data, key)) continue;
+              data.input = data[key];
+              break;
+            }
           }
-          const eventData = {
-            toolName,
-            mcpServerName,
-            ...(event.data?.mcpToolName ? { mcpToolName: event.data.mcpToolName } : {}),
-            ...(toolCallId ? { toolCallId } : {}),
-            ...(input === undefined ? {} : { input }),
-            ...(command ? { command } : {}),
-          };
-          writeEvent("tool.execution_start", eventData, event.timestamp);
+          if (!Object.hasOwn(data, "command") && typeof data.input?.command === "string") data.command = data.input.command;
+          if (data.toolCallId !== undefined) pendingToolCalls.set(toolKey, data);
           break;
         }
 
         case "tool.execution_complete": {
-          const toolCallId = event.data?.toolCallId;
-          // Resolve toolName/mcpServerName from the matching start event when available.
-          const pending = toolCallId ? pendingToolCalls.get(toolCallId) : undefined;
-          const toolName = pending?.toolName ?? event.data?.toolDescription?.name ?? "unknown";
-          const mcpServerName = pending?.mcpServerName ?? "";
-          if (toolCallId) pendingToolCalls.delete(toolCallId);
-          const success = event.data?.success ?? !event.data?.error;
-          // Include result.content (concise LLM-facing output) so that the log
-          // parser can render tool output previews from events.jsonl directly.
-          const result = event.data?.result ?? undefined;
-          // max-tool-denials intentionally tracks permission denials only.
-          // Tool execution failures are still logged, but do not increment the guardrail counter.
-          writeEvent("tool.execution_complete", { toolName, mcpServerName, ...(toolCallId ? { toolCallId } : {}), success, result }, event.timestamp);
+          const pending = data.toolCallId !== undefined ? pendingToolCalls.get(toolKey) : undefined;
+          for (const key of ["toolName", "mcpServerName"]) {
+            if (!Object.hasOwn(data, key) && pending && Object.hasOwn(pending, key)) data[key] = pending[key];
+          }
+          if (!Object.hasOwn(data, "toolName") && data.toolDescription?.name !== undefined) data.toolName = data.toolDescription.name;
+          if (data.toolCallId !== undefined) pendingToolCalls.delete(toolKey);
           break;
         }
 
         case "assistant.message": {
-          const content = event.data?.content ?? "";
-          if (content) {
+          assistantEvents.push(event);
+          const content = data.content;
+          if (typeof content === "string" && content && context.agentId === undefined && !context.parentToolUseId) {
             hasOutput = true;
             output += content;
             assistantTurnCount++;
           }
-          writeEvent("assistant.message", { content }, event.timestamp);
           break;
         }
 
@@ -426,6 +416,7 @@ async function runWithCopilotSDK({
           // LLM inference started for a new turn. Disarm the watchdog — the model
           // may not have dispatched any tool calls yet, so pendingToolCalls can be
           // empty while real work is still in progress.
+          activeAssistantTurns.add(scope);
           inAssistantTurn = true;
           if (postCompletionWatchdog) {
             clearTimeout(postCompletionWatchdog);
@@ -436,45 +427,11 @@ async function runWithCopilotSDK({
         case "assistant.turn_end":
           // LLM inference finished. Allow the watchdog to re-arm on the next event
           // that satisfies the completion conditions.
-          inAssistantTurn = false;
-          break;
-
-        case "session.task_complete":
-          writeEvent("session.task_complete", { success: event.data?.success, summary: event.data?.summary }, event.timestamp);
-          break;
-
-        case "subagent.started":
-          writeEvent(
-            "subagent.started",
-            {
-              agentName: event.data?.agentName,
-              agentDisplayName: event.data?.agentDisplayName,
-              toolCallId: event.data?.toolCallId,
-            },
-            event.timestamp
-          );
-          break;
-
-        case "subagent.completed":
-          writeEvent("subagent.completed", { agentName: event.data?.agentName, toolCallId: event.data?.toolCallId }, event.timestamp);
-          break;
-
-        case "subagent.failed":
-          writeEvent(
-            "subagent.failed",
-            {
-              agentName: event.data?.agentName,
-              toolCallId: event.data?.toolCallId,
-              error: event.data?.error,
-            },
-            event.timestamp
-          );
-          break;
-
-        default:
-          // Other event types are not consumed by unified_timeline.cjs; skip them.
+          activeAssistantTurns.delete(scope);
+          inAssistantTurn = activeAssistantTurns.size > 0;
           break;
       }
+      writeEvent(event.type, data, event.timestamp, event);
 
       // After processing each event, update the post-completion watchdog:
       // - Arm (or rearm) the watchdog when the session looks complete: output
@@ -520,8 +477,10 @@ async function runWithCopilotSDK({
     // sendAndWait returns the last assistant.message event; capture its content
     // as a fallback in case the on() handler missed it.
     if (result && !hasOutput) {
-      const content = result.data?.content ?? "";
-      if (content) {
+      if (!assistantEvents.some(event => isDeepStrictEqual(event, result))) writeEvent("assistant.message", result.data, result.timestamp, result);
+      const context = copilotSessionContext(result);
+      const content = result.data?.content;
+      if (typeof content === "string" && content && context.agentId === undefined && !context.parentToolUseId) {
         output = content;
         hasOutput = true;
         assistantTurnCount++;
@@ -556,6 +515,8 @@ async function runWithCopilotSDK({
       log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
       return { exitCode: 0, output, hasOutput, durationMs };
     }
+
+    writeDriverEvent("session.error", { errorType: "sdk_driver", message: failure.message, ...("code" in failure ? { code: failure.code } : {}) });
 
     // Preserve any output collected before the error so the harness can use it
     // for retry decisions and diagnostics.

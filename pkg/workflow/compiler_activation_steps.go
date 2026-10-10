@@ -41,6 +41,14 @@ func (c *Compiler) addActivationSecretValidationStep(ctx *activationJobBuildCont
 		}
 		stepIDs = append(stepIDs, "validate-secret")
 	}
+	for _, step := range buildFallbackProviderValidationSteps(ctx.data) {
+		for _, line := range step {
+			ctx.steps = append(ctx.steps, line+"\n")
+			if id, ok := strings.CutPrefix(line, "        id: "); ok {
+				stepIDs = append(stepIDs, id)
+			}
+		}
+	}
 	for i, secretValidationStep := range buildSafeOutputSecretValidationSteps(ctx.data) {
 		for _, line := range secretValidationStep {
 			ctx.steps = append(ctx.steps, line+"\n")
@@ -63,17 +71,6 @@ func (c *Compiler) addActivationSecretValidationStep(ctx *activationJobBuildCont
 	}
 	ctx.outputs["secret_verification_result"] = fmt.Sprintf("${{ (%s) && 'failed' || 'success' }}", strings.Join(failureChecks, " || "))
 	compilerActivationJobLog.Printf("Added %d secret validation step(s) to activation job", len(stepIDs))
-}
-
-func (c *Compiler) addActivationDockerSbxSecretsCheckStep(ctx *activationJobBuildContext) {
-	if !isDockerSbxRuntime(ctx.data) {
-		return
-	}
-	for _, line := range generateDockerSbxActivationSecretsCheckStep() {
-		ctx.steps = append(ctx.steps, line+"\n")
-	}
-	ctx.outputs["docker_sbx_secrets_result"] = "${{ steps.docker-sbx-secrets.outputs.verification_result }}"
-	compilerActivationJobLog.Printf("Added docker-sbx Docker Hub secrets check to activation job")
 }
 
 // addActivationOAuthTokenCheckStep adds a step to the activation job that checks
@@ -172,7 +169,7 @@ func (c *Compiler) addActivationCheckoutAndBaseRestoreStep(ctx *activationJobBui
 	data := ctx.data
 	checkoutSteps := c.generateCheckoutGitHubFolderForActivation(data)
 	ctx.steps = append(ctx.steps, checkoutSteps...)
-	if len(checkoutSteps) > 0 {
+	if len(checkoutSteps) > 0 && (!isPRCheckoutDisabled(data) || dynamicWorkflowsEnabled(ctx.engine, data.EngineConfig)) {
 		compilerActivationJobLog.Print("Adding step to save agent config folders for base branch restoration")
 		folders, files := resolveAgentManifestPaths(c.engineRegistry, data)
 		ctx.steps = append(ctx.steps, generateSaveBaseGitHubFoldersStep(
@@ -301,7 +298,8 @@ func (c *Compiler) resolveFrontmatterSkillToken(ctx *activationJobBuildContext, 
 		return tokenExpr
 	}
 	stepID := fmt.Sprintf("frontmatter-skill-app-token-%d", stepNumber)
-	ctx.steps = append(ctx.steps, c.buildGitHubAppTokenMintStepWithMeta(
+	ctx.steps = append(ctx.steps, c.buildGitHubAppTokenMintStepForJob(
+		"activation",
 		skillRef.GitHubApp,
 		nil,
 		"",

@@ -2,7 +2,8 @@
 private: true
 emoji: "📅"
 description: Daily report analyzing repository issues with clustering, metrics, and trend charts
-on: daily
+on:
+  workflow_dispatch:
 max-daily-ai-credits: 10000
 permissions:
   contents: read
@@ -22,6 +23,9 @@ sandbox:
   agent:
     id: awf
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   github:
     mode: gh-proxy
@@ -48,6 +52,7 @@ experiments:
     analysis_type: mann_whitney
     tags: [output, readability, engagement]
 imports:
+  - shared/daily-report-worker.md
   - shared/github-guard-policy.md
   - uses: shared/daily-audit-base.md
     with:
@@ -265,19 +270,11 @@ Use the `upload asset` tool to upload both charts:
 2. Upload `/tmp/gh-aw/python/charts/issue_clusters.png`
 3. Collect the returned URLs for embedding in the discussion
 
-## Phase 5: Close Previous Discussions
-
-Before creating the new discussion, find and close previous daily issues discussions:
-
-1. Search for discussions with title prefix "[daily issues]"
-2. Close each found discussion with reason "OUTDATED"
-3. Add a closing comment: "This discussion has been superseded by a newer daily issues report."
-
-Use the `close_discussion` safe output for each discussion found.
-
-## Phase 6: Create Discussion Report
+## Phase 5: Create Discussion Report
 
 Create a new discussion with the comprehensive report.
+
+Older daily issues discussions are closed automatically by `close-older-discussions: true` via `shared/daily-audit-discussion.md`.
 
 **Formatting Guideline**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. The discussion title serves as h1, so all content headers should start at h3.
 

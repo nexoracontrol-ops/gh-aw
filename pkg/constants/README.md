@@ -57,7 +57,6 @@ The package also acts as the authoritative source for the generated workflow con
 | `MCPGatewayFeatureFlag` | `FeatureFlag` | `"mcp-gateway"` | Enables MCP gateway workflow support. |
 | `DisableXPIAPromptFeatureFlag` | `FeatureFlag` | `"disable-xpia-prompt"` | Disables the XPIA prompt path. |
 | `DIFCProxyFeatureFlag` | `FeatureFlag` | `"difc-proxy"` | Deprecated integrity proxy flag kept for compatibility. |
-| `CliProxyFeatureFlag` | `FeatureFlag` | `"cli-proxy"` | Enables the AWF CLI proxy sidecar path. |
 | `AwfDiagnosticLogsFeatureFlag` | `FeatureFlag` | `"awf-diagnostic-logs"` | Enables AWF failure diagnostics capture. |
 | `ByokCopilotFeatureFlag` | `FeatureFlag` | `"byok-copilot"` | Deprecated legacy Copilot BYOK flag. |
 | `IntegrityReactionsFeatureFlag` | `FeatureFlag` | `"integrity-reactions"` | Enables reaction-based integrity promotion and demotion. |
@@ -74,6 +73,7 @@ The package also acts as the authoritative source for the generated workflow con
 | `SafeOutputsHyphenJobName` | `JobName` | `"safe-outputs"` | Hyphenated compatibility alias for the safe-outputs job. |
 | `UploadAssetsJobName` | `JobName` | `"upload_assets"` | Built-in asset-upload job identifier. |
 | `UploadCodeScanningJobName` | `JobName` | `"upload_code_scanning_sarif"` | Built-in SARIF upload job identifier. |
+| `UploadCodeCoverageJobName` | `JobName` | `"upload_code_coverage"` | Built-in code-coverage upload job identifier. |
 | `ConclusionJobName` | `JobName` | `"conclusion"` | Built-in conclusion job identifier. |
 | `UnlockJobName` | `JobName` | `"unlock"` | Built-in unlock job identifier. |
 | `GitHubMCPServerID` | `MCPServerID` | `"github"` | Built-in GitHub MCP server identifier. |

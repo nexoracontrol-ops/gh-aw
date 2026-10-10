@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -73,11 +74,23 @@ func TestGetValidationConfigJSON(t *testing.T) {
 	}
 }
 
+func TestNoOpValidationConfig(t *testing.T) {
+	config, ok := ValidationConfig["noop"]
+	if !ok {
+		t.Fatal("noop not found in ValidationConfig")
+	}
+
+	if config.DefaultMax != 2 {
+		t.Errorf("noop DefaultMax = %d, want 2", config.DefaultMax)
+	}
+}
+
 func TestApproveWorkflowRunValidationConfig(t *testing.T) {
 	config, ok := ValidationConfig["approve_workflow_run"]
 	if !ok {
 		t.Fatal("approve_workflow_run not found in ValidationConfig")
 	}
+
 	if config.DefaultMax != 1 {
 		t.Errorf("approve_workflow_run DefaultMax = %d, want 1", config.DefaultMax)
 	}
@@ -99,6 +112,15 @@ func TestApproveWorkflowRunValidationConfig(t *testing.T) {
 	}
 	if runID := parsedConfig.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
 		t.Errorf("approve_workflow_run generated run_id = %+v, want required positive integer", runID)
+	}
+}
+
+func TestJiraCreateIssueValidationPreservesTemporaryID(t *testing.T) {
+	config := ValidationConfig["jira_create_issue"]
+	temporaryID := config.Fields["temporary_id"]
+
+	if !temporaryID.Required || !temporaryID.TemporaryID || temporaryID.Pattern != "^#aw_[A-Za-z0-9_]{3,12}$" {
+		t.Errorf("jira_create_issue temporary_id = %+v, want required temporary ID", temporaryID)
 	}
 }
 
@@ -335,6 +357,36 @@ func TestGetValidationConfigJSONWithDataSchema(t *testing.T) {
 	}
 }
 
+func TestValidationConfigCollapseData(t *testing.T) {
+	for typeName, config := range ValidationConfig {
+		if want := typeName == "create_issue"; config.CollapseData != want {
+			t.Errorf("%s CollapseData = %t, want %t", typeName, config.CollapseData, want)
+		}
+	}
+
+	for _, dataEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dataEnabled=%t", dataEnabled), func(t *testing.T) {
+			jsonStr, err := GetValidationConfigJSONWithDataSchema(dataSchemaBodyTypes, nil, dataEnabled, nil)
+			if err != nil {
+				t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+			}
+			var parsed map[string]map[string]any
+			if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+				t.Fatalf("Failed to parse validation config JSON: %v", err)
+			}
+			for _, typeName := range dataSchemaBodyTypes {
+				if typeName == "create_issue" {
+					if parsed[typeName]["collapseData"] != true {
+						t.Error("expected create_issue collapseData to be true")
+					}
+				} else if _, ok := parsed[typeName]["collapseData"]; ok {
+					t.Errorf("did not expect %s collapseData to be present", typeName)
+				}
+			}
+		})
+	}
+}
+
 func containsNewline(s string) bool {
 	for _, r := range s {
 		if r == '\n' {
@@ -460,6 +512,10 @@ func TestUpdateIssueValidationConfig(t *testing.T) {
 	if _, ok := config.Fields["labels"]; !ok {
 		t.Error("update_issue Fields is missing the 'labels' field")
 	}
+	milestone, ok := config.Fields["milestone"]
+	if !ok || !milestone.OptionalPositiveInteger || !milestone.AllowNull {
+		t.Errorf("update_issue milestone must accept positive integers and preserve explicit null, got %+v", milestone)
+	}
 }
 
 func TestIssueIntentValidationFields(t *testing.T) {
@@ -584,6 +640,33 @@ func TestValidationConfigCoversToolInputSchemas(t *testing.T) {
 				t.Errorf("%s tool input %q is missing from ValidationConfig", tool.Name, fieldName)
 			}
 		}
+	}
+}
+
+func TestValidationConfigCoversInjectedToolProperties(t *testing.T) {
+	configs := map[string]*SafeOutputsConfig{
+		"omitted state-reason": {
+			CloseIssues: &CloseIssuesConfig{},
+		},
+		"list state-reason and allowed-events": {
+			CloseIssues: &CloseIssuesConfig{AllowedStateReason: []string{"completed", "duplicate"}},
+			SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+				AllowedEvents: []string{"APPROVE", "COMMENT"},
+			},
+		},
+	}
+
+	for name, safeOutputs := range configs {
+		t.Run(name, func(t *testing.T) {
+			injections := computePropertyInjections(safeOutputs)
+			for toolName, properties := range injections {
+				for propertyName := range properties {
+					if _, ok := ValidationConfig[toolName].Fields[propertyName]; !ok {
+						t.Errorf("%s injected property %q is missing from ValidationConfig", toolName, propertyName)
+					}
+				}
+			}
+		})
 	}
 }
 

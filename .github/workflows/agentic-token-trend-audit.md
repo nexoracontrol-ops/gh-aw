@@ -31,9 +31,6 @@ safe-outputs:
   upload-asset:
     max: 5
     allowed-exts: [.png, .jpg, .jpeg, .svg]
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 tools:
   agentic-workflows:
   bash:
@@ -100,8 +97,8 @@ evals:
 
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.3-codex
+  model-provider: github
+model: copilot/gpt-6-sol
 ---
 
 # On-Demand Agentic Workflow AIC Trend Audit

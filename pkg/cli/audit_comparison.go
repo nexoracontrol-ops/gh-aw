@@ -21,18 +21,31 @@ var auditComparisonLog = logger.New("cli:audit_comparison")
 type AuditComparisonData struct {
 	BaselineFound  bool                           `json:"baseline_found"`
 	Baseline       *AuditComparisonBaseline       `json:"baseline,omitempty"`
+	ModelRouting   *AuditComparisonRoute          `json:"model_routing,omitempty"`
 	Delta          *AuditComparisonDelta          `json:"delta,omitempty"`
 	Classification *AuditComparisonClassification `json:"classification,omitempty"`
 	Recommendation *AuditComparisonRecommendation `json:"recommendation,omitempty"`
 }
 
 type AuditComparisonBaseline struct {
-	RunID        int64    `json:"run_id"`
-	WorkflowName string   `json:"workflow_name,omitempty"`
-	Conclusion   string   `json:"conclusion,omitempty"`
-	CreatedAt    string   `json:"created_at,omitempty"`
-	Selection    string   `json:"selection,omitempty"`
-	MatchedOn    []string `json:"matched_on,omitempty"`
+	RunID        int64                 `json:"run_id"`
+	WorkflowName string                `json:"workflow_name,omitempty"`
+	Conclusion   string                `json:"conclusion,omitempty"`
+	CreatedAt    string                `json:"created_at,omitempty"`
+	Selection    string                `json:"selection,omitempty"`
+	MatchedOn    []string              `json:"matched_on,omitempty"`
+	ModelRouting *AuditComparisonRoute `json:"model_routing,omitempty"`
+}
+
+type AuditComparisonRoute struct {
+	Model             string                  `json:"model,omitempty"`
+	Effort            string                  `json:"effort,omitempty"`
+	Mode              string                  `json:"mode,omitempty"`
+	RouterVersion     string                  `json:"router_version,omitempty"`
+	EffectiveEndpoint string                  `json:"effective_endpoint,omitempty"`
+	SelectedEndpoint  string                  `json:"selected_endpoint,omitempty"`
+	MainAgentCost     ModelRoutingCost        `json:"main_agent_cost,omitzero"`
+	SubagentCosts     []ModelRoutingAgentCost `json:"subagent_costs,omitempty"`
 }
 
 type AuditComparisonDelta struct {
@@ -40,6 +53,13 @@ type AuditComparisonDelta struct {
 	Posture         AuditComparisonStringDelta      `json:"posture"`
 	BlockedRequests AuditComparisonIntDelta         `json:"blocked_requests"`
 	MCPFailure      *AuditComparisonMCPFailureDelta `json:"mcp_failure,omitempty"`
+	ModelRouting    *AuditComparisonRouteDelta      `json:"model_routing,omitempty"`
+}
+
+type AuditComparisonRouteDelta struct {
+	Before  *AuditComparisonRoute `json:"before,omitempty"`
+	After   *AuditComparisonRoute `json:"after,omitempty"`
+	Changed bool                  `json:"changed"`
 }
 
 type AuditComparisonIntDelta struct {
@@ -74,6 +94,7 @@ type auditComparisonSnapshot struct {
 	Posture         string
 	BlockedRequests int
 	MCPFailures     []string
+	ModelRouting    *AuditComparisonRoute
 }
 
 type auditComparisonCandidate struct {
@@ -99,7 +120,29 @@ func buildAuditComparisonSnapshot(processedRun ProcessedRun, createdItems []Crea
 		Posture:         deriveAuditPosture(createdItems),
 		BlockedRequests: blockedRequests,
 		MCPFailures:     collectMCPFailureServers(processedRun.MCPFailures),
+		ModelRouting:    modelRoutingComparisonRoute(processedRun.ModelRouting),
 	}
+}
+
+func modelRoutingComparisonRoute(routing *ModelRoutingSummary) *AuditComparisonRoute {
+	if routing == nil || routing.SelectedModel == "" {
+		return nil
+	}
+	return &AuditComparisonRoute{
+		Model: routing.SelectedModel, Effort: routing.SelectedEffort,
+		Mode: routing.Mode, RouterVersion: routing.RouterVersion,
+		EffectiveEndpoint: routing.EffectiveEndpoint, SelectedEndpoint: routing.SelectedEndpoint,
+		MainAgentCost: routing.MainAgentCost, SubagentCosts: routing.SubagentCosts,
+	}
+}
+
+func sameModelRoutingRoute(left, right *AuditComparisonRoute) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Model == right.Model && left.Effort == right.Effort &&
+		left.Mode == right.Mode && left.RouterVersion == right.RouterVersion &&
+		left.EffectiveEndpoint == right.EffectiveEndpoint && left.SelectedEndpoint == right.SelectedEndpoint
 }
 
 func loadAuditComparisonSnapshotFromArtifacts(run WorkflowRun, logsPath string, verbose bool) (auditComparisonSnapshot, error) {
@@ -133,12 +176,18 @@ func loadAuditComparisonSnapshotFromArtifacts(run WorkflowRun, logsPath string, 
 		Posture:         deriveAuditPosture(extractCreatedItemsFromManifest(logsPath)),
 		BlockedRequests: blockedRequests,
 		MCPFailures:     collectMCPFailureServers(mcpFailures),
+		ModelRouting:    modelRoutingComparisonRoute(analyzeModelRouting(logsPath)),
 	}, nil
 }
 
 func buildAuditComparisonCandidateFromSummary(summary *RunSummary, logsPath string) auditComparisonCandidate {
 	createdItems := resolveCreatedItems(logsPath, summary.SafeOutputs)
 	posture := deriveAuditPosture(createdItems)
+	routing := summary.ModelRouting
+	if routing == nil {
+		// Older cached summaries do not contain model-routing data.
+		routing = analyzeModelRouting(logsPath)
+	}
 
 	blockedRequests := 0
 	if summary.FirewallAnalysis != nil {
@@ -152,6 +201,7 @@ func buildAuditComparisonCandidateFromSummary(summary *RunSummary, logsPath stri
 			Posture:         posture,
 			BlockedRequests: blockedRequests,
 			MCPFailures:     collectMCPFailureServers(summary.MCPFailures),
+			ModelRouting:    modelRoutingComparisonRoute(routing),
 		},
 		TaskDomain:          summary.TaskDomain,
 		BehaviorFingerprint: summary.BehaviorFingerprint,
@@ -288,7 +338,10 @@ func selectAuditComparisonBaseline(current ProcessedRun, candidates []auditCompa
 		}
 	})
 
-	return &candidates[0]
+	for _, candidate := range candidates {
+		return &candidate
+	}
+	return nil
 }
 
 func sameAuditComparisonWorkflow(left WorkflowRun, right WorkflowRun) bool {
@@ -341,9 +394,49 @@ func buildAuditComparison(currentConclusion string, current auditComparisonSnaps
 		return &AuditComparisonData{BaselineFound: false}
 	}
 
-	reasonCodes := make([]string, 0, 4)
 	currentConclusion = strings.TrimSpace(strings.ToLower(currentConclusion))
 	currentRunUnsuccessful := currentConclusion != "" && currentConclusion != "success"
+	delta, reasonCodes := buildAuditComparisonDelta(current, *baseline, currentRunUnsuccessful)
+	newMCPFailure := len(baseline.MCPFailures) == 0 && len(current.MCPFailures) > 0
+	mcpFailuresResolved := len(baseline.MCPFailures) > 0 && len(current.MCPFailures) == 0
+	if newMCPFailure || len(baseline.MCPFailures) > 0 || len(current.MCPFailures) > 0 {
+		delta.MCPFailure = &AuditComparisonMCPFailureDelta{
+			Before:       baseline.MCPFailures,
+			After:        current.MCPFailures,
+			NewlyPresent: newMCPFailure,
+		}
+	}
+	if newMCPFailure {
+		reasonCodes = append(reasonCodes, "new_mcp_failure")
+	} else if mcpFailuresResolved {
+		reasonCodes = append(reasonCodes, "mcp_failures_resolved")
+	}
+	label := classifyAuditComparison(currentRunUnsuccessful, newMCPFailure, mcpFailuresResolved, current, *baseline, delta, reasonCodes)
+
+	return &AuditComparisonData{
+		BaselineFound: true,
+		Baseline: &AuditComparisonBaseline{
+			RunID:        baselineRun.DatabaseID,
+			WorkflowName: baselineRun.WorkflowName,
+			Conclusion:   baselineRun.Conclusion,
+			CreatedAt:    baselineRun.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			Selection:    "latest_success",
+			ModelRouting: baseline.ModelRouting,
+		},
+		ModelRouting: current.ModelRouting,
+		Delta:        delta,
+		Classification: &AuditComparisonClassification{
+			Label:       label,
+			ReasonCodes: reasonCodes,
+		},
+		Recommendation: &AuditComparisonRecommendation{
+			Action: recommendAuditComparisonAction(label, currentConclusion, delta),
+		},
+	}
+}
+
+func buildAuditComparisonDelta(current, baseline auditComparisonSnapshot, currentRunUnsuccessful bool) (*AuditComparisonDelta, []string) {
+	reasonCodes := make([]string, 0, 4)
 	delta := &AuditComparisonDelta{
 		Turns: AuditComparisonIntDelta{
 			Before:  baseline.Turns,
@@ -360,6 +453,16 @@ func buildAuditComparison(currentConclusion string, current auditComparisonSnaps
 			After:   current.BlockedRequests,
 			Changed: baseline.BlockedRequests != current.BlockedRequests,
 		},
+	}
+	if current.ModelRouting != nil || baseline.ModelRouting != nil {
+		delta.ModelRouting = &AuditComparisonRouteDelta{
+			Before:  baseline.ModelRouting,
+			After:   current.ModelRouting,
+			Changed: !sameModelRoutingRoute(current.ModelRouting, baseline.ModelRouting),
+		}
+		if delta.ModelRouting.Changed {
+			reasonCodes = append(reasonCodes, "model_routing_changed")
+		}
 	}
 
 	if current.Turns > baseline.Turns {
@@ -378,22 +481,10 @@ func buildAuditComparison(currentConclusion string, current auditComparisonSnaps
 	if currentRunUnsuccessful {
 		reasonCodes = append(reasonCodes, "run_unsuccessful")
 	}
+	return delta, reasonCodes
+}
 
-	newMCPFailure := len(baseline.MCPFailures) == 0 && len(current.MCPFailures) > 0
-	mcpFailuresResolved := len(baseline.MCPFailures) > 0 && len(current.MCPFailures) == 0
-	if newMCPFailure || len(baseline.MCPFailures) > 0 || len(current.MCPFailures) > 0 {
-		delta.MCPFailure = &AuditComparisonMCPFailureDelta{
-			Before:       baseline.MCPFailures,
-			After:        current.MCPFailures,
-			NewlyPresent: newMCPFailure,
-		}
-	}
-	if newMCPFailure {
-		reasonCodes = append(reasonCodes, "new_mcp_failure")
-	} else if mcpFailuresResolved {
-		reasonCodes = append(reasonCodes, "mcp_failures_resolved")
-	}
-
+func classifyAuditComparison(currentRunUnsuccessful, newMCPFailure, mcpFailuresResolved bool, current, baseline auditComparisonSnapshot, delta *AuditComparisonDelta, reasonCodes []string) string {
 	label := "stable"
 	switch {
 	case currentRunUnsuccessful:
@@ -413,25 +504,7 @@ func buildAuditComparison(currentConclusion string, current auditComparisonSnaps
 	case len(reasonCodes) > 0:
 		label = "changed"
 	}
-
-	return &AuditComparisonData{
-		BaselineFound: true,
-		Baseline: &AuditComparisonBaseline{
-			RunID:        baselineRun.DatabaseID,
-			WorkflowName: baselineRun.WorkflowName,
-			Conclusion:   baselineRun.Conclusion,
-			CreatedAt:    baselineRun.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			Selection:    "latest_success",
-		},
-		Delta: delta,
-		Classification: &AuditComparisonClassification{
-			Label:       label,
-			ReasonCodes: reasonCodes,
-		},
-		Recommendation: &AuditComparisonRecommendation{
-			Action: recommendAuditComparisonAction(label, currentConclusion, delta),
-		},
-	}
+	return label
 }
 
 func recommendAuditComparisonAction(label, currentConclusion string, delta *AuditComparisonDelta) string {
@@ -444,7 +517,6 @@ func recommendAuditComparisonAction(label, currentConclusion string, delta *Audi
 	if delta == nil || label == "stable" {
 		return "No action needed; this run matches the selected successful baseline closely."
 	}
-
 	if delta.Posture.Before == "read_only" && delta.Posture.After == "write_capable" {
 		return "Review first-time write-capable behavior and add a guardrail before enabling by default."
 	}
@@ -453,6 +525,9 @@ func recommendAuditComparisonAction(label, currentConclusion string, delta *Audi
 	}
 	if delta.BlockedRequests.After > delta.BlockedRequests.Before {
 		return "Review network policy changes before treating the new blocked requests as normal behavior."
+	}
+	if delta.ModelRouting != nil && delta.ModelRouting.Changed {
+		return "Review the model-routing change against the selected successful baseline, including the selected model, effort, mode, and router version."
 	}
 	if delta.Turns.After > delta.Turns.Before {
 		return "Compare prompt or task-shape changes because this run needed more turns than the selected successful baseline."

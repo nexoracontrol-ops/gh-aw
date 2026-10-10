@@ -59,9 +59,40 @@ sandbox:
   agent:
     id: awf
     runtime: cloud-hypervisor
+    config:
+      filesystem:
+        allow-write:
+          - /tmp/gh-aw/agent
+          - /workspace/.github/aw
+          - /workspace/.github/agents
 tools:
   cli-proxy: true
   cache-memory: true
+  ledger:
+    caveman-run-history:
+      type: table
+      key: run_id
+      schema:
+        type: object
+        required: [record_type, run_id, date, files_processed, files_optimized, planned_outcome]
+        properties:
+          record_type:
+            enum: [caveman_run]
+          run_id:
+            type: string
+          date:
+            type: string
+          files_processed:
+            type: integer
+            minimum: 0
+          files_optimized:
+            type: integer
+            minimum: 0
+          planned_outcome:
+            enum: [pull_request_requested, noop]
+        additionalProperties: false
+      max-record-kb: 4
+      max-patch-kb: 10
   github:
     mode: local
     toolsets: [default]
@@ -155,6 +186,7 @@ Expected format:
 - If the file does not exist, this is the first run and the cache is intentionally empty. Do **not** call `missing_data` — proceed normally. Count the total number of files in the sorted list (`TOTAL=$(...)`) and pick a **random** starting index with `$(( RANDOM % TOTAL ))`. This avoids always processing the same files first when the cache is cold.
 - If the queue in cache differs from the current file list (files added/removed), rebuild the queue from the current sorted list and reset the index to 0.
 - Pick the **next 5 files** starting from `last_processed_index + 1` (wrapping around if needed). This is your **batch** for this run.
+- **Keep cache-memory for the round-robin cursor.** Use the Git-backed ledger only for durable run audit records.
 
 ## Step 3: Analyze and Optimize Each File
 
@@ -210,7 +242,37 @@ Write the updated state to `/tmp/gh-aw/cache-memory/caveman-optimizer/state.json
 
 Use filesystem-safe format `YYYY-MM-DD` for the date (no colons, no T, no Z).
 
-## Step 5: Output
+## Step 5: Record the Run
+
+Before requesting a PR or `noop`, query the replay projection at `/tmp/gh-aw/ledgers/caveman-run-history/ledger.db` for a run whose ID matches `${{ github.run_id }}`:
+
+```sql
+SELECT key, value FROM state
+WHERE key = '${{ github.run_id }}'
+LIMIT 1;
+```
+
+If replay is reported unavailable, use the generic `records` history instead of querying replay tables.
+If absent, call `ledger_append` exactly once with the following shape, replacing the date, counts, and planned outcome with this run's values:
+
+```json
+{
+  "ledger": "caveman-run-history",
+  "operation": "upsert",
+  "value": {
+    "record_type": "caveman_run",
+    "run_id": "${{ github.run_id }}",
+    "date": "2026-10-05",
+    "files_processed": 5,
+    "files_optimized": 0,
+    "planned_outcome": "noop"
+  }
+}
+```
+
+Keep `value.run_id` a quoted string; it is the table primary key. Do not add a top-level `key` or fields beyond this schema. Use `pull_request_requested` when requesting a PR, otherwise `noop`. Do not include file contents or raw analysis notes. Do not edit ledger branches directly.
+
+## Step 6: Output
 
 **If you made changes to any files**, create a pull request using `create_pull_request`:
 

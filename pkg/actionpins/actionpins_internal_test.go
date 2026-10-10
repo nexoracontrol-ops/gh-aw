@@ -30,6 +30,33 @@ type fixedResolver struct {
 	called int
 }
 
+func TestResolveActionPin_AlreadyPinnedSourceVersion(t *testing.T) {
+	const sha = "c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+	const repo = "Swatinem/rust-cache"
+	for _, tt := range []struct {
+		name  string
+		label string
+		want  string
+	}{
+		{"unlabelled", "", repo + "@" + sha},
+		{"source label", "v2.9.1", repo + "@" + sha + " # v2.9.1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := &PinContext{SourceVersions: map[string]string{repo + "@" + sha: tt.label}}
+			got, err := ResolveActionPin(repo, sha, ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	pin := GetActionPinsByRepo("actions/checkout")[0]
+	got, err := ResolveActionPin(pin.Repo, pin.SHA, &PinContext{
+		SourceVersions: map[string]string{pin.Repo + "@" + pin.SHA: "v0.0.0"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, pin.Repo+"@"+pin.SHA+" # "+pin.Version, got)
+}
+
 func (r *fixedResolver) ResolveSHA(_ context.Context, _, _ string) (string, error) {
 	r.called++
 	return r.sha, nil
@@ -83,6 +110,21 @@ func TestResolveActionPin_GHESMappingTakesPrecedence(t *testing.T) {
 	assert.Contains(t, got, "enterprise/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	assert.NotContains(t, got, "c6a366c94c3e0affe28c06c8df20a878f24da3cf")
 	assert.Equal(t, 1, resolver.called, "mapped enterprise action should use normal resolution")
+}
+
+func TestResolveActionPin_UnresolvedExactMappingFails(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{"internal/missing@v1", ""} {
+		t.Run(target, func(t *testing.T) {
+			_, err := ResolveActionPin("actions/github-script", "v9", &PinContext{
+				Resolver: &countingResolver{},
+				Mappings: map[string]string{"actions/github-script@v9": target},
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "action pin mapping")
+		})
+	}
 }
 
 func TestBuildByRepoIndex_GroupsByRepoAndSortsDescending(t *testing.T) {
@@ -293,12 +335,36 @@ func TestFormatPinnedActionWithResolution_ConsistentVersionComment(t *testing.T)
 			expected:        "actions/checkout@abc123 # v4.1.2",
 		},
 		{
-			name:            "shows both versions when source differs from resolved",
+			name:            "uses more precise resolved tag",
 			repo:            "actions/checkout",
 			sha:             "abc123",
 			sourceVersion:   "v4",
 			resolvedVersion: "v4.1.2",
-			expected:        "actions/checkout@abc123 # v4.1.2 (source v4)",
+			expected:        "actions/checkout@abc123 # v4.1.2",
+		},
+		{
+			name:            "preserves exact source release tag over resolved major",
+			repo:            "actions/github-script",
+			sha:             "abc123",
+			sourceVersion:   "v9.0.0",
+			resolvedVersion: "v9",
+			expected:        "actions/github-script@abc123 # v9.0.0",
+		},
+		{
+			name:            "does not prefer an unverified source minor tag",
+			repo:            "actions/github-script",
+			sha:             "abc123",
+			sourceVersion:   "v9.999",
+			resolvedVersion: "v9",
+			expected:        "actions/github-script@abc123 # v9",
+		},
+		{
+			name:            "uses resolved tag when source refers to another major",
+			repo:            "actions/github-script",
+			sha:             "abc123",
+			sourceVersion:   "v8",
+			resolvedVersion: "v9",
+			expected:        "actions/github-script@abc123 # v9",
 		},
 		{
 			name:            "shows resolved version without source suffix when sourceVersion is empty",
@@ -455,6 +521,74 @@ func TestFindVersionBySHA_ReturnsVersionForKnownSHA(t *testing.T) {
 			assert.Equal(t, tt.want, version, "should return empty string when version is not found")
 		})
 	}
+}
+
+func TestGetActionPinsByRepo_ReturnsCopy(t *testing.T) {
+	t.Parallel()
+
+	const repo = "actions-ecosystem/action-add-labels"
+	original := GetActionPinsByRepo(repo)
+	require.NotEmpty(t, original, "prerequisite: embedded pins must exist for "+repo)
+
+	pins := GetActionPinsByRepo(repo)
+	require.NotEmpty(t, pins, "prerequisite: embedded pins must exist for "+repo)
+
+	pinIndex := -1
+	var inputKey string
+	var input *ActionYAMLInput
+	for i := range pins {
+		for name, candidate := range pins[i].Inputs {
+			if candidate != nil {
+				pinIndex = i
+				inputKey = name
+				input = candidate
+				break
+			}
+		}
+		if input != nil {
+			break
+		}
+	}
+	require.NotNil(t, input, "prerequisite: embedded pins must include an action input")
+
+	input.Description = "mutated description"
+	delete(pins[pinIndex].Inputs, inputKey)
+	pins[0] = ActionPin{Repo: "mutated/repo", Version: "mutated", SHA: "mutated"}
+
+	fresh := GetActionPinsByRepo(repo)
+	require.NotEmpty(t, fresh, "prerequisite: embedded pins must remain available")
+	assert.Equal(t, original[0], fresh[0], "mutating a returned slice must not change the cached pins")
+	assert.Equal(t, original[pinIndex], fresh[pinIndex], "mutating nested inputs must not change cached pins")
+}
+
+func TestGetLatestActionPinByRepo_ReturnsCopy(t *testing.T) {
+	t.Parallel()
+
+	const repo = "actions-ecosystem/action-add-labels"
+	original, ok := GetLatestActionPinByRepo(repo)
+	require.True(t, ok, "prerequisite: embedded pins must exist for "+repo)
+
+	pin, ok := GetLatestActionPinByRepo(repo)
+	require.True(t, ok, "prerequisite: embedded pins must exist for "+repo)
+	require.NotEmpty(t, pin.Inputs, "prerequisite: embedded pins must include action inputs")
+
+	var inputKey string
+	var input *ActionYAMLInput
+	for name, candidate := range pin.Inputs {
+		if candidate != nil {
+			inputKey = name
+			input = candidate
+			break
+		}
+	}
+	require.NotNil(t, input, "prerequisite: embedded pins must include a non-nil action input")
+
+	input.Description = "mutated description"
+	delete(pin.Inputs, inputKey)
+
+	fresh, ok := GetLatestActionPinByRepo(repo)
+	require.True(t, ok, "prerequisite: embedded pins must remain available")
+	assert.Equal(t, original, fresh, "mutating a returned pin's inputs must not change the cached pin")
 }
 
 func TestGetLatestActionPinReference_ReturnsFormattedReferenceOrEmpty(t *testing.T) {

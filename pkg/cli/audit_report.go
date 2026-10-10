@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,9 +26,11 @@ import (
 )
 
 var auditReportLog = logger.New("cli:audit_report")
+var ghaLogTimestampPrefixPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
 
 // AuditData represents the complete structured audit data for a workflow run
 type AuditData struct {
+	SchemaVersion           int                      `json:"schema_version"`
 	CacheSource             auditCacheSource         `json:"cache_source,omitempty"`
 	Overview                OverviewData             `json:"overview"`
 	Comparison              *AuditComparisonData     `json:"comparison,omitempty"`
@@ -51,7 +54,9 @@ type AuditData struct {
 	Noops                   []NoopReport             `json:"noops,omitempty"`
 	MCPFailures             []MCPFailureReport       `json:"mcp_failures,omitempty"`
 	SkillActivations        []SkillActivation        `json:"skill_activations,omitempty"`
+	GatewaySteeringEvents   []GatewaySteeringEvent   `json:"gateway_steering_events,omitempty"`
 	FirewallTokenUsage      *TokenUsageSummary       `json:"firewall_token_usage,omitempty"`
+	ModelRouting            *ModelRoutingSummary     `json:"model_routing,omitempty"`
 	GitHubRateLimitUsage    *GitHubRateLimitUsage    `json:"github_rate_limit_usage,omitempty"`
 	FirewallAnalysis        *FirewallAnalysis        `json:"firewall_analysis,omitempty"`
 	PolicyAnalysis          *PolicyAnalysis          `json:"policy_analysis,omitempty"`
@@ -65,10 +70,14 @@ type AuditData struct {
 	OutcomeSummary          *OutcomeSummary          `json:"outcome_summary,omitempty"`
 	Experiments             *ExperimentData          `json:"experiments,omitempty"`
 	Graders                 *GradersData             `json:"graders,omitempty"`
+	Ledger                  *LedgerActivity          `json:"ledger,omitempty"`
+	WorkQueue               *WorkQueueReport         `json:"work_queue,omitempty"`
+	Friction                *FrictionCostSummary     `json:"friction,omitempty"`
 }
 
 // AuditFinding represents a key insight discovered during audit
 type AuditFinding struct {
+	Code        AuditFindingCode           `json:"code"`             // Stable machine-readable identifier
 	Category    string                     `json:"category"`         // e.g., "error", "performance", "cost", "tooling"
 	Severity    scanfindings.SeverityLevel `json:"severity"`         // shared severity vocabulary
 	Title       string                     `json:"title"`            // Brief title
@@ -116,13 +125,15 @@ type MetricsData struct {
 	AIC            float64                `json:"aic,omitempty"`
 	AmbientContext *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
 	WorkingSet     *WorkingSetMetrics     `json:"working_set,omitempty" console:"-"`
+	Friction       *FrictionCostSummary   `json:"-" console:"-"`
 	ActionMinutes  float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
 	Turns          int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
 	ErrorCount     int                    `json:"error_count" console:"header:Errors"`
 	WarningCount   int                    `json:"warning_count" console:"header:Warnings"`
 }
 
-// JobData contains information about individual jobs
+// JobData is the audit report rendering of a job.
+// It is derived from, and intentionally much smaller than, the raw API mirror JobInfo.
 type JobData struct {
 	Name       string        `json:"name" console:"header:Name"`
 	Status     string        `json:"status" console:"header:Status"`
@@ -208,6 +219,8 @@ type MCPToolSummary struct {
 	CallCount          int    `json:"call_count" console:"header:Calls"`
 	TotalInputSize     int    `json:"total_input_size" console:"header:Total Input,format:number"`
 	TotalOutputSize    int    `json:"total_output_size" console:"header:Total Output,format:number"`
+	AvgInputSize       int    `json:"avg_input_size,omitempty" console:"header:Avg Input,format:number"`
+	AvgOutputSize      int    `json:"avg_output_size,omitempty" console:"header:Avg Output,format:number"`
 	MaxInputSize       int    `json:"max_input_size" console:"header:Max Input,format:number"`
 	MaxOutputSize      int    `json:"max_output_size" console:"header:Max Output,format:number"`
 	AvgDuration        string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
@@ -245,6 +258,10 @@ type MCPServerStats struct {
 	RequestCount    int    `json:"request_count" console:"header:Requests"`
 	TotalInputSize  int    `json:"total_input_size" console:"header:Total Input,format:number"`
 	TotalOutputSize int    `json:"total_output_size" console:"header:Total Output,format:number"`
+	AvgInputSize    int    `json:"avg_input_size,omitempty" console:"header:Avg Input,format:number"`
+	AvgOutputSize   int    `json:"avg_output_size,omitempty" console:"header:Avg Output,format:number"`
+	MaxInputSize    int    `json:"max_input_size,omitempty" console:"header:Max Input,format:number"`
+	MaxOutputSize   int    `json:"max_output_size,omitempty" console:"header:Max Output,format:number"`
 	AvgDuration     string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
 }
 
@@ -298,13 +315,14 @@ func buildAuditData(ctx context.Context, processedRun ProcessedRun, metrics LogM
 func buildLocalAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData) (AuditData, []CreatedItemReport) {
 	run := processedRun.Run
 	auditReportLog.Printf("Building audit data for run ID %d", run.DatabaseID)
+	mcpToolUsage = normalizeMCPPayloadStats(mcpToolUsage)
 	expData := extractExperimentData(run.LogsPath)
 	overview := buildAuditOverview(run, expData)
 	metricsData, inferredEngineID := buildAuditMetrics(processedRun, metrics)
 	jobs := buildAuditJobs(processedRun.JobDetails)
 	errors := extractAuditErrors(run)
 	downloadedFiles := extractDownloadedFiles(run.LogsPath)
-	toolUsage := buildAuditToolUsage(metrics, mcpToolUsage)
+	toolUsage := buildAuditToolUsage(metrics, mcpToolUsage, processedRun.SkillActivations)
 	createdItems := resolveCreatedItems(run.LogsPath, processedRun.SafeOutputs)
 	taskDomain, behaviorFingerprint, agenticAssessments := buildAuditAssessments(processedRun, metricsData, toolUsage, createdItems, overview.AwContext)
 	findings, recommendations, observabilityInsights := buildAuditNarrative(processedRun, metricsData, errors, toolUsage, createdItems, agenticAssessments)
@@ -328,6 +346,7 @@ func buildLocalAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolU
 		recommendations:       recommendations,
 		observabilityInsights: observabilityInsights,
 	})
+	auditData.ModelRouting = applyAwInfoModelRouting(processedRun.ModelRouting, processedRun.Run.LogsPath)
 	return auditData, createdItems
 }
 
@@ -377,6 +396,7 @@ func buildAuditMetrics(processedRun ProcessedRun, metrics LogMetrics) (MetricsDa
 	applyFallbackMetrics(&metricsData, processedRun, metrics, fallbackMetrics)
 	populateAuditMetricContext(&metricsData, processedRun.TokenUsage)
 	metricsData.WorkingSet = processedRun.WorkingSet
+	metricsData.Friction = processedRun.Friction
 	return metricsData, inferredEngineID
 }
 
@@ -444,8 +464,33 @@ func extractAuditErrors(run WorkflowRun) []ValidationIssue {
 	return nil
 }
 
-func buildAuditToolUsage(metrics LogMetrics, mcpToolUsage *MCPToolUsageData) []ToolUsageInfo {
-	return mergeMCPToolUsageInfo(buildToolUsageInfo(metrics), mcpToolUsage)
+func buildAuditToolUsage(metrics LogMetrics, mcpToolUsage *MCPToolUsageData, skillActivations []SkillActivation) []ToolUsageInfo {
+	usage := mergeMCPToolUsageInfo(buildToolUsageInfo(metrics), mcpToolUsage)
+	skillCounts := make(map[string]int, len(skillActivations))
+	for _, activation := range skillActivations {
+		name := "skill:" + activation.Name
+		count := activation.InvocationCount
+		if count <= 0 {
+			count = 1
+		}
+		skillCounts[name] += count
+	}
+	merged := make([]ToolUsageInfo, 0, len(usage)+len(skillCounts))
+	for _, tool := range usage {
+		if count, ok := skillCounts[tool.Name]; ok {
+			tool.CallCount += count
+			delete(skillCounts, tool.Name)
+		}
+		merged = append(merged, tool)
+	}
+	for _, activation := range skillActivations {
+		name := "skill:" + activation.Name
+		if count, ok := skillCounts[name]; ok {
+			merged = append(merged, ToolUsageInfo{Name: name, CallCount: count})
+			delete(skillCounts, name)
+		}
+	}
+	return merged
 }
 
 func buildAuditAssessments(processedRun ProcessedRun, metricsData MetricsData, toolUsage []ToolUsageInfo, createdItems []CreatedItemReport, awContext *AwContext) (*TaskDomainInfo, *BehaviorFingerprint, []AgenticAssessment) {
@@ -506,16 +551,19 @@ func assembleAuditData(inputs auditDataInputs) AuditData {
 	mcpServerHealth := buildMCPServerHealth(inputs.mcpToolUsage, inputs.processedRun.MCPFailures)
 
 	if auditReportLog.Enabled() {
-		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d tool types, %d findings, %d recommendations",
-			len(inputs.jobs), len(inputs.errors), len(inputs.toolUsage), len(inputs.findings), len(inputs.recommendations))
+		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d tool types, %d findings, %d recommendations", len(inputs.jobs), len(inputs.errors), len(inputs.toolUsage), len(inputs.findings), len(inputs.recommendations))
 	}
 
 	return AuditData{
+		SchemaVersion:           auditSchemaVersion,
 		Overview:                inputs.overview,
 		TaskDomain:              inputs.taskDomain,
 		BehaviorFingerprint:     inputs.behaviorFingerprint,
 		AgenticAssessments:      inputs.agenticAssessments,
 		Metrics:                 metricsData,
+		Friction:                inputs.processedRun.Friction,
+		Ledger:                  inputs.processedRun.Ledger,
+		WorkQueue:               inputs.processedRun.WorkQueue,
 		KeyFindings:             inputs.findings,
 		Recommendations:         inputs.recommendations,
 		ObservabilityInsights:   inputs.observabilityInsights,
@@ -532,18 +580,27 @@ func assembleAuditData(inputs auditDataInputs) AuditData {
 		Noops:                   inputs.processedRun.Noops,
 		MCPFailures:             inputs.processedRun.MCPFailures,
 		SkillActivations:        inputs.processedRun.SkillActivations,
+		GatewaySteeringEvents:   inputs.processedRun.GatewaySteeringEvents,
 		FirewallTokenUsage:      inputs.processedRun.TokenUsage,
 		GitHubRateLimitUsage:    inputs.processedRun.GitHubRateLimitUsage,
 		FirewallAnalysis:        inputs.processedRun.FirewallAnalysis,
 		PolicyAnalysis:          inputs.processedRun.PolicyAnalysis,
 		RedactedDomainsAnalysis: inputs.processedRun.RedactedDomainsAnalysis,
 		Errors:                  inputs.errors,
+		Warnings:                auditEngineConfigWarnings(engineConfig),
 		ToolUsage:               inputs.toolUsage,
 		MCPToolUsage:            inputs.mcpToolUsage,
 		CreatedItems:            inputs.createdItems,
 		Experiments:             inputs.expData,
 		Graders:                 extractGradersData(run.LogsPath),
 	}
+}
+
+func auditEngineConfigWarnings(config *AuditEngineConfig) []ValidationIssue {
+	if config == nil || config.RoutingWarning == "" {
+		return nil
+	}
+	return []ValidationIssue{{Type: "model_routing_outcome_disagreement", Message: config.RoutingWarning}}
 }
 
 func addAuditOutcomeSummary(ctx context.Context, auditData *AuditData, createdItems []CreatedItemReport) {
@@ -1090,7 +1147,7 @@ func stripGHALogTimestamps(content string) string {
 		// GHA timestamp format: YYYY-MM-DDTHH:MM:SS[.sss...]Z<space>
 		// The 'T' separator is always at position 10. Search for the terminating 'Z' after 'T'
 		// in a generous window (positions 11-35) to handle any fractional seconds length.
-		if len(line) > 19 && line[4] == '-' && line[7] == '-' && line[10] == 'T' {
+		if len(line) > 19 && ghaLogTimestampPrefixPattern.MatchString(line) {
 			// Find the Z that ends the timestamp within a reasonable range
 			searchBound := min(35, len(line))
 			if zIdx := strings.IndexByte(line[11:searchBound], 'Z'); zIdx >= 0 {
@@ -1098,9 +1155,7 @@ func stripGHALogTimestamps(content string) string {
 				if zPos+1 <= len(line) {
 					line = line[zPos+1:]
 					// Skip leading space after the timestamp
-					if line != "" && line[0] == ' ' {
-						line = line[1:]
-					}
+					line = strings.TrimPrefix(line, " ")
 				}
 			}
 		}

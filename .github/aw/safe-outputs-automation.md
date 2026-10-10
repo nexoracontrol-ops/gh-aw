@@ -74,7 +74,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
       allowed-refs: ["release/*"]         # Optional: glob allowlist for agent-provided per-call ref overrides (default: caller's ref only)
   ```
 
-  Triggers other agentic workflows using workflow_dispatch. Agent output includes `workflow_name` (without .md extension) and optional `inputs` (key-value pairs). Cross-repo dispatch is supported via `target-repo` plus an `allowed-repos` allowlist; cross-repo targets require a token with `actions: write` on the target repository.
+  Triggers other agentic workflows using workflow_dispatch. Agent output includes `workflow_name` (without .md extension) and optional `inputs` (key-value pairs). Cross-repo dispatch is supported via `target-repo` plus an `allowed-repos` allowlist; cross-repo targets require a token with `actions: write` on the target repository. For queue workers, load [work-queue.md](work-queue.md) and use `work_queue_dispatch_next` to request a bounded pool prefix. Trusted processing selects Work and the installed worker profile; do not select `work_id` through `dispatch_workflow` or declare reserved assignment/caller inputs.
 - `dispatch-repository:` - Dispatch `repository_dispatch` events to external repositories (experimental)
 
   ```yaml
@@ -172,6 +172,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
       custom-agent: "agent-id"        # Optional: custom agent ID
       custom-instructions: "..."      # Optional: additional instructions for the agent
       allowed: [copilot]              # Optional: restrict to specific agent names
+      required-labels: [copilot-ready] # Optional: ALL of these labels must be present on the issue/PR for assignment to run
       max: 1                          # Optional: max assignments (default: 1)
       target: "*"                     # Optional: "triggering" (default), "*", or number
       target-repo: "owner/repo"       # Optional: where the issue lives (cross-repository)
@@ -265,6 +266,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
   ```yaml
   safe-outputs:
     noop:
+      max: 2                          # Optional: max noop messages (default: 2)
       report-as-issue: false          # Optional: report noop as issue (default: true)
   ```
 

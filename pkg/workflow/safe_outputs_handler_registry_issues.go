@@ -88,6 +88,7 @@ var issueHandlerRegistry = map[string]handlerBuilder{
 		c := cfg.LinkSubIssue
 		return newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
+			AddIfNotEmpty("target", c.Target).
 			AddStringSlice("parent_required_labels", c.ParentRequiredLabels).
 			AddIfNotEmpty("parent_title_prefix", c.ParentTitlePrefix).
 			AddStringSlice("sub_required_labels", c.SubRequiredLabels).
@@ -148,6 +149,7 @@ var issueHandlerRegistry = map[string]handlerBuilder{
 		c := cfg.AddLabels
 		config := newHandlerConfigBuilder().
 			AddTemplatableInt("max", c.Max).
+			AddTemplatableInt("max_labels", c.MaxLabels).
 			AddStringSlice("allowed", c.Allowed).
 			AddStringSlice("blocked", c.Blocked).
 			AddBoolPtr("issue_intent", c.IssueIntent).

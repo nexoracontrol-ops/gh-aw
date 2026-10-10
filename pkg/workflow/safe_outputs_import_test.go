@@ -749,6 +749,7 @@ safe-outputs:
     - "example.com"
     - "api.example.com"
   report-failure-as-issue: ${{ inputs.report-failure-as-issue }}
+  report-failed-jobs: ${{ inputs.report-failed-jobs }}
   staged: true
   env:
     TEST_VAR: "test_value"
@@ -810,6 +811,8 @@ This workflow uses the imported meta configuration.
 	assert.Equal(t, "${{ secrets.CUSTOM_TOKEN }}", workflowData.SafeOutputs.GitHubToken, "GitHubToken should be imported")
 	require.NotNil(t, workflowData.SafeOutputs.ReportFailureAsIssue, "ReportFailureAsIssue should be imported")
 	assert.Equal(t, "${{ inputs.report-failure-as-issue }}", workflowData.SafeOutputs.ReportFailureAsIssue.String(), "ReportFailureAsIssue should be imported as templatable bool")
+	require.NotNil(t, workflowData.SafeOutputs.ReportFailedJobs, "ReportFailedJobs should be imported")
+	assert.Equal(t, "${{ inputs.report-failed-jobs }}", workflowData.SafeOutputs.ReportFailedJobs.String(), "ReportFailedJobs should be imported as a templatable bool")
 	// Note: When main workflow has safe-outputs section, extractSafeOutputsConfig sets MaximumPatchSize default (4096)
 	// before merge happens, so imported value is not used. User should specify max-patch-size in main workflow.
 	assert.Equal(t, 4096, workflowData.SafeOutputs.MaximumPatchSize, "MaximumPatchSize defaults to 4096 when main has safe-outputs")
@@ -832,6 +835,7 @@ safe-outputs:
   allowed-domains:
     - "shared.example.com"
   report-failure-as-issue: false
+  report-failed-jobs: true
   github-token: "${{ secrets.SHARED_TOKEN }}"
   max-patch-size: 1024
 ---
@@ -854,6 +858,7 @@ safe-outputs:
   allowed-domains:
     - "main.example.com"
   report-failure-as-issue: ${{ inputs.report-failure-as-issue }}
+  report-failed-jobs: false
   github-token: "${{ secrets.MAIN_TOKEN }}"
   max-patch-size: 2048
   create-issue:
@@ -885,6 +890,8 @@ This workflow has its own meta configuration that should take precedence.
 	assert.Equal(t, []string{"main.example.com"}, workflowData.SafeOutputs.AllowedDomains, "AllowedDomains from main should take precedence")
 	require.NotNil(t, workflowData.SafeOutputs.ReportFailureAsIssue, "ReportFailureAsIssue from main should be set")
 	assert.Equal(t, "${{ inputs.report-failure-as-issue }}", workflowData.SafeOutputs.ReportFailureAsIssue.String(), "ReportFailureAsIssue from main should take precedence")
+	require.NotNil(t, workflowData.SafeOutputs.ReportFailedJobs, "ReportFailedJobs from main should be set")
+	assert.Equal(t, "false", workflowData.SafeOutputs.ReportFailedJobs.String(), "ReportFailedJobs from main should take precedence")
 	assert.Equal(t, "${{ secrets.MAIN_TOKEN }}", workflowData.SafeOutputs.GitHubToken, "GitHubToken from main should take precedence")
 	assert.Equal(t, 2048, workflowData.SafeOutputs.MaximumPatchSize, "MaximumPatchSize from main should take precedence")
 }
@@ -2046,6 +2053,52 @@ safe-outputs:
 
 	// The explicit disable must survive the import merge.
 	assert.Nil(t, workflowData.SafeOutputs.ThreatDetection, "ThreatDetection must remain nil when explicitly disabled by main workflow")
+}
+
+func TestSafeOutputsImportPreservesDisabledDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		safeOutputs string
+		noop        string
+	}{
+		{"metadata only", "messages:\n    footer: \"> custom footer\"", "{}"},
+		{"explicit handlers", "missing-tool: {}\n  missing-data: {}\n  report-incomplete: {}", "{}"},
+		{"disabled noop", "messages:\n    footer: \"> custom footer\"", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			compiler := NewCompiler(WithVersion("1.0.0"))
+			workflowsDir := filepath.Join(t.TempDir(), ".github", "workflows")
+			require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+			shared := "---\nsafe-outputs:\n  " + tc.safeOutputs + "\n---\n"
+			require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "shared.md"), []byte(shared), 0644))
+			main := `---
+on: workflow_dispatch
+imports:
+  - ./shared.md
+safe-outputs:
+  missing-tool: false
+  missing-data: false
+  report-incomplete: false
+  noop: ` + tc.noop + `
+---
+Run a task.
+`
+			mainFile := filepath.Join(workflowsDir, "main.md")
+			require.NoError(t, os.WriteFile(mainFile, []byte(main), 0644))
+
+			data, err := compiler.ParseWorkflowFile(mainFile)
+			require.NoError(t, err)
+			require.NotNil(t, data.SafeOutputs)
+			assert.Nil(t, data.SafeOutputs.MissingTool)
+			assert.Nil(t, data.SafeOutputs.MissingData)
+			assert.Nil(t, data.SafeOutputs.ReportIncomplete)
+			if tc.noop == "false" {
+				assert.Nil(t, data.SafeOutputs.NoOp)
+			} else {
+				assert.NotNil(t, data.SafeOutputs.NoOp)
+			}
+		})
+	}
 }
 
 // TestSafeOutputsDifferentTypesFromImportsMerged reproduces the bug reported in

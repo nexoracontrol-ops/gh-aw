@@ -64,6 +64,25 @@ func TestAWFSupportsExcludeEnv(t *testing.T) {
 	}
 }
 
+func TestAWFSupportsSessionStateDir(t *testing.T) {
+	tests := []struct {
+		name           string
+		firewallConfig *FirewallConfig
+		want           bool
+	}{
+		{name: "default version", firewallConfig: nil, want: true},
+		{name: "exact minimum", firewallConfig: &FirewallConfig{Version: "v0.25.15"}, want: true},
+		{name: "older version", firewallConfig: &FirewallConfig{Version: "v0.25.14"}, want: false},
+		{name: "latest", firewallConfig: &FirewallConfig{Version: "latest"}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, awfSupportsSessionStateDir(tt.firewallConfig))
+		})
+	}
+}
+
 func TestAWFSupportsCliProxy(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -365,11 +384,6 @@ func TestAWFEmitsFilesystemAllowWrite(t *testing.T) {
 			Agent: &AgentSandboxConfig{Runtime: AgentRuntimeDocker},
 		},
 	}
-	gvisor := &WorkflowData{
-		SandboxConfig: &SandboxConfig{
-			Agent: &AgentSandboxConfig{Runtime: AgentRuntimeGVisor},
-		},
-	}
 
 	tests := []struct {
 		name           string
@@ -397,11 +411,6 @@ func TestAWFEmitsFilesystemAllowWrite(t *testing.T) {
 		{
 			name:         "docker never emits",
 			workflowData: docker,
-			want:         false,
-		},
-		{
-			name:         "gvisor never emits",
-			workflowData: gvisor,
 			want:         false,
 		},
 		{
@@ -490,23 +499,6 @@ func TestAWFSupportsAPIProxyCACert(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := awfSupportsAPIProxyCACert(tt.firewallConfig)
 			assert.Equal(t, tt.want, got, "awfSupportsAPIProxyCACert result")
-		})
-	}
-}
-
-func TestAWFSupportsVerifySbxEgress(t *testing.T) {
-	tests := []struct {
-		name           string
-		firewallConfig *FirewallConfig
-		want           bool
-	}{
-		{name: "default version supports verify-sbx-egress", want: true},
-		{name: "exact minimum version supports verify-sbx-egress", firewallConfig: &FirewallConfig{Version: "v0.28.13"}, want: true},
-		{name: "older version does not support verify-sbx-egress", firewallConfig: &FirewallConfig{Version: "v0.28.12"}, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, awfSupportsVerifySbxEgress(tt.firewallConfig))
 		})
 	}
 }

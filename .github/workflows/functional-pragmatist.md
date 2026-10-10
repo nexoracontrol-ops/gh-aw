@@ -47,7 +47,7 @@ timeout-minutes: 45
 engine:
   id: codex
   model-provider: openai
-model: openai/gpt-5.3-codex
+model: openai/gpt-5.6-luna
 strict: true
 
 
@@ -56,9 +56,6 @@ evals:
     question: Did the agent analyze the codebase for pragmatic functional programming improvements?
   - id: refactoring_pr_created_or_noop
     question: Did the agent create a focused refactoring pull request, or report that no suitable change was found?
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Functional and Immutability Enhancer 🔄

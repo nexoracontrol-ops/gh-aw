@@ -53,6 +53,10 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string { //nolin
 	// Step 3: Clear MCP configuration files so the detection engine runs without MCP servers
 	steps = append(steps, c.buildClearMCPConfigStep()...)
 
+	if usingExternalDetector {
+		steps = append(steps, buildResetArcDindDetectionResultsStep(data)...)
+	}
+
 	// Step 4: Prepare files - copies agent output files to expected paths
 	steps = append(steps, c.buildPrepareDetectionFilesStep()...)
 
@@ -88,6 +92,9 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string { //nolin
 
 		// Step 11: Run threat-detect under AWF with a read-write mount for the result file
 		steps = append(steps, c.buildExternalDetectorExecutionStep(data)...)
+
+		// Collect staged results before post-steps, accounting, upload, and conclusion.
+		steps = append(steps, buildCollectArcDindDetectionResultsStep(data)...)
 
 		// Step 11a: Render detection.log to the Actions log wrapped in group/stop-commands macros.
 		steps = append(steps, c.buildRenderDetectionLogStep(data)...)
@@ -223,6 +230,7 @@ const detectionFirewallLogsDir = constants.ThreatDetectionDir + "/sandbox/firewa
 // cap have nothing to observe for the detection phase (see gh-aw#54047/#54046).
 func (c *Compiler) buildCopyDetectionFirewallLogsStep(data *WorkflowData) []string {
 	if !isFirewallEnabled(data) {
+		threatLog.Print("Firewall disabled, skipping detection firewall log copy step")
 		return nil
 	}
 
@@ -283,6 +291,7 @@ func (c *Compiler) buildDetectionConclusionStep(data *WorkflowData) []string {
 	// When ContinueOnErrorExpr is set the value is resolved at runtime; compile-time we use
 	// true as a safe default so the step-level continue-on-error is included (permissive).
 	continueOnError, continueOnErrorExpr := resolveThreatDetectionContinueOnError(data)
+	threatLog.Printf("Building detection conclusion step: continueOnError=%t, hasExpr=%t", continueOnError, continueOnErrorExpr != nil)
 
 	steps := []string{
 		"      - name: Parse and conclude threat detection\n",
@@ -335,6 +344,7 @@ func (c *Compiler) buildDetectionTokenUsageSummaryStep(data *WorkflowData) []str
 		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
 		"        env:\n",
 		"          GH_AW_TOKEN_USAGE_SUMMARY_TITLE: Threat Detection Token Usage\n",
+		"          GH_AW_PHASE: detection\n",
 		"          GH_AW_AGENT_USAGE_PATH: " + constants.TmpGhAwDir + "/threat-detection/detection_usage.json\n",
 		"          GH_AW_AGENT_USAGE_JSONL_PATH: " + constants.TmpGhAwDir + "/threat-detection/detection_usage.jsonl\n",
 		"          GH_AW_WRITE_EMPTY_USAGE: \"true\"\n",
@@ -508,6 +518,7 @@ func (c *Compiler) buildCustomThreatDetectionSteps(steps []any) []string {
 			}
 		}
 	}
+	threatLog.Printf("Built %d custom threat detection step(s)", len(result))
 	return result
 }
 
@@ -517,6 +528,7 @@ func (c *Compiler) buildCustomThreatDetectionSteps(steps []any) []string {
 // The prefix comes from the agent job output since the detection job depends on the agent job.
 func (c *Compiler) buildUploadDetectionLogStep(data *WorkflowData) []string {
 	detectionArtifactName := artifactPrefixExprForAgentDownstreamJob(data) + constants.DetectionArtifactName.String()
+	threatLog.Printf("Building detection log upload step with artifact name %s", detectionArtifactName)
 	steps := []string{
 		"      - name: Upload threat detection log\n",
 		"        if: always()\n",
@@ -530,6 +542,7 @@ func (c *Compiler) buildUploadDetectionLogStep(data *WorkflowData) []string {
 		"            " + constants.TmpGhAwDir + "/threat-detection/detection_usage.jsonl\n",
 	}
 	if isFirewallEnabled(data) {
+		threatLog.Print("Including firewall logs in detection log upload artifact")
 		steps = append(steps,
 			"            "+detectionFirewallLogsDir+"/logs/\n",
 			"            "+detectionFirewallLogsDir+"/audit/\n",
@@ -596,12 +609,25 @@ func (c *Compiler) buildRenderDetectionLogStep(data *WorkflowData) []string {
 // in warn mode keeps the job conclusion consistent with that tolerance.
 func (c *Compiler) buildInstallThreatDetectStep(data *WorkflowData) []string {
 	version := string(constants.DefaultThreatDetectVersion)
+	artifactBaseURL := constants.DefaultThreatDetectArtifactBaseURL
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil &&
+		data.SafeOutputs.ThreatDetection.ArtifactBaseURL != "" {
+		artifactBaseURL = data.SafeOutputs.ThreatDetection.ArtifactBaseURL
+	}
+	amd64Digest := constants.DefaultThreatDetectSHA256["threat-detect-linux-amd64"]
+	arm64Digest := constants.DefaultThreatDetectSHA256["threat-detect-linux-arm64"]
+	installFlags := ""
+	if isArcDindTopology(data) {
+		installFlags = " --rootless"
+	}
 
 	// Determine continue-on-error mode (same logic as buildDetectionConclusionStep).
 	continueOnError, continueOnErrorExpr := resolveThreatDetectionContinueOnError(data)
+	threatLog.Printf("Installing threat-detect binary: version=%s, continueOnError=%t", version, continueOnError)
 
 	steps := []string{
 		"      - name: Install threat-detect binary\n",
+		"        id: threat_detect_install\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 	}
 	if continueOnErrorExpr != nil {
@@ -611,7 +637,14 @@ func (c *Compiler) buildInstallThreatDetectStep(data *WorkflowData) []string {
 	}
 	steps = append(steps,
 		"        run: |\n",
-		fmt.Sprintf("          bash \"${RUNNER_TEMP}/gh-aw/actions/install_threat_detect_binary.sh\" %s\n", version),
+		fmt.Sprintf(
+			"          bash \"${RUNNER_TEMP}/gh-aw/actions/install_threat_detect_binary.sh\" %s --artifact-base-url %s --sha256-amd64 %s --sha256-arm64 %s%s\n",
+			shellEscapeArg(version),
+			shellEscapeArg(artifactBaseURL),
+			shellEscapeArg(amd64Digest),
+			shellEscapeArg(arm64Digest),
+			installFlags,
+		),
 	)
 	return steps
 }

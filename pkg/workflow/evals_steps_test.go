@@ -29,7 +29,7 @@ func TestDailyAICEvalsAccountingTransport(t *testing.T) {
 			t.Errorf("evals accounting transport missing %q", expected)
 		}
 	}
-	usage := strings.Join(buildUsageArtifactUploadSteps("", true, func(action string) string { return action }), "")
+	usage := strings.Join(buildUsageArtifactUploadSteps("", true, "", false, func(action string) string { return action }), "")
 	if !strings.Contains(usage, "/tmp/gh-aw/usage/evals/token_usage.jsonl") {
 		t.Fatal("conclusion must publish evals token usage")
 	}
@@ -70,6 +70,49 @@ func TestEvalsExecutionEvidence(t *testing.T) {
 	}
 }
 
+func TestEvalsOTLPEnvExcludedFromSandbox(t *testing.T) {
+	for _, engineID := range []string{"copilot", "claude", "codex"} {
+		for _, tt := range []struct {
+			name   string
+			env    string
+			dryRun bool
+			want   bool
+		}{
+			{name: "configured endpoint", env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com\n", want: true},
+			{name: "no endpoint", env: "env:\n  OTHER: value\n"},
+			{name: "dry run", env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com\n", dryRun: true},
+		} {
+			t.Run(engineID+"/"+tt.name, func(t *testing.T) {
+				data := &WorkflowData{
+					AI:           engineID,
+					EngineConfig: &EngineConfig{ID: engineID},
+					Env:          tt.env,
+					DryRun:       tt.dryRun,
+				}
+				steps := strings.Join(NewCompiler().buildEvalsEngineSteps(data), "")
+				if !strings.Contains(steps, "--env-all") {
+					t.Fatal("evals must execute through AWF")
+				}
+				for _, name := range otlpSandboxExcludedEnvVarNames {
+					wantCount := 0
+					if tt.want {
+						wantCount = 1
+					}
+					if got := strings.Count(steps, "--exclude-env "+name); got != wantCount {
+						t.Errorf("expected %d exclusions for %s, got %d", wantCount, name, got)
+					}
+				}
+				if strings.Contains(steps, "https://traces.example.com") {
+					t.Fatal("evals steps must not copy the host OTLP endpoint")
+				}
+				if data.ExcludedEnv != nil {
+					t.Fatal("evals must not mutate the parent workflow exclusions")
+				}
+			})
+		}
+	}
+}
+
 func TestDailyAICEvalsCollectorTopology(t *testing.T) {
 	for _, topology := range []string{"default", "arc-dind"} {
 		t.Run(topology, func(t *testing.T) {
@@ -105,6 +148,62 @@ func TestDailyAICEvalsCollectorTopology(t *testing.T) {
 					(topology == "arc-dind" && strings.Contains(collector, "/tmp/gh-aw/sandbox/firewall")) {
 					t.Errorf("collector must not fall back to stale agent paths:\n%s", collector)
 				}
+			}
+		})
+	}
+}
+
+// TestBuildEvalsEngineStepsHonorsNodeActionOverride verifies that the evals job's
+// Setup Node.js step honors runtimes.node.action-repo / action-version.
+func TestBuildEvalsEngineStepsHonorsNodeActionOverride(t *testing.T) {
+	compiler := NewCompiler()
+	const customRef = "myorg/myrepo/.github/actions/setup-node@main"
+
+	for _, engineID := range []string{"copilot", "claude"} {
+		t.Run(engineID, func(t *testing.T) {
+			data := &WorkflowData{
+				AI: engineID,
+				Runtimes: map[string]any{
+					"node": map[string]any{
+						"action-repo":    "myorg/myrepo/.github/actions/setup-node",
+						"action-version": "main",
+					},
+				},
+				Evals: &EvalsConfig{
+					Questions: []EvalDefinition{
+						{ID: "test", Question: "Does the code work?"},
+					},
+				},
+			}
+
+			allSteps := strings.Join(compiler.buildEvalsEngineSteps(data), "")
+			if !strings.Contains(allSteps, "uses: "+customRef) {
+				t.Errorf("expected Setup Node.js to use %q;\ngot:\n%s", customRef, allSteps)
+			}
+			if strings.Contains(allSteps, "uses: actions/setup-node@") {
+				t.Errorf("expected no default actions/setup-node reference;\ngot:\n%s", allSteps)
+			}
+		})
+	}
+}
+
+func TestBuildEvalsEngineStepsHonorsNodeVersion(t *testing.T) {
+	compiler := NewCompiler()
+	for _, engineID := range []string{"copilot", "claude", "codex"} {
+		t.Run(engineID, func(t *testing.T) {
+			data := &WorkflowData{
+				AI:       engineID,
+				Runtimes: map[string]any{"node": map[string]any{"version": "24.21.0"}},
+				Evals: &EvalsConfig{
+					Questions: []EvalDefinition{{ID: "test", Question: "Does the code work?"}},
+				},
+			}
+			steps := strings.Join(compiler.buildEvalsEngineSteps(data), "")
+			if count := strings.Count(steps, "- name: Setup Node.js"); count != 1 {
+				t.Fatalf("expected one Setup Node.js step, got %d:\n%s", count, steps)
+			}
+			if !strings.Contains(steps, "node-version: '24.21.0'") {
+				t.Errorf("expected pinned Node version in evals steps:\n%s", steps)
 			}
 		})
 	}

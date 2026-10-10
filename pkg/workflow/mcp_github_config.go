@@ -82,7 +82,7 @@ func dynamicEnclaveGitHubGuardRepos(workflowData *WorkflowData) []string {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	repos := make([]string, 0, len(enclave.Dynamic.AllowedRepositories)+len(enclave.Dynamic.AllowedOwners))
+	repos := make([]string, 0, typeutil.SafeAllocationCapacity(len(enclave.Dynamic.AllowedRepositories), len(enclave.Dynamic.AllowedOwners)))
 	add := func(repo string) {
 		repo = strings.TrimSpace(repo)
 		if repo == "" {
@@ -126,7 +126,7 @@ func staticEnclaveGitHubGuardPolicies(workflowData *WorkflowData) map[string]any
 		return nil
 	}
 	allowOnly := enclaveGitHubMCPAgentPolicy(workflowData).AllowOnly
-	repos, _ := allowOnly["repos"].([]string)
+	repos, _ := allowOnly["repos"].([]string) //nolint:typeassertionokdiscarded // A missing repos list is handled below.
 	if len(repos) == 0 {
 		return nil
 	}
@@ -208,7 +208,7 @@ func staticEnclaveWriteSinkGuardPolicy(workflowData *WorkflowData) map[string]an
 }
 
 func writeSinkAcceptLabelsForRepos(repos []string) []string {
-	accept := make([]string, 0, len(repos))
+	accept := make([]string, 0, typeutil.SafeAllocationCapacity(len(repos)))
 	for _, repo := range repos {
 		accept = append(accept, transformRepoPattern(repo))
 	}
@@ -239,10 +239,7 @@ func hasGitHubApp(githubTool map[string]any) bool {
 }
 
 // isGitHubCLIModeEnabled returns true when GitHub prompt/runtime mode is explicitly set
-// to `tools.github.mode: gh-proxy`. If mode is explicitly set to `local` or `remote`, it
-// takes precedence over the legacy features.cli-proxy flag (treated as MCP mode).
-// When mode is not explicitly set, this returns the legacy `features.cli-proxy` flag
-// value for backward compatibility.
+// to `tools.github.mode: gh-proxy`.
 func isGitHubCLIModeEnabled(data *WorkflowData) bool {
 	if data == nil {
 		return false
@@ -261,13 +258,20 @@ func isGitHubCLIModeEnabled(data *WorkflowData) bool {
 					case GitHubMCPModeLocal, GitHubMCPModeRemote:
 						return false
 					default:
-						githubConfigLog.Printf("Unrecognized tools.github.mode value: %s, falling back to legacy behavior", stringValue)
+						githubConfigLog.Printf("Unrecognized tools.github.mode value: %s, treating as MCP mode", stringValue)
 					}
 				}
 			}
 		}
 	}
-	return isFeatureEnabled(constants.CliProxyFeatureFlag, data)
+	return false
+}
+
+func isGitHubAppTokenForCLIProxy(data *WorkflowData) bool {
+	if data == nil || data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
+		return false
+	}
+	return isGitHubCLIModeEnabled(data)
 }
 
 // normalizeGitHubType normalizes and validates GitHub MCP transport values.
@@ -419,7 +423,7 @@ func parseGitHubAllowedToolsAndLimits(allowedSetting any) ([]string, map[string]
 		return parseStringSliceAny(allowedSetting, nil), nil
 	}
 
-	allowedTools := make([]string, 0, len(allowedItems))
+	allowedTools := make([]string, 0)
 	toolCallLimits := make(map[string]int)
 
 	for _, item := range allowedItems {
@@ -494,9 +498,9 @@ func getGitHubGuardPolicies(githubTool map[string]any) map[string]any {
 		// parse-guard-vars step. The step outputs proper JSON arrays (split on comma/newline,
 		// validated, jq-encoded) from both the compile-time static values and the
 		// GH_AW_GITHUB_* org/repo variables.
-		policy["blocked-users"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}"
-		policy["trusted-users"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}"
-		policy["approval-labels"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}"
+		policy["blocked-users"] = guardExprSentinel + "${GH_AW_GUARD_BLOCKED_USERS}"
+		policy["trusted-users"] = guardExprSentinel + "${GH_AW_GUARD_TRUSTED_USERS}"
+		policy["approval-labels"] = guardExprSentinel + "${GH_AW_GUARD_APPROVAL_LABELS}"
 		return map[string]any{
 			"allow-only": policy,
 		}
@@ -635,7 +639,7 @@ func deriveSafeOutputsGuardPolicyFromGitHub(githubTool map[string]any) map[strin
 		}
 	case []any:
 		// Array of patterns
-		acceptList = make([]string, 0, len(r))
+		acceptList = make([]string, 0)
 		for _, item := range r {
 			if pattern, ok := item.(string); ok {
 				acceptList = append(acceptList, transformRepoPattern(pattern))
@@ -643,7 +647,7 @@ func deriveSafeOutputsGuardPolicyFromGitHub(githubTool map[string]any) map[strin
 		}
 	case []string:
 		// Array of patterns (already strings)
-		acceptList = make([]string, 0, len(r))
+		acceptList = make([]string, 0)
 		for _, pattern := range r {
 			acceptList = append(acceptList, transformRepoPattern(pattern))
 		}
@@ -708,7 +712,7 @@ func deriveWriteSinkGuardPolicyFromWorkflow(workflowData *WorkflowData) map[stri
 		return dynamicEnclaveWriteSinkGuardPolicy(workflowData)
 	}
 
-	toolConfig, _ := rawGithubTool.(map[string]any)
+	toolConfig, _ := rawGithubTool.(map[string]any) //nolint:typeassertionokdiscarded // A non-map tool has no explicit guard policy.
 
 	// Detect blanket opt-out: private-to-public-flows: allow.
 	// Per Section 10.9.3, allow disables sink-visibility enforcement in addition to forcePublicRepos.

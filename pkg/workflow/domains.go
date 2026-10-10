@@ -99,16 +99,6 @@ func getLoadedEcosystemDomains() map[string][]string {
 // invariant above.
 var engineDefaultDomainSets = getLoadedDomainSets().EngineDefaults
 
-// GetEngineDefaultDomainSets returns copies of the named engine domain sets for
-// analysis, reporting, and network.allowed expansion.
-func GetEngineDefaultDomainSets() map[string][]string {
-	sets := make(map[string][]string, len(engineDefaultDomainSets))
-	for name, domains := range engineDefaultDomainSets {
-		sets[name] = copyEngineDefaultDomainSet(domains)
-	}
-	return sets
-}
-
 func copyEngineDefaultDomainSet(domains []string) []string {
 	return append([]string(nil), domains...)
 }
@@ -131,6 +121,8 @@ var ClaudeDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["c
 // GeminiDefaultDomains are the default domains required for Google Gemini CLI authentication and operation.
 var GeminiDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["gemini"])
 
+var AgyDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["agy"])
+
 // PiBaseDefaultDomains are the base domains required for the Pi CLI to operate,
 // independent of the chosen LLM provider. When a model uses provider/model format,
 // provider-specific API domains are added on top via GetDefaultDomainsForEngine.
@@ -138,9 +130,6 @@ var PiBaseDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["p
 
 // piProviderDomains maps provider prefixes to their API domains. It covers the
 // same set of providers that Pi can route through via the AWF LLM gateway.
-// Note: "google" is intentionally omitted — Pi backend resolution only supports
-// copilot, anthropic, openai, and codex; adding google here without backend
-// support would produce an inconsistent routing configuration.
 var piProviderDomains = getLoadedDomainSets().PiProviderDomains
 
 // PiDefaultDomains are the static default domains for backward compatibility when
@@ -158,12 +147,12 @@ func extractProviderFromModel(model string) (string, error) {
 	if model == "" {
 		return "", nil
 	}
-	parts := strings.SplitN(model, "/", 2)
-	if len(parts) < 2 {
+	prefix, _, hasSlash := strings.Cut(model, "/")
+	if !hasSlash {
 		// No slash: no "provider/model" format; no provider to extract.
 		return "", nil
 	}
-	provider := strings.ToLower(parts[0])
+	provider := strings.ToLower(prefix)
 	if provider == "" { //nolint:tolowerequalfold
 		return "", fmt.Errorf("invalid engine.model %q: provider prefix is empty; use provider/model format (for example: openai/gpt-4.1, anthropic/claude-sonnet-4)", model)
 	}
@@ -660,6 +649,7 @@ var engineDefaultDomains = map[constants.EngineName][]string{
 	constants.ClaudeEngine:  ClaudeDefaultDomains,
 	constants.CodexEngine:   CodexDefaultDomains,
 	constants.GeminiEngine:  GeminiDefaultDomains,
+	constants.AgyEngine:     AgyDefaultDomains,
 }
 
 // GetDefaultDomainsForEngine returns the engine's default required domains.

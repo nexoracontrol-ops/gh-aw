@@ -123,6 +123,18 @@ Add deterministic steps before or after agentic execution, or define full custom
 
 The `jobs:` map can also target compiler-generated built-in jobs such as `agent`, `activation`, and `safe_outputs` for additive customization. In particular, `jobs.agent.needs` and `jobs.agent.if` let you gate the generated agent job on a custom setup job while preserving compiler-managed dependencies.
 
+### Pre-start Docker Image Pull Policy (`docker-image-pull-policy:`)
+
+By default, the generated agent and detection jobs pre-pull their Docker images (`docker-image-pull-policy: always`). Set `docker-image-pull-policy: never` to require those images to be present locally instead:
+
+```yaml
+docker-image-pull-policy: never
+```
+
+In `never` mode, every pre-start image must be a registry-qualified `repository[:tag]@sha256:<64 lowercase hex>` reference. The download helper checks that Docker can inspect each exact reference and that its `RepoDigests` contains the exact `repository@sha256:...` entry. It validates **all** images before tagging their requested local aliases and never falls back to a pull. A versioned reference creates only its versioned alias, not `:latest`; ensure downstream consumers use that alias. Missing metadata, unpinned images, conflicting aliases, or failed inspections stop the job.
+
+Use `jobs.agent.pre-steps` and `jobs.detection.pre-steps` to restore independently verified image content on each isolated consumer runner **before** its download step; if a job depends on a separate acquisition job, configure its `needs` accordingly. Preloading with `docker save/load` is not necessarily sufficient: that transport may discard registry `RepoDigests`, which this mode refuses to fabricate. This setting only checks local Docker metadata; it does not independently verify image bytes, provenance, or scanner policy, or prevent other startup components from contacting registries. Use an isolated disposable Docker daemon and verify the full handoff and startup path separately.
+
 ### Cache Configuration (`cache:`)
 
 Cache configuration using standard GitHub Actions `actions/cache` syntax:
@@ -208,6 +220,10 @@ engine:
 ```
 
 See [Harness Retry and Post-result Watchdog Policy](/gh-aw/reference/engines/#harness-retry-and-post-result-watchdog-policy) for defaults, units, and the equivalent `GH_AW_HARNESS_*` environment variables.
+
+### Model Routing (`engine.model-routing:`)
+
+Enables experimental per-run model and reasoning-effort selection for Copilot with the AWF firewall. Requires `goal` (`cost` or `cost-speed`), `mode` (`economy`, `balanced`, `robust`, or `auto`), and a non-empty `allowed-models` list. Overrides the fixed `engine.model` and effort settings. See [Model Routing](/gh-aw/reference/model-routing/) for value meanings, requirements, sub-agent constraints, known limitations, and logs.
 
 ### Engine Driver (`engine.driver:`)
 
@@ -367,7 +383,7 @@ safe-outputs:
   report-failed-jobs: false
 ```
 
-When omitted, `report-failed-jobs` defaults to `true`.
+`report-failed-jobs` also accepts a GitHub Actions expression that resolves to a boolean. When omitted, it defaults to `true`.
 
 Custom safe-output jobs are defined under `safe-outputs.jobs:`. They run after the agent completes and can expose a custom safe-output tool to the agent. The optional `output` field is the success message returned to the agent:
 
@@ -464,7 +480,7 @@ The top-level `max-runs:` field is a **deprecated** alias for `max-turns:` and i
 
 ### Turn Cache Miss Limit (`max-turn-cache-misses:`)
 
-Sets the maximum consecutive AWF cache misses allowed before the API proxy blocks further requests. The value maps to `apiProxy.maxCacheMisses`, must be a positive integer, and defaults to `5` when neither frontmatter nor the `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` environment override provides a value.
+Sets the maximum consecutive AWF cache misses allowed before the API proxy blocks further requests. The value maps to `apiProxy.maxCacheMisses`, must be a positive integer, and defaults to `5` when neither frontmatter nor the `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` environment override provides a value. The configured value also applies to the threat-detection job, which talks to the same LLM provider.
 
 ```yaml wrap
 max-turn-cache-misses: 5
@@ -501,6 +517,14 @@ max-daily-ai-credits:
   github-app:
     client-id: ${{ vars.APP_ID }}
     private-key: ${{ secrets.APP_PRIVATE_KEY }}
+```
+
+By default, the activation job fails when the guardrail cannot determine the complete 24-hour AI Credits total. Set `continue-on-error: true` to report the unknown total as a warning and allow the workflow to continue:
+
+```yaml wrap
+max-daily-ai-credits:
+  value: 10000
+  continue-on-error: true
 ```
 
 ```yaml wrap
@@ -646,7 +670,7 @@ Override one or more runtimes, optionally with a custom setup action:
 ```yaml wrap
 runtimes:
   node:
-    version: "20"
+    version: "24"
   python:
     version: "3.12"
     action-repo: "actions/setup-python"
@@ -737,6 +761,8 @@ Enable experimental or optional compiler and runtime behaviors as key-value pair
 ### Strict Mode (`strict:`)
 
 Enables enhanced security validation for production workflows. Default: `true`.
+
+For `pull_request_target` workflows, the `on.pull_request_target` options documented in [Explicit Trusted Checkout Policy](/gh-aw/reference/checkout/#explicit-trusted-checkout-policy) can declare fixed trusted checkout pairs and acknowledge the trigger-specific warning without disabling strict mode.
 
 ```yaml wrap
 strict: false  # Disable enhanced security validation for development/testing

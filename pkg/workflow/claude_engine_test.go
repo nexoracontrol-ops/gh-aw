@@ -35,6 +35,9 @@ func TestClaudeEngine(t *testing.T) {
 	if !engine.GetCapabilities().ToolsAllowlist {
 		t.Error("Claude engine should support MCP tools")
 	}
+	if !engine.GetCapabilities().DynamicWorkflows {
+		t.Error("Claude engine should support dynamic workflows")
+	}
 
 	// Test installation steps (should have 2 steps: Node.js setup + install;
 	// secret validation is now in the activation job via GetSecretValidationStep)
@@ -111,8 +114,12 @@ func TestClaudeEngine(t *testing.T) {
 		t.Errorf("Expected --print flag in step: %s", stepContent)
 	}
 
-	if !strings.Contains(stepContent, "--permission-mode acceptEdits") {
-		t.Errorf("Expected --permission-mode acceptEdits in CLI args: %s", stepContent)
+	if !strings.Contains(stepContent, "--strict-mcp-config") {
+		t.Errorf("Expected --strict-mcp-config in CLI args even without MCP servers: %s", stepContent)
+	}
+
+	if !strings.Contains(stepContent, "--permission-mode dontAsk") {
+		t.Errorf("Expected --permission-mode dontAsk in CLI args: %s", stepContent)
 	}
 
 	if !strings.Contains(stepContent, "--output-format stream-json") {
@@ -198,6 +205,9 @@ func TestClaudeEngineLLMProviderGitHubUsesCopilotCredentials(t *testing.T) {
 		NetworkPermissions: &NetworkPermissions{
 			Firewall: &FirewallConfig{Enabled: true},
 		},
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{ID: "awf"},
+		},
 	}
 
 	steps := engine.GetExecutionSteps(workflowData, "test-log")
@@ -205,8 +215,65 @@ func TestClaudeEngineLLMProviderGitHubUsesCopilotCredentials(t *testing.T) {
 	stepContent := strings.Join([]string(steps[0]), "\n")
 
 	assert.Contains(t, stepContent, "GH_AW_LLM_PROVIDER: github")
-	assert.Contains(t, stepContent, "ANTHROPIC_API_KEY: ${{ secrets.COPILOT_GITHUB_TOKEN }}")
-	assert.Contains(t, stepContent, fmt.Sprintf("ANTHROPIC_BASE_URL: http://host.docker.internal:%d", constants.CopilotLLMGatewayPort))
+	assert.Contains(t, stepContent, "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}")
+	assert.NotContains(t, stepContent, "ANTHROPIC_API_KEY:")
+	assert.Contains(t, stepContent, `export ANTHROPIC_API_KEY="$COPILOT_DUMMY_BYOK"`)
+	assert.Contains(t, stepContent, fmt.Sprintf("ANTHROPIC_BASE_URL: http://api-proxy:%d", constants.CopilotLLMGatewayPort))
+
+	configJSON, err := BuildAWFConfigJSON(AWFCommandConfig{EngineName: "claude", WorkflowData: workflowData})
+	require.NoError(t, err)
+	assert.Contains(t, configJSON, `"isolation":true`)
+}
+
+func TestClaudeEngineCopilotModelPrefixUsesIsolatedGateway(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name:  "test-workflow",
+		Model: "copilot/claude-haiku-4.5",
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+		SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf"}},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	require.Len(t, steps, 1)
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	assert.Contains(t, stepContent, "GH_AW_LLM_PROVIDER: github")
+	assert.Contains(t, stepContent, fmt.Sprintf("ANTHROPIC_BASE_URL: http://api-proxy:%d", constants.CopilotLLMGatewayPort))
+	assert.NotContains(t, stepContent, "ANTHROPIC_BASE_URL: http://host.docker.internal:")
+}
+
+func TestClaudeEngineCopilotCustomCommandUsesIsolatedGatewayBootstrap(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			LLMProvider: LLMProviderGitHub,
+			Command:     "custom-claude",
+		},
+		NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+		SandboxConfig:      &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf"}},
+	}
+
+	steps := engine.GetExecutionSteps(workflowData, "test-log")
+	require.Len(t, steps, 1)
+	stepContent := strings.Join([]string(steps[0]), "\n")
+	assert.Contains(t, stepContent, "custom-claude")
+	assert.Contains(t, stepContent, fmt.Sprintf("ANTHROPIC_BASE_URL: http://api-proxy:%d", constants.CopilotLLMGatewayPort))
+}
+
+func TestClaudeEngineDoesNotSetGatewayURLWithoutFirewall(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		Name:         "test-workflow",
+		EngineConfig: &EngineConfig{LLMProvider: LLMProviderGitHub},
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{Disabled: true},
+		},
+	}
+
+	assert.NotContains(t, engine.buildClaudeCommandEnv(workflowData), "ANTHROPIC_BASE_URL")
 }
 
 func TestClaudeEngineAllowsMountedMCPCLICommandsInRestrictedBash(t *testing.T) {
@@ -236,8 +303,7 @@ func TestClaudeEngineAllowsMountedMCPCLICommandsInRestrictedBash(t *testing.T) {
 	assert.Contains(t, stepContent, "Bash(mymcp:*)", "Expected mounted custom MCP CLI allowlist command")
 	assert.Contains(t, stepContent, "Bash(playwright-cli:*)", "Expected Playwright CLI allowlist command")
 	assert.Contains(t, stepContent, "Bash(safeoutputs:*)", "Expected mounted safeoutputs CLI allowlist command")
-	// Permission mode must be acceptEdits when bash is restricted (not wildcard)
-	assert.Contains(t, stepContent, "--permission-mode acceptEdits", "Expected acceptEdits with restricted bash")
+	assert.Contains(t, stepContent, "--permission-mode dontAsk", "Expected deterministic restricted bash permissions")
 }
 
 func TestClaudeEnginePermissionMode(t *testing.T) {
@@ -251,17 +317,17 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 		notExpectedMode string
 	}{
 		{
-			name:            "no tools — default acceptEdits",
+			name:            "no tools — default dontAsk",
 			tools:           nil,
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
-			name: "restricted bash — acceptEdits",
+			name: "restricted bash — dontAsk",
 			tools: map[string]any{
 				"bash": []any{"git", "echo"},
 			},
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
@@ -269,7 +335,7 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 			tools: map[string]any{
 				"bash": []any{"*"},
 			},
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
@@ -277,7 +343,7 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 			tools: map[string]any{
 				"bash": []any{":*"},
 			},
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
@@ -285,7 +351,7 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 			tools: map[string]any{
 				"bash": true,
 			},
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
@@ -293,15 +359,15 @@ func TestClaudeEnginePermissionMode(t *testing.T) {
 			tools: map[string]any{
 				"bash": nil,
 			},
-			expectedMode:    "acceptEdits",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "bypassPermissions",
 		},
 		{
-			name: "edit false defaults to auto permission mode",
+			name: "edit false defaults to dontAsk permission mode",
 			tools: map[string]any{
 				"edit": false,
 			},
-			expectedMode:    "auto",
+			expectedMode:    "dontAsk",
 			notExpectedMode: "acceptEdits",
 		},
 		{
@@ -654,6 +720,10 @@ func TestClaudeEngineWithMCPServers(t *testing.T) {
 		t.Errorf("Expected --mcp-config in CLI args when MCP servers are configured: %s", stepContent)
 	}
 
+	if !strings.Contains(stepContent, "--strict-mcp-config") {
+		t.Errorf("Expected --strict-mcp-config in CLI args when MCP servers are configured: %s", stepContent)
+	}
+
 	// When MCP servers are configured, GH_AW_MCP_CONFIG SHOULD be present
 	if !strings.Contains(stepContent, "GH_AW_MCP_CONFIG: ${{ runner.temp }}/gh-aw/mcp-config/mcp-servers.json") {
 		t.Errorf("Expected GH_AW_MCP_CONFIG environment variable when MCP servers are configured: %s", stepContent)
@@ -686,6 +756,10 @@ func TestClaudeEngineWithSafeOutputs(t *testing.T) {
 	// When safe-outputs is configured, --mcp-config flag SHOULD be present
 	if !strings.Contains(stepContent, `--mcp-config "${RUNNER_TEMP}/gh-aw/mcp-config/mcp-servers.json"`) {
 		t.Errorf("Expected --mcp-config in CLI args when safe-outputs are configured: %s", stepContent)
+	}
+
+	if !strings.Contains(stepContent, "--strict-mcp-config") {
+		t.Errorf("Expected --strict-mcp-config in CLI args when safe-outputs are configured: %s", stepContent)
 	}
 
 	// When safe-outputs is configured, GH_AW_MCP_CONFIG SHOULD be present
@@ -1035,4 +1109,27 @@ func TestIsAnthropicWIF(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestClaudeEngineModelRoutingExecutionStep(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:  "routed-workflow",
+		Model: "claude-opus-5",
+		EngineConfig: &EngineConfig{
+			ID:          "claude",
+			LLMProvider: LLMProviderGitHub,
+			ModelRouting: &CopilotModelRoutingConfig{
+				Goal: "cost", Mode: "balanced", AllowedModels: []string{"claude-opus-5"},
+			},
+		},
+		NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+		ParsedTools:        NewTools(map[string]any{}),
+	}
+
+	step := strings.Join([]string(NewClaudeEngine().GetExecutionSteps(workflowData, "test-log")[0]), "\n")
+	require.Contains(t, step, "GH_AW_MODEL_ROUTING")
+	require.Contains(t, step, "candidateModels")
+	require.NotContains(t, step, "ANTHROPIC_MODEL:")
+	require.NotContains(t, step, "GH_AW_MODEL_AGENT_CLAUDE:")
+	require.NotContains(t, step, "--model")
 }

@@ -161,6 +161,18 @@
               "engine_id": {
                 "type": "string"
               },
+              "model": {
+                "type": "string"
+              },
+              "requested_model": {
+                "type": "string"
+              },
+              "model_effort": {
+                "type": "string"
+              },
+              "model_routing_status": {
+                "type": "string"
+              },
               "status": {
                 "type": "string"
               },
@@ -238,6 +250,825 @@
                   "peak_input_tokens",
                   "rebuild_excess_tokens",
                   "invocations"
+                ],
+                "additionalProperties": false
+              },
+              "ledger": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "transactions_added": {
+                    "type": [
+                      "null",
+                      "integer"
+                    ]
+                  },
+                  "compaction": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "before": {
+                        "type": "integer"
+                      },
+                      "after": {
+                        "type": "integer"
+                      },
+                      "selected": {
+                        "type": "integer"
+                      },
+                      "records": {
+                        "type": "integer"
+                      },
+                      "replacement": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "retired": {
+                        "type": "integer"
+                      },
+                      "changed": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "before",
+                      "after",
+                      "selected",
+                      "records",
+                      "replacement",
+                      "retired",
+                      "changed"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              },
+              "work_queue": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "snapshot": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "version": {
+                        "type": "integer"
+                      },
+                      "sha": {
+                        "type": [
+                          "null",
+                          "string"
+                        ]
+                      },
+                      "worker": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "work_id": {
+                            "type": "string"
+                          },
+                          "claim_id": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "work_id",
+                          "claim_id"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "transactions": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "version": {
+                              "type": "integer"
+                            },
+                            "kind": {
+                              "type": "string"
+                            },
+                            "work": {
+                              "type": "string"
+                            },
+                            "claim": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "attempt": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "enqueued": {
+                              "type": [
+                                "null",
+                                "integer"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "version",
+                            "kind",
+                            "work",
+                            "claim",
+                            "attempt"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "current": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "role": {
+                            "type": "string"
+                          },
+                          "policy_installed": {
+                            "type": "boolean"
+                          },
+                          "tip": {
+                            "type": "string"
+                          },
+                          "policy_epoch": {
+                            "type": "string"
+                          },
+                          "captured_at": {
+                            "type": "integer"
+                          },
+                          "commit_count": {
+                            "type": "integer"
+                          },
+                          "admission_paused": {
+                            "type": "boolean"
+                          },
+                          "grants_paused": {
+                            "type": "boolean"
+                          },
+                          "assignment": {
+                            "type": [
+                              "null",
+                              "object"
+                            ],
+                            "properties": {
+                              "dispatch_id": {
+                                "type": "string"
+                              },
+                              "request_id": {
+                                "type": "string"
+                              },
+                              "commit_id": {
+                                "type": "string"
+                              },
+                              "state": {
+                                "type": "string"
+                              },
+                              "released": {
+                                "type": "boolean"
+                              },
+                              "claims": {
+                                "type": [
+                                  "null",
+                                  "array"
+                                ],
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "claim_handle": {
+                                      "type": "string"
+                                    },
+                                    "claim_id": {
+                                      "type": "string"
+                                    },
+                                    "work_id": {
+                                      "type": "string"
+                                    },
+                                    "state": {
+                                      "type": "string"
+                                    },
+                                    "delivery_barrier": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "claim_handle",
+                                    "claim_id",
+                                    "work_id",
+                                    "state",
+                                    "delivery_barrier"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              }
+                            },
+                            "required": [
+                              "dispatch_id",
+                              "request_id",
+                              "commit_id",
+                              "state",
+                              "released",
+                              "claims"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "role",
+                          "policy_installed",
+                          "tip",
+                          "policy_epoch",
+                          "captured_at",
+                          "commit_count",
+                          "admission_paused",
+                          "grants_paused"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "version",
+                      "sha",
+                      "worker",
+                      "transactions"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "finish_intent": {
+                    "type": "string"
+                  },
+                  "finish_intents": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "intent_id": {
+                          "type": "string"
+                        },
+                        "claim_handle": {
+                          "type": "string"
+                        },
+                        "outcome": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "intent_id",
+                        "claim_handle",
+                        "outcome"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "operations": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "timestamp": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "message",
+                        "source"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              "friction": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "measurement_state": {
+                    "type": "string"
+                  },
+                  "canonical_unit": {
+                    "type": "string"
+                  },
+                  "sources": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "total_events": {
+                    "type": "integer"
+                  },
+                  "total_occurrences": {
+                    "type": "integer"
+                  },
+                  "counted_occurrences": {
+                    "type": "integer"
+                  },
+                  "suppressed_occurrences": {
+                    "type": "integer"
+                  },
+                  "linked_invocations": {
+                    "type": "integer"
+                  },
+                  "unattributed_occurrences": {
+                    "type": "integer"
+                  },
+                  "cost": {
+                    "type": "object",
+                    "properties": {
+                      "aic": {
+                        "type": "number"
+                      },
+                      "tokens": {
+                        "type": "object",
+                        "properties": {
+                          "input": {
+                            "type": "integer"
+                          },
+                          "output": {
+                            "type": "integer"
+                          },
+                          "cache_read": {
+                            "type": "integer"
+                          },
+                          "cache_write": {
+                            "type": "integer"
+                          },
+                          "reasoning": {
+                            "type": "integer"
+                          },
+                          "total": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "input",
+                          "output",
+                          "cache_read",
+                          "cache_write",
+                          "reasoning",
+                          "total"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "turns": {
+                        "type": "integer"
+                      },
+                      "tool_calls": {
+                        "type": "integer"
+                      },
+                      "latency_ms": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "aic",
+                      "tokens",
+                      "turns",
+                      "tool_calls",
+                      "latency_ms"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "total_run_aic": {
+                    "type": [
+                      "null",
+                      "number"
+                    ]
+                  },
+                  "total_run_aic_partial": {
+                    "type": "boolean"
+                  },
+                  "friction_ratio": {
+                    "type": [
+                      "null",
+                      "number"
+                    ]
+                  },
+                  "dimension_states": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "uncertainty": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "object",
+                      "properties": {
+                        "state": {
+                          "type": "string"
+                        },
+                        "method": {
+                          "type": "string"
+                        },
+                        "confidence": {
+                          "type": "string"
+                        },
+                        "relative_error": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "lower_bound": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "upper_bound": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "confidence_level": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "sample_size": {
+                          "type": "integer"
+                        },
+                        "basis": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "state"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "drivers": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "driver": {
+                          "type": "string"
+                        },
+                        "class": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "events": {
+                          "type": "integer"
+                        },
+                        "occurrences": {
+                          "type": "integer"
+                        },
+                        "counted_occurrences": {
+                          "type": "integer"
+                        },
+                        "suppressed_occurrences": {
+                          "type": "integer"
+                        },
+                        "state": {
+                          "type": "string"
+                        },
+                        "cost": {
+                          "type": "object",
+                          "properties": {
+                            "aic": {
+                              "type": "number"
+                            },
+                            "tokens": {
+                              "type": "object",
+                              "properties": {
+                                "input": {
+                                  "type": "integer"
+                                },
+                                "output": {
+                                  "type": "integer"
+                                },
+                                "cache_read": {
+                                  "type": "integer"
+                                },
+                                "cache_write": {
+                                  "type": "integer"
+                                },
+                                "reasoning": {
+                                  "type": "integer"
+                                },
+                                "total": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "input",
+                                "output",
+                                "cache_read",
+                                "cache_write",
+                                "reasoning",
+                                "total"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "turns": {
+                              "type": "integer"
+                            },
+                            "tool_calls": {
+                              "type": "integer"
+                            },
+                            "latency_ms": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "aic",
+                            "tokens",
+                            "turns",
+                            "tool_calls",
+                            "latency_ms"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "driver",
+                        "events",
+                        "occurrences",
+                        "counted_occurrences",
+                        "suppressed_occurrences",
+                        "state",
+                        "cost"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "groups": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "group_id": {
+                          "type": "string"
+                        },
+                        "primary_source": {
+                          "type": "string"
+                        },
+                        "event_ids": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "event_ids_truncated": {
+                          "type": "boolean"
+                        },
+                        "total_occurrences": {
+                          "type": "integer"
+                        },
+                        "counted_occurrences": {
+                          "type": "integer"
+                        },
+                        "suppressed_occurrences": {
+                          "type": "integer"
+                        },
+                        "rule": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "group_id",
+                        "total_occurrences",
+                        "counted_occurrences",
+                        "suppressed_occurrences"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "events": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "driver": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "type": "string"
+                        },
+                        "group_id": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "detail": {
+                          "type": "string"
+                        },
+                        "timestamp": {
+                          "type": "string"
+                        },
+                        "occurrences": {
+                          "type": "integer"
+                        },
+                        "counted_occurrences": {
+                          "type": "integer"
+                        },
+                        "suppressed_occurrences": {
+                          "type": "integer"
+                        },
+                        "suppressed_by": {
+                          "type": "string"
+                        },
+                        "attribution_class": {
+                          "type": "string"
+                        },
+                        "state": {
+                          "type": "string"
+                        },
+                        "estimation_method": {
+                          "type": "string"
+                        },
+                        "lower_bound_aic": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "upper_bound_aic": {
+                          "type": [
+                            "null",
+                            "number"
+                          ]
+                        },
+                        "confidence": {
+                          "type": "string"
+                        },
+                        "dimension_states": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "string"
+                          }
+                        },
+                        "cost": {
+                          "type": "object",
+                          "properties": {
+                            "aic": {
+                              "type": "number"
+                            },
+                            "tokens": {
+                              "type": "object",
+                              "properties": {
+                                "input": {
+                                  "type": "integer"
+                                },
+                                "output": {
+                                  "type": "integer"
+                                },
+                                "cache_read": {
+                                  "type": "integer"
+                                },
+                                "cache_write": {
+                                  "type": "integer"
+                                },
+                                "reasoning": {
+                                  "type": "integer"
+                                },
+                                "total": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "input",
+                                "output",
+                                "cache_read",
+                                "cache_write",
+                                "reasoning",
+                                "total"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "turns": {
+                              "type": "integer"
+                            },
+                            "tool_calls": {
+                              "type": "integer"
+                            },
+                            "latency_ms": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "aic",
+                            "tokens",
+                            "turns",
+                            "tool_calls",
+                            "latency_ms"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "driver",
+                        "occurrences",
+                        "counted_occurrences",
+                        "suppressed_occurrences",
+                        "state",
+                        "cost"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "events_truncated": {
+                    "type": "boolean"
+                  },
+                  "unmeasured_drivers": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "driver": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "driver",
+                        "reason"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "ignored_token_records": {
+                    "type": "integer"
+                  },
+                  "derived": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "measurement_state",
+                  "total_events",
+                  "total_occurrences",
+                  "counted_occurrences",
+                  "suppressed_occurrences",
+                  "cost"
                 ],
                 "additionalProperties": false
               },
@@ -372,11 +1203,271 @@
                         "items": {
                           "type": "string"
                         }
+                      },
+                      "model_routing": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "model": {
+                            "type": "string"
+                          },
+                          "effort": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "router_version": {
+                            "type": "string"
+                          },
+                          "effective_endpoint": {
+                            "type": "string"
+                          },
+                          "selected_endpoint": {
+                            "type": "string"
+                          },
+                          "main_agent_cost": {
+                            "type": "object",
+                            "properties": {
+                              "requests": {
+                                "type": "integer"
+                              },
+                              "input_tokens": {
+                                "type": "integer"
+                              },
+                              "output_tokens": {
+                                "type": "integer"
+                              },
+                              "cache_read_tokens": {
+                                "type": "integer"
+                              },
+                              "cache_write_tokens": {
+                                "type": "integer"
+                              },
+                              "aic": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "requests",
+                              "input_tokens",
+                              "output_tokens",
+                              "cache_read_tokens",
+                              "cache_write_tokens",
+                              "aic"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "subagent_costs": {
+                            "type": [
+                              "null",
+                              "array"
+                            ],
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "agent_name": {
+                                  "type": "string"
+                                },
+                                "agent_type": {
+                                  "type": "string"
+                                },
+                                "instance_count": {
+                                  "type": "integer"
+                                },
+                                "completed_count": {
+                                  "type": "integer"
+                                },
+                                "failed_count": {
+                                  "type": "integer"
+                                },
+                                "incomplete_count": {
+                                  "type": "integer"
+                                },
+                                "effort": {
+                                  "type": "string"
+                                },
+                                "models": {
+                                  "type": [
+                                    "null",
+                                    "array"
+                                  ],
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "requests": {
+                                  "type": "integer"
+                                },
+                                "input_tokens": {
+                                  "type": "integer"
+                                },
+                                "output_tokens": {
+                                  "type": "integer"
+                                },
+                                "cache_read_tokens": {
+                                  "type": "integer"
+                                },
+                                "cache_write_tokens": {
+                                  "type": "integer"
+                                },
+                                "aic": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "agent_name",
+                                "agent_type",
+                                "instance_count",
+                                "requests",
+                                "input_tokens",
+                                "output_tokens",
+                                "cache_read_tokens",
+                                "cache_write_tokens",
+                                "aic"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "additionalProperties": false
                       }
                     },
                     "required": [
                       "run_id"
                     ],
+                    "additionalProperties": false
+                  },
+                  "model_routing": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "model": {
+                        "type": "string"
+                      },
+                      "effort": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "router_version": {
+                        "type": "string"
+                      },
+                      "effective_endpoint": {
+                        "type": "string"
+                      },
+                      "selected_endpoint": {
+                        "type": "string"
+                      },
+                      "main_agent_cost": {
+                        "type": "object",
+                        "properties": {
+                          "requests": {
+                            "type": "integer"
+                          },
+                          "input_tokens": {
+                            "type": "integer"
+                          },
+                          "output_tokens": {
+                            "type": "integer"
+                          },
+                          "cache_read_tokens": {
+                            "type": "integer"
+                          },
+                          "cache_write_tokens": {
+                            "type": "integer"
+                          },
+                          "aic": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "requests",
+                          "input_tokens",
+                          "output_tokens",
+                          "cache_read_tokens",
+                          "cache_write_tokens",
+                          "aic"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "subagent_costs": {
+                        "type": [
+                          "null",
+                          "array"
+                        ],
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "agent_name": {
+                              "type": "string"
+                            },
+                            "agent_type": {
+                              "type": "string"
+                            },
+                            "instance_count": {
+                              "type": "integer"
+                            },
+                            "completed_count": {
+                              "type": "integer"
+                            },
+                            "failed_count": {
+                              "type": "integer"
+                            },
+                            "incomplete_count": {
+                              "type": "integer"
+                            },
+                            "effort": {
+                              "type": "string"
+                            },
+                            "models": {
+                              "type": [
+                                "null",
+                                "array"
+                              ],
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "requests": {
+                              "type": "integer"
+                            },
+                            "input_tokens": {
+                              "type": "integer"
+                            },
+                            "output_tokens": {
+                              "type": "integer"
+                            },
+                            "cache_read_tokens": {
+                              "type": "integer"
+                            },
+                            "cache_write_tokens": {
+                              "type": "integer"
+                            },
+                            "aic": {
+                              "type": "number"
+                            }
+                          },
+                          "required": [
+                            "agent_name",
+                            "agent_type",
+                            "instance_count",
+                            "requests",
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_tokens",
+                            "cache_write_tokens",
+                            "aic"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
                     "additionalProperties": false
                   },
                   "delta": {
@@ -475,6 +1566,281 @@
                         },
                         "required": [
                           "newly_present"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "model_routing": {
+                        "type": [
+                          "null",
+                          "object"
+                        ],
+                        "properties": {
+                          "before": {
+                            "type": [
+                              "null",
+                              "object"
+                            ],
+                            "properties": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "effort": {
+                                "type": "string"
+                              },
+                              "mode": {
+                                "type": "string"
+                              },
+                              "router_version": {
+                                "type": "string"
+                              },
+                              "effective_endpoint": {
+                                "type": "string"
+                              },
+                              "selected_endpoint": {
+                                "type": "string"
+                              },
+                              "main_agent_cost": {
+                                "type": "object",
+                                "properties": {
+                                  "requests": {
+                                    "type": "integer"
+                                  },
+                                  "input_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "output_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "cache_read_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "cache_write_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "aic": {
+                                    "type": "number"
+                                  }
+                                },
+                                "required": [
+                                  "requests",
+                                  "input_tokens",
+                                  "output_tokens",
+                                  "cache_read_tokens",
+                                  "cache_write_tokens",
+                                  "aic"
+                                ],
+                                "additionalProperties": false
+                              },
+                              "subagent_costs": {
+                                "type": [
+                                  "null",
+                                  "array"
+                                ],
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "agent_name": {
+                                      "type": "string"
+                                    },
+                                    "agent_type": {
+                                      "type": "string"
+                                    },
+                                    "instance_count": {
+                                      "type": "integer"
+                                    },
+                                    "completed_count": {
+                                      "type": "integer"
+                                    },
+                                    "failed_count": {
+                                      "type": "integer"
+                                    },
+                                    "incomplete_count": {
+                                      "type": "integer"
+                                    },
+                                    "effort": {
+                                      "type": "string"
+                                    },
+                                    "models": {
+                                      "type": [
+                                        "null",
+                                        "array"
+                                      ],
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "requests": {
+                                      "type": "integer"
+                                    },
+                                    "input_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "output_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "cache_read_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "cache_write_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "aic": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "required": [
+                                    "agent_name",
+                                    "agent_type",
+                                    "instance_count",
+                                    "requests",
+                                    "input_tokens",
+                                    "output_tokens",
+                                    "cache_read_tokens",
+                                    "cache_write_tokens",
+                                    "aic"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "after": {
+                            "type": [
+                              "null",
+                              "object"
+                            ],
+                            "properties": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "effort": {
+                                "type": "string"
+                              },
+                              "mode": {
+                                "type": "string"
+                              },
+                              "router_version": {
+                                "type": "string"
+                              },
+                              "effective_endpoint": {
+                                "type": "string"
+                              },
+                              "selected_endpoint": {
+                                "type": "string"
+                              },
+                              "main_agent_cost": {
+                                "type": "object",
+                                "properties": {
+                                  "requests": {
+                                    "type": "integer"
+                                  },
+                                  "input_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "output_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "cache_read_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "cache_write_tokens": {
+                                    "type": "integer"
+                                  },
+                                  "aic": {
+                                    "type": "number"
+                                  }
+                                },
+                                "required": [
+                                  "requests",
+                                  "input_tokens",
+                                  "output_tokens",
+                                  "cache_read_tokens",
+                                  "cache_write_tokens",
+                                  "aic"
+                                ],
+                                "additionalProperties": false
+                              },
+                              "subagent_costs": {
+                                "type": [
+                                  "null",
+                                  "array"
+                                ],
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "agent_name": {
+                                      "type": "string"
+                                    },
+                                    "agent_type": {
+                                      "type": "string"
+                                    },
+                                    "instance_count": {
+                                      "type": "integer"
+                                    },
+                                    "completed_count": {
+                                      "type": "integer"
+                                    },
+                                    "failed_count": {
+                                      "type": "integer"
+                                    },
+                                    "incomplete_count": {
+                                      "type": "integer"
+                                    },
+                                    "effort": {
+                                      "type": "string"
+                                    },
+                                    "models": {
+                                      "type": [
+                                        "null",
+                                        "array"
+                                      ],
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "requests": {
+                                      "type": "integer"
+                                    },
+                                    "input_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "output_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "cache_read_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "cache_write_tokens": {
+                                      "type": "integer"
+                                    },
+                                    "aic": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "required": [
+                                    "agent_name",
+                                    "agent_type",
+                                    "instance_count",
+                                    "requests",
+                                    "input_tokens",
+                                    "output_tokens",
+                                    "cache_read_tokens",
+                                    "cache_write_tokens",
+                                    "aic"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "changed": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "changed"
                         ],
                         "additionalProperties": false
                       }
@@ -688,6 +2054,12 @@
                   "total_steering_events": {
                     "type": "integer"
                   },
+                  "steering_event_counts": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer"
+                    }
+                  },
                   "total_duration_ms": {
                     "type": "integer"
                   },
@@ -785,8 +2157,100 @@
                         "requested_model": {
                           "type": "string"
                         },
+                        "resolved_model": {
+                          "type": "string"
+                        },
+                        "served_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "error_code": {
+                          "type": "string"
+                        },
                         "invocation_count": {
                           "type": "integer"
+                        },
+                        "completed_count": {
+                          "type": "integer"
+                        },
+                        "failed_count": {
+                          "type": "integer"
+                        },
+                        "incomplete_count": {
+                          "type": "integer"
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "error": {
+                          "type": "string"
+                        },
+                        "effective_model": {
+                          "type": "string"
+                        },
+                        "reason_code": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "agent_name",
+                        "requested_model",
+                        "invocation_count"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "declared_subagent_models": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "agent_name": {
+                          "type": "string"
+                        },
+                        "requested_model": {
+                          "type": "string"
+                        },
+                        "resolved_model": {
+                          "type": "string"
+                        },
+                        "served_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "error_code": {
+                          "type": "string"
+                        },
+                        "invocation_count": {
+                          "type": "integer"
+                        },
+                        "completed_count": {
+                          "type": "integer"
+                        },
+                        "failed_count": {
+                          "type": "integer"
+                        },
+                        "incomplete_count": {
+                          "type": "integer"
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "error": {
+                          "type": "string"
                         },
                         "effective_model": {
                           "type": "string"
@@ -819,11 +2283,192 @@
                         },
                         "requests": {
                           "type": "integer"
+                        },
+                        "resolved_model": {
+                          "type": "string"
+                        },
+                        "served_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "input_tokens": {
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_read_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_write_tokens": {
+                          "type": "integer"
+                        },
+                        "reasoning_tokens": {
+                          "type": "integer"
+                        },
+                        "aic": {
+                          "type": "number"
+                        },
+                        "total_duration_ms": {
+                          "type": "integer"
                         }
                       },
                       "required": [
                         "model",
-                        "requests"
+                        "requests",
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_tokens",
+                        "cache_write_tokens"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "agent_usage": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "agent_name": {
+                          "type": "string"
+                        },
+                        "agent_type": {
+                          "type": "string"
+                        },
+                        "source_engine": {
+                          "type": "string"
+                        },
+                        "instance_count": {
+                          "type": "integer"
+                        },
+                        "completed_count": {
+                          "type": "integer"
+                        },
+                        "failed_count": {
+                          "type": "integer"
+                        },
+                        "incomplete_count": {
+                          "type": "integer"
+                        },
+                        "requested_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "resolved_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "served_models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "requests": {
+                          "type": "integer"
+                        },
+                        "input_tokens": {
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_read_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_write_tokens": {
+                          "type": "integer"
+                        },
+                        "reasoning_tokens": {
+                          "type": "integer"
+                        },
+                        "aic": {
+                          "type": "number"
+                        },
+                        "total_api_duration_ms": {
+                          "type": "integer"
+                        },
+                        "models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "resolved_model": {
+                                "type": "string"
+                              },
+                              "requests": {
+                                "type": "integer"
+                              },
+                              "input_tokens": {
+                                "type": "integer"
+                              },
+                              "output_tokens": {
+                                "type": "integer"
+                              },
+                              "cache_read_tokens": {
+                                "type": "integer"
+                              },
+                              "cache_write_tokens": {
+                                "type": "integer"
+                              },
+                              "reasoning_tokens": {
+                                "type": "integer"
+                              },
+                              "aic": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "model",
+                              "requests",
+                              "input_tokens",
+                              "output_tokens",
+                              "cache_read_tokens",
+                              "cache_write_tokens"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "agent_name",
+                        "agent_type",
+                        "instance_count",
+                        "requests",
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_tokens",
+                        "cache_write_tokens"
                       ],
                       "additionalProperties": false
                     }
@@ -851,6 +2496,389 @@
                   "total_response_bytes",
                   "cache_efficiency",
                   "by_model"
+                ],
+                "additionalProperties": false
+              },
+              "model_routing": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "objective": {
+                    "type": "string"
+                  },
+                  "objective_mode": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "labels": {
+                    "type": "object",
+                    "properties": {
+                      "task_type": {
+                        "type": "string"
+                      },
+                      "scope": {
+                        "type": "string"
+                      },
+                      "task_complexity": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "mode": {
+                    "type": "string"
+                  },
+                  "classifier_model": {
+                    "type": "string"
+                  },
+                  "classifier_effort": {
+                    "type": "string"
+                  },
+                  "classifier_attempts": {
+                    "type": "integer"
+                  },
+                  "degraded_classification": {
+                    "type": "boolean"
+                  },
+                  "degraded_reason": {
+                    "type": "string"
+                  },
+                  "selected_id": {
+                    "type": "string"
+                  },
+                  "selected_provider": {
+                    "type": "string"
+                  },
+                  "selected_model": {
+                    "type": "string"
+                  },
+                  "selected_effort": {
+                    "type": "string"
+                  },
+                  "wire_model": {
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "effective_endpoint": {
+                    "type": "string"
+                  },
+                  "selected_endpoint": {
+                    "type": "string"
+                  },
+                  "top_choices": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "provider": {
+                          "type": "string"
+                        },
+                        "model": {
+                          "type": "string"
+                        },
+                        "effort": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "router_name": {
+                    "type": "string"
+                  },
+                  "router_version": {
+                    "type": "string"
+                  },
+                  "latency_ms": {
+                    "type": "integer"
+                  },
+                  "failure": {
+                    "type": [
+                      "null",
+                      "object"
+                    ],
+                    "properties": {
+                      "code": {
+                        "type": "string"
+                      },
+                      "detail": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "routed_counts": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer"
+                    }
+                  },
+                  "outcome_counts": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer"
+                    }
+                  },
+                  "deviations": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "requested_model": {
+                          "type": "string"
+                        },
+                        "requested_effort": {
+                          "type": "string"
+                        },
+                        "selected_model": {
+                          "type": "string"
+                        },
+                        "selected_effort": {
+                          "type": "string"
+                        },
+                        "deviation": {
+                          "type": "string"
+                        },
+                        "count": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "count"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "classifier_cost": {
+                    "type": "object",
+                    "properties": {
+                      "requests": {
+                        "type": "integer"
+                      },
+                      "input_tokens": {
+                        "type": "integer"
+                      },
+                      "output_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_read_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_write_tokens": {
+                        "type": "integer"
+                      },
+                      "aic": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "requests",
+                      "input_tokens",
+                      "output_tokens",
+                      "cache_read_tokens",
+                      "cache_write_tokens",
+                      "aic"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "selected_model_cost": {
+                    "type": "object",
+                    "properties": {
+                      "requests": {
+                        "type": "integer"
+                      },
+                      "input_tokens": {
+                        "type": "integer"
+                      },
+                      "output_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_read_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_write_tokens": {
+                        "type": "integer"
+                      },
+                      "aic": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "requests",
+                      "input_tokens",
+                      "output_tokens",
+                      "cache_read_tokens",
+                      "cache_write_tokens",
+                      "aic"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "deviated_traffic_cost": {
+                    "type": "object",
+                    "properties": {
+                      "requests": {
+                        "type": "integer"
+                      },
+                      "input_tokens": {
+                        "type": "integer"
+                      },
+                      "output_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_read_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_write_tokens": {
+                        "type": "integer"
+                      },
+                      "aic": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "requests",
+                      "input_tokens",
+                      "output_tokens",
+                      "cache_read_tokens",
+                      "cache_write_tokens",
+                      "aic"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "main_agent_cost": {
+                    "type": "object",
+                    "properties": {
+                      "requests": {
+                        "type": "integer"
+                      },
+                      "input_tokens": {
+                        "type": "integer"
+                      },
+                      "output_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_read_tokens": {
+                        "type": "integer"
+                      },
+                      "cache_write_tokens": {
+                        "type": "integer"
+                      },
+                      "aic": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "requests",
+                      "input_tokens",
+                      "output_tokens",
+                      "cache_read_tokens",
+                      "cache_write_tokens",
+                      "aic"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "subagent_costs": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "agent_name": {
+                          "type": "string"
+                        },
+                        "agent_type": {
+                          "type": "string"
+                        },
+                        "instance_count": {
+                          "type": "integer"
+                        },
+                        "completed_count": {
+                          "type": "integer"
+                        },
+                        "failed_count": {
+                          "type": "integer"
+                        },
+                        "incomplete_count": {
+                          "type": "integer"
+                        },
+                        "effort": {
+                          "type": "string"
+                        },
+                        "models": {
+                          "type": [
+                            "null",
+                            "array"
+                          ],
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "requests": {
+                          "type": "integer"
+                        },
+                        "input_tokens": {
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_read_tokens": {
+                          "type": "integer"
+                        },
+                        "cache_write_tokens": {
+                          "type": "integer"
+                        },
+                        "aic": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "agent_name",
+                        "agent_type",
+                        "instance_count",
+                        "requests",
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                        "aic"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "endpoint_only_deviation_normalized": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "status",
+                  "labels",
+                  "classifier_cost",
+                  "selected_model_cost",
+                  "deviated_traffic_cost"
                 ],
                 "additionalProperties": false
               },
@@ -1425,6 +3453,12 @@
                   "total_output_size": {
                     "type": "integer"
                   },
+                  "avg_input_size": {
+                    "type": "integer"
+                  },
+                  "avg_output_size": {
+                    "type": "integer"
+                  },
                   "max_input_size": {
                     "type": "integer"
                   },
@@ -1477,6 +3511,18 @@
                     "type": "integer"
                   },
                   "total_output_size": {
+                    "type": "integer"
+                  },
+                  "avg_input_size": {
+                    "type": "integer"
+                  },
+                  "avg_output_size": {
+                    "type": "integer"
+                  },
+                  "max_input_size": {
+                    "type": "integer"
+                  },
+                  "max_output_size": {
                     "type": "integer"
                   },
                   "avg_duration": {
@@ -2127,6 +4173,12 @@
             "object"
           ],
           "properties": {
+            "dry_run": {
+              "type": "boolean"
+            },
+            "no_dry_run": {
+              "type": "boolean"
+            },
             "message": {
               "type": "string"
             },
@@ -2191,6 +4243,12 @@
             "properties": {
               "repository": {
                 "type": "string"
+              },
+              "dry_run": {
+                "type": "boolean"
+              },
+              "no_dry_run": {
+                "type": "boolean"
               },
               "message": {
                 "type": "string"
@@ -2399,6 +4457,189 @@
             ],
             "additionalProperties": false
           }
+        },
+        "model_routing": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "properties": {
+            "routes": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "task_type": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "task_complexity": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "effort": {
+                    "type": "string"
+                  },
+                  "router_version": {
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "effective_endpoint": {
+                    "type": "string"
+                  },
+                  "selected_endpoint": {
+                    "type": "string"
+                  },
+                  "run_count": {
+                    "type": "integer"
+                  },
+                  "total_aic": {
+                    "type": "number"
+                  },
+                  "average_aic": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "run_count",
+                  "total_aic",
+                  "average_aic"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "classifier_aic": {
+              "type": "number"
+            },
+            "main_agent_cost": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "integer"
+                },
+                "input_tokens": {
+                  "type": "integer"
+                },
+                "output_tokens": {
+                  "type": "integer"
+                },
+                "cache_read_tokens": {
+                  "type": "integer"
+                },
+                "cache_write_tokens": {
+                  "type": "integer"
+                },
+                "aic": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "requests",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "aic"
+              ],
+              "additionalProperties": false
+            },
+            "subagent_costs": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "agent_name": {
+                    "type": "string"
+                  },
+                  "agent_type": {
+                    "type": "string"
+                  },
+                  "instance_count": {
+                    "type": "integer"
+                  },
+                  "completed_count": {
+                    "type": "integer"
+                  },
+                  "failed_count": {
+                    "type": "integer"
+                  },
+                  "incomplete_count": {
+                    "type": "integer"
+                  },
+                  "effort": {
+                    "type": "string"
+                  },
+                  "models": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "requests": {
+                    "type": "integer"
+                  },
+                  "input_tokens": {
+                    "type": "integer"
+                  },
+                  "output_tokens": {
+                    "type": "integer"
+                  },
+                  "cache_read_tokens": {
+                    "type": "integer"
+                  },
+                  "cache_write_tokens": {
+                    "type": "integer"
+                  },
+                  "aic": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "agent_name",
+                  "agent_type",
+                  "instance_count",
+                  "requests",
+                  "input_tokens",
+                  "output_tokens",
+                  "cache_read_tokens",
+                  "cache_write_tokens",
+                  "aic"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total_requests": {
+              "type": "integer"
+            },
+            "deviated_requests": {
+              "type": "integer"
+            },
+            "deviated_traffic_share": {
+              "type": "number"
+            },
+            "endpoint_only_deviation_normalized": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [
@@ -3034,6 +5275,189 @@
             ],
             "additionalProperties": false
           }
+        },
+        "model_routing": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "properties": {
+            "routes": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "task_type": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "task_complexity": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "effort": {
+                    "type": "string"
+                  },
+                  "router_version": {
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "effective_endpoint": {
+                    "type": "string"
+                  },
+                  "selected_endpoint": {
+                    "type": "string"
+                  },
+                  "run_count": {
+                    "type": "integer"
+                  },
+                  "total_aic": {
+                    "type": "number"
+                  },
+                  "average_aic": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "run_count",
+                  "total_aic",
+                  "average_aic"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "classifier_aic": {
+              "type": "number"
+            },
+            "main_agent_cost": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "integer"
+                },
+                "input_tokens": {
+                  "type": "integer"
+                },
+                "output_tokens": {
+                  "type": "integer"
+                },
+                "cache_read_tokens": {
+                  "type": "integer"
+                },
+                "cache_write_tokens": {
+                  "type": "integer"
+                },
+                "aic": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "requests",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "aic"
+              ],
+              "additionalProperties": false
+            },
+            "subagent_costs": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "agent_name": {
+                    "type": "string"
+                  },
+                  "agent_type": {
+                    "type": "string"
+                  },
+                  "instance_count": {
+                    "type": "integer"
+                  },
+                  "completed_count": {
+                    "type": "integer"
+                  },
+                  "failed_count": {
+                    "type": "integer"
+                  },
+                  "incomplete_count": {
+                    "type": "integer"
+                  },
+                  "effort": {
+                    "type": "string"
+                  },
+                  "models": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "requests": {
+                    "type": "integer"
+                  },
+                  "input_tokens": {
+                    "type": "integer"
+                  },
+                  "output_tokens": {
+                    "type": "integer"
+                  },
+                  "cache_read_tokens": {
+                    "type": "integer"
+                  },
+                  "cache_write_tokens": {
+                    "type": "integer"
+                  },
+                  "aic": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "agent_name",
+                  "agent_type",
+                  "instance_count",
+                  "requests",
+                  "input_tokens",
+                  "output_tokens",
+                  "cache_read_tokens",
+                  "cache_write_tokens",
+                  "aic"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "total_requests": {
+              "type": "integer"
+            },
+            "deviated_requests": {
+              "type": "integer"
+            },
+            "deviated_traffic_share": {
+              "type": "number"
+            },
+            "endpoint_only_deviation_normalized": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

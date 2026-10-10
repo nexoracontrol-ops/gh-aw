@@ -23,7 +23,6 @@ network:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
@@ -35,7 +34,7 @@ safe-outputs:
   staged: true
   jobs:
     test_environment:
-      name: "Test Environment Deployment"
+      name: test_environment
       description: "A test job with choice input"
       runs-on: ubuntu-latest
       inputs:

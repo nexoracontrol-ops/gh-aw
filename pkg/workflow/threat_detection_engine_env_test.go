@@ -7,7 +7,48 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	yamlv3 "gopkg.in/yaml.v3"
 )
+
+func TestConclusionWarnsWhenDetectionHasNoVerdict(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{},
+		},
+	}
+	steps := strings.Join(compiler.buildConclusionSetupSteps(data), "")
+	for _, want := range []string{
+		"Warn if threat detection produced no verdict",
+		"if: always() && needs.detection.result != 'skipped'",
+		"needs.detection.outputs.detection_reason == 'agent_failure'",
+		"needs.detection.outputs.detection_reason == 'parse_error'",
+		"needs.detection.outputs.detection_conclusion == ''",
+		"::warning::Threat detection produced no security verdict.",
+	} {
+		if !strings.Contains(steps, want) {
+			t.Errorf("expected conclusion steps to contain %q", want)
+		}
+		data.SafeOutputs.AddComments = &AddCommentsConfig{}
+		enabled := true
+		data.StatusComment = &enabled
+		job, err := compiler.buildConclusionJob(data, "agent", []string{"add_comment"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(job.If, "!(needs.add_comment.outputs.comment_id) || needs.detection.result != 'skipped'") {
+			t.Fatal("missing verdict must allow conclusion even after publishing a comment")
+		}
+		if !strings.Contains(strings.Join(job.Steps, ""), "if: always() && !(needs.add_comment.outputs.comment_id)") {
+			t.Fatal("status-comment update must still suppress duplicate comments")
+		}
+	}
+	data.SafeOutputs.ThreatDetection = nil
+	steps = strings.Join(compiler.buildConclusionSetupSteps(data), "")
+	if strings.Contains(steps, "Warn if threat detection produced no verdict") {
+		t.Error("disabled detection must not produce a missing-verdict warning")
+	}
+}
 
 // TestBuildDetectionEngineExecutionStepPropagatesAPITarget verifies that when engine.api-target
 // is configured on the main engine, the threat detection AWF invocation also receives
@@ -252,6 +293,213 @@ func TestBuildDetectionEngineExecutionStepEmitsNodeSetupForCopilot(t *testing.T)
 			}
 			if nodeIdx > installIdx {
 				t.Errorf("Setup Node.js (at %d) must precede %q (at %d)", nodeIdx, tt.expectedInstallStep, installIdx)
+			}
+		})
+	}
+}
+
+func TestBuildDetectionEngineExecutionStepHonorsNodeActionOverride(t *testing.T) {
+	compiler := NewCompiler()
+	const customRef = "myorg/myrepo/.github/actions/setup-node@main"
+
+	for _, engineID := range []string{"copilot", "claude", "codex"} {
+		t.Run(engineID, func(t *testing.T) {
+			data := &WorkflowData{
+				AI: engineID,
+				Runtimes: map[string]any{
+					"node": map[string]any{
+						"action-repo":    "myorg/myrepo/.github/actions/setup-node",
+						"action-version": "main",
+					},
+				},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			}
+			s := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+			if c := strings.Count(s, "- name: Setup Node.js"); c != 1 {
+				t.Fatalf("want exactly one Setup Node.js, got %d.\n%s", c, s)
+			}
+			if !strings.Contains(s, "uses: "+customRef) {
+				t.Errorf("expected Setup Node.js to use %q, got:\n%s", customRef, s)
+			}
+			if strings.Contains(s, "uses: actions/setup-node@") {
+				t.Errorf("expected no default actions/setup-node reference, got:\n%s", s)
+			}
+		})
+	}
+}
+
+func TestBuildDetectionEngineExecutionStepHonorsNodeVersion(t *testing.T) {
+	compiler := NewCompiler()
+	for _, engineID := range []string{"copilot", "claude", "codex"} {
+		t.Run(engineID, func(t *testing.T) {
+			data := &WorkflowData{
+				AI:       engineID,
+				Runtimes: map[string]any{"node": map[string]any{"version": "24.21.0"}},
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			}
+			steps := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+			if count := strings.Count(steps, "- name: Setup Node.js"); count != 1 {
+				t.Fatalf("expected one Setup Node.js step, got %d:\n%s", count, steps)
+			}
+			if !strings.Contains(steps, "node-version: '24.21.0'") {
+				t.Errorf("expected pinned Node version in detection steps:\n%s", steps)
+			}
+		})
+	}
+}
+
+func TestGenerateNodeJsSetupStepForWorkflow(t *testing.T) {
+	defaultStep := strings.Join(GenerateNodeJsSetupStep(), "\n")
+
+	tests := []struct {
+		name         string
+		data         *WorkflowData
+		expectedUses string
+		version      string
+	}{
+		{
+			name:         "nil data uses default",
+			data:         nil,
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      string(constants.DefaultNodeVersion),
+		},
+		{
+			name: "runtimes map override",
+			data: &WorkflowData{Runtimes: map[string]any{
+				"node": map[string]any{"action-repo": "myorg/setup-node", "action-version": "v1", "version": "24.21.0"},
+			}},
+			expectedUses: "uses: myorg/setup-node@v1",
+			version:      "24.21.0",
+		},
+		{
+			name: "typed frontmatter override",
+			data: &WorkflowData{ParsedFrontmatter: &FrontmatterConfig{RuntimesTyped: &RuntimesConfig{
+				Node: &RuntimeConfig{ActionRepo: "myorg/setup-node", ActionVersion: "v2", Version: "22.13.0"},
+			}}},
+			expectedUses: "uses: myorg/setup-node@v2",
+			version:      "22.13.0",
+		},
+		{
+			name: "merged node entry without action override supersedes typed override",
+			data: &WorkflowData{
+				Runtimes: map[string]any{"node": map[string]any{"version": "22"}},
+				ParsedFrontmatter: &FrontmatterConfig{RuntimesTyped: &RuntimesConfig{
+					Node: &RuntimeConfig{ActionRepo: "myorg/setup-node", ActionVersion: "v2", Version: "22.13.0"},
+				}},
+			},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      "22",
+		},
+		{
+			name: "merged node entry without version supersedes typed override",
+			data: &WorkflowData{
+				Runtimes: map[string]any{"node": map[string]any{"action-version": "v7"}},
+				ParsedFrontmatter: &FrontmatterConfig{RuntimesTyped: &RuntimesConfig{
+					Node: &RuntimeConfig{Version: "22.13.0"},
+				}},
+			},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      string(constants.DefaultNodeVersion),
+		},
+		{
+			name: "numeric version from merged runtimes",
+			data: &WorkflowData{Runtimes: map[string]any{
+				"node": map[string]any{"version": 22},
+			}},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      "22",
+		},
+		{
+			name: "whole-number float version from merged runtimes",
+			data: &WorkflowData{Runtimes: map[string]any{
+				"node": map[string]any{"version": float64(24)},
+			}},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      "24",
+		},
+		{
+			name: "boolean version uses default",
+			data: &WorkflowData{Runtimes: map[string]any{
+				"node": map[string]any{"version": true},
+			}},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      string(constants.DefaultNodeVersion),
+		},
+		{
+			name: "null version uses default",
+			data: &WorkflowData{Runtimes: map[string]any{
+				"node": map[string]any{"version": nil},
+			}},
+			expectedUses: "uses: " + getActionPin("actions/setup-node"),
+			version:      string(constants.DefaultNodeVersion),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			step := strings.Join(generateNodeJsSetupStepForWorkflow(tt.data), "\n")
+			if !strings.Contains(step, tt.expectedUses) {
+				t.Errorf("expected %q in step:\n%s", tt.expectedUses, step)
+			}
+			if !strings.Contains(step, "node-version: '"+tt.version+"'") {
+				t.Errorf("expected Node version %q in step:\n%s", tt.version, step)
+			}
+			if tt.data == nil && step != defaultStep {
+				t.Errorf("expected default step, got:\n%s", step)
+			}
+		})
+	}
+}
+
+func TestRewriteNodeSetupStepSafelySerializesNodeVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{
+			name:    "embedded quote stays in scalar",
+			version: "24' }} evil: true #",
+			want:    "24' }} evil: true #",
+		},
+		{
+			name:    "control character is ignored",
+			version: "24\n  evil: true #",
+			want:    string(constants.DefaultNodeVersion),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			step := rewriteNodeSetupStep(GenerateNodeJsSetupStep(), "", tt.version)
+			var workflow struct {
+				Steps []struct {
+					Name string         `yaml:"name"`
+					Uses string         `yaml:"uses"`
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			}
+			var document strings.Builder
+			document.WriteString("steps:\n")
+			for _, line := range step {
+				document.WriteString("  ")
+				document.WriteString(strings.TrimPrefix(line, "      "))
+				document.WriteByte('\n')
+			}
+			decoder := yamlv3.NewDecoder(strings.NewReader(document.String()))
+			decoder.KnownFields(true)
+			if err := decoder.Decode(&workflow); err != nil {
+				t.Fatalf("generated setup step is not valid YAML: %v\n%s", err, document.String())
+			}
+			if len(workflow.Steps) != 1 {
+				t.Fatalf("expected one Setup Node.js step, got %d", len(workflow.Steps))
+			}
+			if got := workflow.Steps[0].With["node-version"]; got != tt.want {
+				t.Errorf("node-version = %#v, want %q", got, tt.want)
 			}
 		})
 	}

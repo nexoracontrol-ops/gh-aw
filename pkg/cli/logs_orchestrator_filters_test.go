@@ -91,26 +91,26 @@ func TestApplyRunFilters_Runtime(t *testing.T) {
 	}{
 		{
 			name:          "matching runtime passes",
-			awInfo:        `{"agent_runtime":"gvisor"}`,
-			filterRuntime: "gvisor",
+			awInfo:        `{"agent_runtime":"cloud-hypervisor"}`,
+			filterRuntime: "cloud-hypervisor",
 			wantSkip:      false,
 		},
 		{
 			name:          "non-matching runtime skipped",
-			awInfo:        `{"agent_runtime":"docker-sbx"}`,
-			filterRuntime: "gvisor",
+			awInfo:        `{"agent_runtime":"docker"}`,
+			filterRuntime: "cloud-hypervisor",
 			wantSkip:      true,
 		},
 		{
 			name:          "missing aw_info skipped",
 			awInfo:        "", // no file
-			filterRuntime: "gvisor",
+			filterRuntime: "cloud-hypervisor",
 			wantSkip:      true,
 		},
 		{
 			name:          "empty agent_runtime is skipped",
 			awInfo:        `{"agent_runtime":""}`,
-			filterRuntime: "gvisor",
+			filterRuntime: "cloud-hypervisor",
 			wantSkip:      true,
 		},
 	}
@@ -287,6 +287,10 @@ func TestBuildProcessedRun(t *testing.T) {
 				UpdatedAt:  now,
 			},
 			AwContext: awCtx,
+			SkillActivations: []SkillActivation{{
+				Name:            "documentation",
+				InvocationCount: 2,
+			}},
 		},
 			LogsPath: tmpDir,
 		}
@@ -296,6 +300,7 @@ func TestBuildProcessedRun(t *testing.T) {
 		assert.Equal(t, int64(1234), pr.Run.DatabaseID)
 		assert.Equal(t, tmpDir, pr.Run.LogsPath)
 		assert.Equal(t, awCtx, pr.AwContext)
+		assert.Equal(t, result.SkillActivations, pr.SkillActivations)
 		assert.Equal(t, 0, pr.Run.ErrorCount)
 		assert.Equal(t, 0, pr.Run.WarningCount)
 	})

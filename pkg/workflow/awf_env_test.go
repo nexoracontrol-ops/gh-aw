@@ -291,6 +291,82 @@ func TestComputeAWFExcludeEnvVarNames(t *testing.T) {
 	}
 }
 
+func TestOTLPEnvExcludedFromAWFSandboxes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		env  string
+		want bool
+	}{
+		{name: "configured endpoint", env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com\n", want: true},
+		{name: "no endpoint", env: "env:\n  OTHER: value\n", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Env:          tt.env,
+				EngineConfig: &EngineConfig{ID: "copilot"},
+			}
+			for _, phase := range []struct {
+				name string
+				data *WorkflowData
+			}{
+				{name: "agent", data: data},
+				{name: "detection", data: buildThreatDetectionWorkflowData(data, "copilot")},
+			} {
+				t.Run(phase.name, func(t *testing.T) {
+					excluded := ComputeAWFExcludeEnvVarNames(phase.data, []string{"COPILOT_GITHUB_TOKEN"})
+					args := BuildAWFArgs(AWFCommandConfig{WorkflowData: phase.data, ExcludeEnvVarNames: excluded})
+					assert.Contains(t, args, "--env-all")
+					for _, name := range otlpSandboxExcludedEnvVarNames {
+						if tt.want {
+							assert.Equal(t, 1, strings.Count(strings.Join(args, " "), "--exclude-env "+name))
+						} else {
+							assert.NotContains(t, strings.Join(args, " "), "--exclude-env "+name)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestComputeAWFExcludeEnvVarNamesDetectsSecretExpressionsAcrossSources(t *testing.T) {
+	expressions := []struct {
+		name  string
+		value string
+	}{
+		{name: "compact expression", value: "${{secrets.TOKEN}}"},
+		{name: "mixed-case context and name", value: "${{ Secrets.Token }}"},
+		{name: "variable-first fallback", value: "${{ vars.A || secrets.B }}"},
+		{name: "github-token-first fallback", value: "${{ github.token || secrets.X }}"},
+	}
+	sources := []string{"engine", "agent", "mcp-scripts"}
+
+	for _, source := range sources {
+		for _, expression := range expressions {
+			t.Run(source+"/"+expression.name, func(t *testing.T) {
+				const envName = "CONFIGURED_ENV"
+				workflowData := &WorkflowData{}
+				switch source {
+				case "engine":
+					workflowData.EngineConfig = &EngineConfig{Env: map[string]string{envName: expression.value}}
+				case "agent":
+					workflowData.SandboxConfig = &SandboxConfig{
+						Agent: &AgentSandboxConfig{Env: map[string]string{envName: expression.value}},
+					}
+				case "mcp-scripts":
+					workflowData.MCPScripts = &MCPScriptsConfig{
+						Tools: map[string]*MCPScriptToolConfig{
+							"example": {Env: map[string]string{envName: expression.value}},
+						},
+					}
+				}
+
+				assert.Contains(t, ComputeAWFExcludeEnvVarNames(workflowData, nil), envName)
+			})
+		}
+	}
+}
+
 // TestMainAgentRunUsesStandardCreditsExpressionNotDetectionExpression verifies that
 // a standard (non-detection) main-agent run emits the main-agent credits expression
 // (vars.GH_AW_DEFAULT_MAX_AI_CREDITS) and not the detection-specific one, so a future

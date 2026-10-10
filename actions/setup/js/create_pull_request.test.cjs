@@ -154,6 +154,59 @@ describe("create_pull_request - draft policy enforcement", () => {
     expect(result.metadata).toEqual({ node_id: "PR_kwDOtest456" });
   });
 
+  it("should depth-limit the base branch fetch in a shallow repository", async () => {
+    global.exec.getExecOutput.mockImplementation((cmd, args) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      if (cmd === "git" && args[0] === "show-ref") {
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    const result = await handler({ title: "Test PR", body: "Test body" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "--depth=1", "origin", "main"]);
+  });
+
+  it("should preserve existing base history in a shallow repository", async () => {
+    global.exec.getExecOutput.mockImplementation((cmd, args) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    const result = await handler({ title: "Test PR", body: "Test body" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "origin", "main"]);
+    expect(global.exec.exec).not.toHaveBeenCalledWith("git", ["fetch", "--depth=1", "origin", "main"]);
+  });
+
+  it("should preserve a sparse-full repository when fetching the base branch", async () => {
+    global.exec.getExecOutput.mockImplementation((cmd, args) => {
+      if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+        return Promise.resolve({ exitCode: 0, stdout: "false\n", stderr: "" });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+    });
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    const result = await handler({ title: "Test PR", body: "Test body" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "origin", "main"]);
+    expect(global.exec.exec).not.toHaveBeenCalledWith("git", ["fetch", "--depth=1", "origin", "main"]);
+  });
+
   it("should enforce draft: false from config even when agent requests draft: true", async () => {
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({ draft: "false", allow_empty: true });
@@ -597,6 +650,92 @@ index 0000000..abc1234
 
     expect(result.success).toBe(true);
     expect(pushSignedSpy).toHaveBeenCalledWith(expect.objectContaining({ signedCommits: false }));
+  });
+
+  it("should create the PR when the bundle push fails once with a transient workflows-scope timeout and succeeds on retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const patchPath = canonicalPatchPath("feature/test");
+      fs.writeFileSync(
+        patchPath,
+        `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+      );
+      const bundlePath = canonicalBundlePath("feature/test");
+      fs.writeFileSync(bundlePath, "bundle content");
+      pushSignedSpy.mockRejectedValueOnce(new Error("Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required.")).mockResolvedValueOnce("bundle-tip");
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ base_branch: "main", preserve_branch_name: true });
+      const resultPromise = handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).not.toBe(true);
+      expect(pushSignedSpy).toHaveBeenCalledTimes(2);
+      expect(global.github.rest.pulls.create).toHaveBeenCalled();
+      expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("should fall back to a review issue when the bundle push keeps failing with a transient workflows-scope timeout after retries are exhausted", async () => {
+    vi.useFakeTimers();
+    try {
+      const patchPath = canonicalPatchPath("feature/test");
+      fs.writeFileSync(
+        patchPath,
+        `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+      );
+      const bundlePath = canonicalBundlePath("feature/test");
+      fs.writeFileSync(bundlePath, "bundle content");
+      pushSignedSpy.mockRejectedValue(new Error("Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required."));
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ base_branch: "main", preserve_branch_name: true });
+      const resultPromise = handler({ title: "Test PR", body: "Test body", branch: "feature/test" }, {});
+
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBe(true);
+      // 1 initial + 5 retries = 6 total push attempts (RATE_LIMIT_RETRY_CONFIG.maxRetries = 5)
+      expect(pushSignedSpy).toHaveBeenCalledTimes(6);
+      expect(global.github.rest.issues.create).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("should rewrite bundle history to a single commit and retry when signed push rejects merge commits", async () => {
@@ -1284,6 +1423,92 @@ index 0000000..abc1234
     expect(fallbackIssueBody).not.toContain("Closes #57");
     expect(fallbackIssueBody).not.toContain("Resolves test-owner/test-repo#58");
   });
+
+  it("should create the PR when the initial push fails once with a transient workflows-scope timeout and succeeds on retry (no bundle)", async () => {
+    vi.useFakeTimers();
+    try {
+      const patchPath = canonicalPatchPath("autoloop/perf-comparison");
+      fs.writeFileSync(
+        patchPath,
+        `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+      );
+      // No bundle file - forces the patch transport fallback path
+      pushSignedSpy.mockRejectedValueOnce(new Error("Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required.")).mockResolvedValueOnce("new-head-sha");
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ base_branch: "main", preserve_branch_name: true });
+      const resultPromise = handler({ title: "Test PR", body: "Test body", branch: "autoloop/perf-comparison" }, {});
+
+      await vi.runAllTimersAsync();
+
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).not.toBe(true);
+      expect(pushSignedSpy).toHaveBeenCalledTimes(2);
+      expect(global.github.rest.pulls.create).toHaveBeenCalled();
+      expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("should fall back to a review issue when the initial push keeps failing with a transient workflows-scope timeout after retries are exhausted (no bundle)", async () => {
+    vi.useFakeTimers();
+    try {
+      const patchPath = canonicalPatchPath("autoloop/perf-comparison");
+      fs.writeFileSync(
+        patchPath,
+        `From abc123 Mon Sep 17 00:00:00 2001
+From: Test Author <test@example.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] Test commit
+
+diff --git a/test.txt b/test.txt
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/test.txt
+@@ -0,0 +1 @@
++Hello World
+--
+2.34.1
+`
+      );
+      // No bundle file - forces the patch transport fallback path
+      pushSignedSpy.mockRejectedValue(new Error("Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required."));
+
+      const { main } = require("./create_pull_request.cjs");
+      const handler = await main({ base_branch: "main", preserve_branch_name: true });
+      const resultPromise = handler({ title: "Test PR", body: "Test body", branch: "autoloop/perf-comparison" }, {});
+
+      await vi.runAllTimersAsync();
+
+      const result = await resultPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBe(true);
+      // 1 initial + 5 retries = 6 total push attempts (RATE_LIMIT_RETRY_CONFIG.maxRetries = 5)
+      expect(pushSignedSpy).toHaveBeenCalledTimes(6);
+      expect(global.github.rest.issues.create).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("create_pull_request - fallback-as-issue configuration", () => {
@@ -1620,9 +1845,9 @@ describe("create_pull_request - max limit enforcement", () => {
     const { countUniquePatchFiles, parseDiffGitHeader } = require("./create_pull_request.cjs");
 
     // Embedded escaped quote: "a/foo\"bar" "b/foo\"bar"
-    expect(parseDiffGitHeader('diff --git "a/foo\\"bar" "b/foo\\"bar"')).toBe('foo\\"bar');
+    expect(parseDiffGitHeader('diff --git "a/foo\\"bar" "b/foo\\"bar"')).toBe('foo"bar');
     // Embedded backslash: "a/foo\\bar" "b/foo\\bar"
-    expect(parseDiffGitHeader('diff --git "a/foo\\\\bar" "b/foo\\\\bar"')).toBe("foo\\\\bar");
+    expect(parseDiffGitHeader('diff --git "a/foo\\\\bar" "b/foo\\\\bar"')).toBe("foo\\bar");
     // Plain unquoted form
     expect(parseDiffGitHeader("diff --git a/foo.txt b/foo.txt")).toBe("foo.txt");
     // Path with spaces (git always emits quoted form when path contains spaces)
@@ -3093,6 +3318,27 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     expect(checkoutWithBaseCommit).toBeTruthy();
   });
 
+  it("should preserve an existing shallow base ref for the patch ancestry check", async () => {
+    global.exec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockImplementation((cmd, args) => {
+        if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+          return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }),
+    };
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({});
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: MOCK_BASE_COMMIT_SHA }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.exec.exec).toHaveBeenCalledWith("git", ["fetch", "origin", "main"]);
+    expect(global.exec.exec).not.toHaveBeenCalledWith("git", ["fetch", "--depth=1", "origin", "main"]);
+    expect(global.exec.getExecOutput).toHaveBeenCalledWith("git", ["merge-base", "--is-ancestor", MOCK_BASE_COMMIT_SHA, "origin/main"], { ignoreReturnCode: true });
+  });
+
   it("should ignore agent-supplied base_commit values when creating the branch", async () => {
     global.exec = {
       exec: vi.fn().mockResolvedValue(0),
@@ -4466,6 +4712,21 @@ describe("create_pull_request - branch-prefix config", () => {
     expect(createCall.owner).toBe("test-owner");
     expect(createCall.repo).toBe("test-repo");
     expect(createCall.head).toMatch(/^fork-owner:my-feature(?:-[0-9a-f]+)?$/);
+  });
+
+  it("should include head_repo when the head and target repositories have the same owner", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      allow_empty: true,
+      "head-repo": "test-owner/docs-automation",
+      allowed_repos: ["test-owner/test-repo", "test-owner/docs-automation"],
+    });
+
+    await handler({ title: "Test PR", body: "body", branch: "my-feature" }, {});
+
+    const createCall = global.github.rest.pulls.create.mock.calls[0][0];
+    expect(createCall.head).toMatch(/^test-owner:my-feature(?:-[0-9a-f]+)?$/);
+    expect(createCall.head_repo).toBe("test-owner/docs-automation");
   });
 
   it("should normalize an invalid branch-prefix and emit a warning", async () => {

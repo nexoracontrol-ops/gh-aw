@@ -13,7 +13,6 @@ permissions:
   pull-requests: read
 sandbox:
   agent:
-    runtime: cloud-hypervisor
     id: awf
 tracker-id: daily-schema-audit-cursor
 engine:
@@ -34,6 +33,8 @@ tools:
     - find
     - jq
     - wc
+    - sort
+    - echo
 safe-outputs:
   create-issue:
     expires: 1d

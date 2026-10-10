@@ -1400,7 +1400,7 @@ func TestJobWithGitHubAppWorkflowCallUsesTargetRepoNameFallback(t *testing.T) {
 	stepsContent := strings.Join(job.Steps, "")
 
 	// Must use the repo-name-only output, NOT the full slug
-	assert.Contains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo_name }}",
+	assert.Contains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo_name || github.event.repository.name }}",
 		"GitHub App token step must use target_repo_name (repo name only) for workflow_call workflows")
 	assert.NotContains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo }}",
 		"GitHub App token step must not use target_repo (full slug) for workflow_call workflows")
@@ -1436,7 +1436,7 @@ func TestConclusionJobWithGitHubAppWorkflowCallUsesTargetRepoNameFallback(t *tes
 	stepsContent := strings.Join(job.Steps, "")
 
 	// Must use the repo-name-only output, NOT the full slug
-	assert.Contains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo_name }}",
+	assert.Contains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo_name || github.event.repository.name }}",
 		"Conclusion job GitHub App token step must use target_repo_name (repo name only) for workflow_call workflows")
 	assert.NotContains(t, stepsContent, "repositories: ${{ needs.activation.outputs.target_repo }}",
 		"Conclusion job GitHub App token step must not use target_repo (full slug) for workflow_call workflows")
@@ -1712,12 +1712,35 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 	}
 }
 
+func TestCreateCodeScanningAlertUploadJobWorkflowCallDependsOnActivation(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+
+	workflowData := &WorkflowData{
+		Name: "Test Workflow",
+		On: `"on":
+  workflow_call:`,
+		SafeOutputs: &SafeOutputsConfig{
+			CreateCodeScanningAlerts: &CreateCodeScanningAlertsConfig{},
+		},
+	}
+
+	uploadJob, err := compiler.buildCodeScanningUploadJob(workflowData)
+	require.NoError(t, err)
+	require.NotNil(t, uploadJob)
+	assert.Equal(t, []string{
+		string(constants.ActivationJobName),
+		string(constants.SafeOutputsJobName),
+	}, uploadJob.Needs)
+	assert.Contains(t, strings.Join(uploadJob.Steps, ""), "${{ needs.activation.outputs.artifact_prefix }}")
+}
+
 // TestBuildSafeOutputItemsManifestUploadStep verifies that the upload step includes
 // the manifest and temporary ID map but excludes process stdout/stderr logs.
 func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
 	steps := buildSafeOutputItemsManifestUploadStep("", func(action string) string {
 		return action + "@test-pin"
-	})
+	}, false)
 
 	content := strings.Join(steps, "")
 
@@ -1726,4 +1749,49 @@ func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
 	assert.Contains(t, content, "/tmp/gh-aw/safe-output-items.jsonl")
 	assert.NotContains(t, content, "process-safe-outputs.stdout.log")
 	assert.NotContains(t, content, "process-safe-outputs.stderr.log")
+}
+
+func TestSafeOutputClaimArtifactsRequireWorkerAndSuccessfulRedaction(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		queue  any
+		staged bool
+		worker bool
+	}{
+		{name: "ordinary"},
+		{name: "queue-disabled", queue: false},
+		{name: "queue-reader", queue: true},
+		{name: "worker", queue: map[string]any{"worker": true}, worker: true},
+		{name: "staged-worker", queue: map[string]any{"worker": true}, staged: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.trialMode = test.staged
+			data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{}, Tools: map[string]any{}}
+			if test.queue != nil {
+				data.Tools["work-queue"] = test.queue
+			}
+			before := []string{
+				"      - name: Process Safe Outputs\n",
+				"        env:\n",
+				"          PRIVATE_TOKEN: ${{ secrets.PRIVATE_TOKEN }}\n",
+			}
+			content := strings.Join(compiler.appendFinalSafeOutputSteps(data, before, ""), "")
+			require.NotContains(t, content, "/tmp/gh-aw/claims/*/delivery-receipt.json")
+			if test.worker {
+				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-items.jsonl")
+				require.Contains(t, content, "/tmp/gh-aw/claims/*/temporary-id-map.json")
+				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-errors.json")
+				require.Contains(t, content, "id: redact_secrets")
+				require.Contains(t, content, "steps.redact_secrets.outcome == 'success'")
+				require.Contains(t, content, "SECRET_PRIVATE_TOKEN: ${{ secrets.PRIVATE_TOKEN }}")
+				require.Contains(t, content, "retention-days: 1")
+				require.Less(t, strings.Index(content, "id: redact_secrets"), strings.Index(content, "Upload Safe Outputs Items"))
+			} else {
+				require.NotContains(t, content, "/claims/")
+				require.NotContains(t, content, "redact_secrets")
+				require.NotContains(t, content, "retention-days:")
+			}
+		})
+	}
 }

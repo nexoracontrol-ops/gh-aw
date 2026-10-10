@@ -6,15 +6,16 @@
 // by the enabled feature set must be listed and AWF fails closed instead of falling
 // back to the official registry.
 //
-// The repository-level .github/workflows/aw.json "container_pins" setting can
-// redirect default AWF references for predownload and lock metadata, but it
-// cannot change the role references AWF resolves at runtime. This manifest is
-// authoritative for both runtime role selection and gh-aw's matching predownload.
+// The repository-level .github/workflows/aw.json "container_pins" setting redirects
+// default AWF references for predownload and lock metadata. Detection jobs also
+// translate those redirects into a closed runtime manifest. An explicitly configured
+// manifest remains authoritative for runtime role selection and matching predownload.
 
 package workflow
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -32,6 +33,7 @@ const (
 	awfImageRoleSquid            = "squid"
 	awfImageRoleAgent            = "agent"
 	awfImageRoleAPIProxy         = "apiProxy"
+	awfImageRoleRouter           = "router"
 	awfImageRoleCliProxy         = "cliProxy"
 	awfImageRoleBuildTools       = "buildTools"
 	awfImageRoleDohProxy         = "dohProxy"
@@ -46,6 +48,7 @@ var awfImageRoles = []string{
 	awfImageRoleSquid,
 	awfImageRoleAgent,
 	awfImageRoleAPIProxy,
+	awfImageRoleRouter,
 	awfImageRoleCliProxy,
 	awfImageRoleBuildTools,
 	awfImageRoleDohProxy,
@@ -53,6 +56,31 @@ var awfImageRoles = []string{
 	awfImageRoleEnclaveAgent,
 	awfImageRoleEnclaveMcpServer,
 	awfImageRoleDindStaging,
+}
+
+// sandboxImageRoleFromFrontmatter converts the hyphenated frontmatter spelling to
+// the camel-cased role name required by the AWF config schema.
+func sandboxImageRoleFromFrontmatter(role string) string {
+	switch role {
+	case "api-proxy":
+		return awfImageRoleAPIProxy
+	case "cli-proxy":
+		return awfImageRoleCliProxy
+	case "build-tools":
+		return awfImageRoleBuildTools
+	case "doh-proxy":
+		return awfImageRoleDohProxy
+	case "enclave-script":
+		return awfImageRoleEnclaveScript
+	case "enclave-agent":
+		return awfImageRoleEnclaveAgent
+	case "enclave-mcp-server":
+		return awfImageRoleEnclaveMcpServer
+	case "dind-staging":
+		return awfImageRoleDindStaging
+	default:
+		return role
+	}
 }
 
 // awfPinnedImagePattern is AWF's canonical digestPinnedImage grammar. It follows
@@ -63,10 +91,52 @@ var awfPinnedImagePattern = regexp.MustCompile(`^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[
 // getSandboxAgentImages returns the configured sandbox.agent.images manifest, or nil.
 func getSandboxAgentImages(workflowData *WorkflowData) map[string]string {
 	agentConfig := getAgentConfig(workflowData)
-	if agentConfig == nil || len(agentConfig.Images) == 0 {
+	if (agentConfig == nil || len(agentConfig.Images) == 0) && !isModelRoutingEnabled(workflowData) {
 		return nil
 	}
-	return agentConfig.Images
+	images := make(map[string]string)
+	if agentConfig != nil {
+		maps.Copy(images, agentConfig.Images)
+	}
+	if isModelRoutingEnabled(workflowData) {
+		defaultImages, _ := modelRoutingDefaultImages(workflowData, images)
+		for role, image := range defaultImages {
+			if _, exists := images[role]; !exists {
+				images[role] = image
+			}
+		}
+	}
+	return images
+}
+
+func modelRoutingDefaultImages(workflowData *WorkflowData, configuredImages map[string]string) (map[string]string, []string) {
+	images := make(map[string]string)
+	var missing []string
+	imageTag := getAWFImageTag(getFirewallConfig(workflowData))
+	roles := []string{awfImageRoleSquid, awfImageRoleAgent, awfImageRoleAPIProxy, awfImageRoleCliProxy}
+	for _, role := range roles {
+		if _, configured := configuredImages[role]; configured {
+			continue
+		}
+		image := defaultAWFImageForRole(role, imageTag)
+		pin, found := lookupContainerPin(image, workflowData.ActionCache)
+		if !found || pin.PinnedImage == "" {
+			missing = append(missing, image)
+			continue
+		}
+		images[role] = pin.PinnedImage
+	}
+
+	if _, configured := configuredImages[awfImageRoleRouter]; !configured {
+		image := constants.DefaultRouterRegistry + ":" + string(constants.DefaultRouterVersion)
+		pin, found := lookupContainerPin(image, workflowData.ActionCache)
+		if !found || pin.PinnedImage == "" {
+			missing = append(missing, image)
+		} else {
+			images[awfImageRoleRouter] = pin.PinnedImage
+		}
+	}
+	return images, missing
 }
 
 // isKnownAWFImageRole reports whether role is part of the closed AWF role set.
@@ -78,6 +148,9 @@ func isKnownAWFImageRole(role string) bool {
 // manifest for the workflow's enabled feature set.
 func requiredAWFImageRoles(workflowData *WorkflowData) []string {
 	required := []string{awfImageRoleSquid, awfImageRoleAgent, awfImageRoleAPIProxy}
+	if isModelRoutingEnabled(workflowData) {
+		required = appendUniqueRole(required, awfImageRoleRouter)
+	}
 	args := customAWFArgs(workflowData)
 	if isCliProxyNeeded(workflowData) || hasEnabledAWFArg(args, "--difc-proxy-host") {
 		required = append(required, awfImageRoleCliProxy)
@@ -129,6 +202,8 @@ func defaultAWFImageForRole(role, imageTag string) string {
 		return constants.DefaultFirewallRegistry + "/agent:" + imageTag
 	case awfImageRoleAPIProxy:
 		return constants.DefaultFirewallRegistry + "/api-proxy:" + imageTag
+	case awfImageRoleRouter:
+		return constants.DefaultFirewallRegistry + "/router:" + imageTag
 	case awfImageRoleCliProxy:
 		return constants.DefaultFirewallRegistry + "/cli-proxy:" + imageTag
 	case awfImageRoleBuildTools:
@@ -190,6 +265,23 @@ func validateSandboxAgentImages(workflowData *WorkflowData) error {
 		return nil
 	}
 
+	if isModelRoutingEnabled(workflowData) {
+		configuredImages := map[string]string(nil)
+		if agentConfig := getAgentConfig(workflowData); agentConfig != nil {
+			configuredImages = agentConfig.Images
+		}
+		_, missing := modelRoutingDefaultImages(workflowData, configuredImages)
+		if len(missing) > 0 {
+			effectiveVersion := getAWFImageTag(getFirewallConfig(workflowData))
+			return NewValidationError(
+				"sandbox.agent.images",
+				strings.Join(missing, ", "),
+				"no digest pins are available for model routing with AWF version "+effectiveVersion,
+				fmt.Sprintf("Add matching entries to the embedded container pin catalog or provide explicit sandbox.agent.images overrides for: %s.", strings.Join(missing, ", ")),
+			)
+		}
+	}
+
 	roles := make([]string, 0, len(images))
 	for role := range images {
 		roles = append(roles, role)
@@ -215,19 +307,9 @@ func validateSandboxAgentImages(workflowData *WorkflowData) error {
 		return err
 	}
 
-	// AWF version gate: container.images is only understood by AWF v0.28.4+.
 	firewallConfig := getFirewallConfig(workflowData)
-	if !awfSupportsContainerImages(firewallConfig) {
-		effectiveVersion := string(constants.DefaultFirewallVersion)
-		if firewallConfig != nil && firewallConfig.Version != "" {
-			effectiveVersion = firewallConfig.Version
-		}
-		return NewValidationError(
-			"sandbox.agent.images",
-			strings.Join(roles, ", "),
-			fmt.Sprintf("sandbox.agent.images requires AWF %s or newer", constants.AWFContainerImagesMinVersion),
-			fmt.Sprintf("The custom image manifest maps to container.images, which older AWF versions reject.\n\nThe effective AWF version is %s. Set sandbox.agent.version (or firewall.version) to %s or newer.", effectiveVersion, constants.AWFContainerImagesMinVersion),
-		)
+	if err := validateAWFImageManifestVersionGates(firewallConfig, images, roles); err != nil {
+		return err
 	}
 
 	if err := validateNoConflictingAWFImageSelectors(workflowData, firewallConfig, roles); err != nil {
@@ -255,8 +337,38 @@ func validateAWFImageManifestCoverage(workflowData *WorkflowData, images map[str
 		"sandbox.agent.images",
 		strings.Join(roles, ", "),
 		"incomplete image manifest: missing required role(s) "+strings.Join(missing, ", "),
-		fmt.Sprintf("AWF fails closed when container.images is set, so every image role required by the enabled features must be pinned.\n\nAdd the missing role(s):\n\nsandbox:\n  agent:\n    images:\n      %s: registry.example.com/approved/%s:v0.28.4@sha256:<64-hex-digest>\n\nSee: %s", missing[0], missing[0], constants.DocsSandboxURL),
+		fmt.Sprintf("AWF fails closed when container.images is set, so every image role required by the enabled features must be pinned.\n\nAdd the missing role(s):\n\nsandbox:\n  agent:\n    images:\n      %s: registry.example.com/approved/%s:v0.28.4@sha256:<64-hex-digest>\n\nSee: %s", missing[0], missing[0], constants.DocsSandboxURL), //nolint:uncheckedsliceindex // missing is non-empty per the len(missing) == 0 check above
 	)
+}
+
+// validateAWFImageManifestVersionGates enforces the AWF minimum versions required
+// by the manifest: the base container.images support (AWF v0.28.4+) and, when
+// present, the "router" role (AWF v0.28.21+).
+func validateAWFImageManifestVersionGates(firewallConfig *FirewallConfig, images map[string]string, roles []string) error {
+	effectiveVersion := string(constants.DefaultFirewallVersion)
+	if firewallConfig != nil && firewallConfig.Version != "" {
+		effectiveVersion = firewallConfig.Version
+	}
+
+	if !awfSupportsContainerImages(firewallConfig) {
+		return NewValidationError(
+			"sandbox.agent.images",
+			strings.Join(roles, ", "),
+			fmt.Sprintf("sandbox.agent.images requires AWF %s or newer", constants.AWFContainerImagesMinVersion),
+			fmt.Sprintf("The custom image manifest maps to container.images, which older AWF versions reject.\n\nThe effective AWF version is %s. Set sandbox.agent.version (or firewall.version) to %s or newer.", effectiveVersion, constants.AWFContainerImagesMinVersion),
+		)
+	}
+
+	if _, ok := images[awfImageRoleRouter]; ok && !awfSupportsRouterImageRole(firewallConfig) {
+		return NewValidationError(
+			"sandbox.agent.images.router",
+			images[awfImageRoleRouter],
+			fmt.Sprintf("sandbox.agent.images.router requires AWF %s or newer", constants.AWFRouterImageRoleMinVersion),
+			fmt.Sprintf("The router role in container.images is rejected by older AWF versions.\n\nThe effective AWF version is %s. Set sandbox.agent.version (or firewall.version) to %s or newer.", effectiveVersion, constants.AWFRouterImageRoleMinVersion),
+		)
+	}
+
+	return nil
 }
 
 // validateNoConflictingAWFImageSelectors rejects other configuration that could

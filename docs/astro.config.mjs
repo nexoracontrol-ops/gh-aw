@@ -253,11 +253,22 @@ export default defineConfig({
     "/reference/repository-package-manifest/": "/gh-aw/reference/aw-yml-package-manifest/",
   },
   integrations: [
+    // Dev-only pages for the social preview images (see scripts/capture-og.mjs).
+    {
+      name: "og-preview",
+      hooks: {
+        "astro:config:setup": ({ command, injectRoute }) => {
+          if (command !== "dev") return;
+          injectRoute({ pattern: "/og-preview/home", entrypoint: "./src/og/OgHome.astro" });
+          injectRoute({ pattern: "/og-preview/background", entrypoint: "./src/og/OgBackground.astro" });
+        },
+      },
+    },
     sitemap(),
     mermaid(),
     starlight({
       title: "GitHub Agentic Workflows",
-      description: "Write agentic workflows in natural language using markdown files and run them as GitHub Actions workflows.",
+      description: "Intelligent automation for GitHub with Copilot, Claude, Codex or Gemini. Agents triage, investigate and open pull requests with guardrails and cost controls.",
       favicon: "/favicon.svg",
       logo: {
         src: "./src/assets/agentic-workflow.svg",
@@ -267,12 +278,17 @@ export default defineConfig({
         Banner: "./src/components/RecruitmentBanner.astro",
         Head: "./src/components/CustomHead.astro",
         SkipLink: "./src/components/SkipLink.astro",
-        SocialIcons: "./src/components/CustomHeader.astro",
+        Header: "./src/components/SiteHeader.astro",
+        MobileMenuToggle: "./src/components/MobileMenuToggle.astro",
+        MobileMenuFooter: "./src/components/MobileMenuFooter.astro",
+        Sidebar: "./src/components/Sidebar.astro",
         ThemeSelect: "./src/components/ThemeToggle.astro",
         Footer: "./src/components/CustomFooter.astro",
+        PageFrame: "./src/components/PageFrame.astro",
+        PageTitle: "./src/components/PageTitle.astro",
         SiteTitle: "./src/components/CustomLogo.astro",
       },
-      customCss: ["./src/styles/custom.css"],
+      customCss: ["./src/styles/tokens.css", "./src/styles/custom.css", "./src/styles/landing.css", "./src/styles/chrome.css", "./src/styles/docs-components.css"],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/github/gh-aw" }],
       tableOfContents: {
         minHeadingLevel: 2,
@@ -282,6 +298,24 @@ export default defineConfig({
       expressiveCode: {
         frames: {
           showCopyToClipboardButton: true,
+        },
+        styleOverrides: {
+          borderRadius: "7px",
+          borderWidth: "1px",
+          borderColor: "var(--aw-color-border)",
+          codeBackground: "var(--aw-color-bg-subtle)",
+          codeFontSize: "var(--aw-step--1)",
+          codeLineHeight: "1.6",
+          frames: {
+            shadowColor: "transparent",
+            frameBoxShadowCssValue: "none",
+            editorTabBarBackground: "var(--aw-color-bg-subtle)",
+            editorActiveTabBackground: "var(--aw-color-bg-subtle)",
+            editorTabBarBorderBottomColor: "var(--aw-color-border)",
+            terminalTitlebarBackground: "var(--aw-color-bg-subtle)",
+            terminalTitlebarBorderBottomColor: "var(--aw-color-border)",
+            terminalBackground: "var(--aw-color-bg-subtle)",
+          },
         },
         shiki: {
           langs: /** @type {any[]} */ ["markdown", "yaml"],
@@ -355,7 +389,7 @@ export default defineConfig({
             { label: "Quick Start", link: "/setup/quick-start/" },
             { label: "Creating New Workflows", link: "/setup/creating-workflows/" },
             { label: "Working with Workflows", link: "/guides/working-with-workflows/" },
-            { label: "Creation Wizard", link: "/wizard/" },
+            { label: "Creation Wizard", link: "/wizard/", attrs: { class: "sidebar-external", target: "_blank", rel: "noopener", "aria-label": "Creation Wizard (opens in a new tab)" } },
             { label: "CLI Commands", link: "/setup/cli/" },
           ],
         },
@@ -366,6 +400,7 @@ export default defineConfig({
             { label: "Claude Code", link: "/engines/claude/" },
             { label: "OpenAI Codex", link: "/engines/codex/" },
             { label: "Google Gemini", link: "/engines/gemini/" },
+            { label: "Agy (experimental)", link: "/engines/agy/" },
             { label: "Pi", link: "/engines/pi/" },
           ],
         },
@@ -375,6 +410,7 @@ export default defineConfig({
             { label: "GitHub Actions Primer", link: "/guides/github-actions-primer/" },
             { label: "Using MCPs", link: "/guides/mcps/" },
             { label: "Network Configuration", link: "/guides/network-configuration/" },
+            { label: "Deploying a Work Queue", link: "/guides/deploy-work-queue/" },
             { label: "Agentic Automation Workshop", link: "/workshop/" },
             { label: "Using at Scale in Organizations", link: "/guides/using-at-scale/" },
           ],
@@ -389,7 +425,7 @@ export default defineConfig({
             { label: "Repository Maintenance", link: "/gallery/maintaining-repos/" },
             { label: "CI Failure Investigation", link: "/gallery/ci-failure-investigation/" },
             { label: "Code Improvement", link: "/gallery/code-improvement/" },
-            { label: "Dependency Analysis", link: "/patterns/research-plan-assign-ops/" },
+            { label: "Dependency Analysis", link: "/gallery/dependency-analysis/" },
             { label: "Metrics and Analytics", link: "/gallery/metrics-analytics/" },
             { label: "Repository Reporting", link: "/gallery/ai-release-notes/" },
             { label: "Security Review", link: "/gallery/security-review/" },
@@ -407,10 +443,12 @@ export default defineConfig({
             { label: "BatchOps", link: "/patterns/batch-ops/" },
             { label: "CentralRepoOps", link: "/patterns/central-repo-ops/" },
             { label: "ChatOps", link: "/patterns/chat-ops/" },
+            { label: "Daily Report Portfolio", link: "/patterns/daily-report-portfolio/" },
             { label: "DeterministicOps", link: "/patterns/deterministic-ops/" },
             { label: "DispatchOps", link: "/patterns/dispatch-ops/" },
             { label: "IssueOps", link: "/patterns/issue-ops/" },
             { label: "LabelOps", link: "/patterns/label-ops/" },
+            { label: "Linter Factory", link: "/patterns/linter-factory/" },
             { label: "MemoryOps", link: "/patterns/memory-ops/" },
             { label: "MonitorOps", link: "/patterns/monitor-ops/" },
             { label: "FeatureOps", link: "/patterns/feature-grower/" },
@@ -490,6 +528,7 @@ export default defineConfig({
             { label: "Tools (Playwright)", link: "/reference/playwright/" },
             { label: "Tools (Serena)", link: "/reference/serena/" },
             { label: "Tools (Web Search)", link: "/reference/web-search/" },
+            { label: "Work Queues", link: "/reference/work-queue/" },
             { label: "Workflows", link: "/reference/workflow-structure/" },
             { label: "Workflows (Frontmatter)", link: "/reference/frontmatter/" },
             { label: "Workflows (Markdown)", link: "/reference/markdown/" },

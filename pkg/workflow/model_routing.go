@@ -1,0 +1,414 @@
+package workflow
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"regexp"
+	"strings"
+
+	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
+)
+
+const modelRoutingConversationFile = "/tmp/gh-aw/routing-conversation.json"
+
+var routingModelNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+type CopilotModelRoutingConfig struct {
+	Goal          string
+	Mode          string
+	AllowedModels []string
+}
+
+func isModelRoutingEnabled(data *WorkflowData) bool {
+	return data != nil && data.EngineConfig != nil && data.EngineConfig.ModelRouting != nil
+}
+
+func applyModelRoutingEnv(env map[string]string, data *WorkflowData) {
+	if isModelRoutingEnabled(data) {
+		env["GH_AW_MODEL_ROUTING"] = "1"
+	}
+}
+
+func resolveModelRoutingAllowedModels(routing *CopilotModelRoutingConfig) ([]string, error) {
+	if routing == nil {
+		return nil, nil
+	}
+	if len(routing.AllowedModels) == 0 {
+		return nil, errors.New("engine.model-routing.allowed-models must contain at least one Copilot model")
+	}
+
+	models := make([]string, 0, len(routing.AllowedModels))
+	seen := make(map[string]struct{}, len(routing.AllowedModels))
+	for _, model := range routing.AllowedModels {
+		model = strings.TrimSpace(model)
+		model = strings.TrimPrefix(model, "github-copilot/")
+		model = strings.TrimPrefix(model, "copilot/")
+		if !validModelRoutingCandidate(model) {
+			return nil, fmt.Errorf("engine.model-routing.allowed-models contains invalid Copilot model %q", model)
+		}
+		qualified := "github-copilot/" + model
+		if _, ok := seen[qualified]; ok {
+			continue
+		}
+		seen[qualified] = struct{}{}
+		models = append(models, qualified)
+	}
+	return models, nil
+}
+
+func intersectModelRoutingPolicy(candidates, allowed, blocked []string) ([]string, error) {
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if containsExpression(candidate) {
+			if len(allowed) > 0 || len(blocked) > 0 {
+				return nil, errors.New("GitHub Actions expressions in engine.model-routing.allowed-models cannot be checked against models.allowed or models.blocked")
+			}
+			result = append(result, candidate)
+			continue
+		}
+		model := strings.TrimPrefix(candidate, "github-copilot/")
+		if len(allowed) > 0 && !matchesModelPolicy(model, candidate, allowed) {
+			continue
+		}
+		if matchesModelPolicy(model, candidate, blocked) {
+			continue
+		}
+		result = append(result, candidate)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("all engine.model-routing.allowed-models are excluded by models.allowed or models.blocked policy")
+	}
+	return result, nil
+}
+
+func validModelRoutingCandidate(model string) bool {
+	if !containsExpression(model) {
+		return routingModelNamePattern.MatchString(model)
+	}
+	withoutExpressions := ExpressionPattern.ReplaceAllString(model, "x")
+	return routingModelNamePattern.MatchString(withoutExpressions)
+}
+
+// subAgentRequestModels extends request policy without changing router candidates.
+func subAgentRequestModels(data *WorkflowData, candidates, allowed, blocked []string) ([]string, []string) {
+	result := append([]string(nil), candidates...)
+	seen := make(map[string]struct{}, len(result))
+	for _, candidate := range result {
+		seen[candidate] = struct{}{}
+	}
+	var warnings []string
+	for _, agent := range data.SubAgentModels {
+		patterns := expandSubagentModelPatterns(agent.Model, data, "github-copilot")
+		admitted := false
+		for _, pattern := range patterns {
+			if len(allowed) > 0 && strings.ContainsAny(pattern, "*[") {
+				for _, rule := range allowed {
+					if strings.ContainsAny(rule, "*[") {
+						continue
+					}
+					qualified := rule
+					if !strings.Contains(rule, "/") {
+						qualified = "github-copilot/" + rule
+					}
+					if matched, _ := path.Match(pattern, qualified); matched {
+						if !matchesModelPolicy(rule, qualified, blocked) {
+							admitted = true
+							if _, ok := seen[qualified]; !ok {
+								result = append(result, qualified)
+								seen[qualified] = struct{}{}
+							}
+						}
+					}
+				}
+			}
+			model := strings.TrimPrefix(pattern, "github-copilot/")
+			if len(allowed) > 0 && !matchesModelPolicy(model, pattern, allowed) {
+				continue
+			}
+			if matchesModelPolicy(model, pattern, blocked) {
+				continue
+			}
+			admitted = true
+			if _, ok := seen[pattern]; !ok {
+				result = append(result, pattern)
+				seen[pattern] = struct{}{}
+			}
+		}
+		if !admitted {
+			warnings = append(warnings, fmt.Sprintf("sub-agent %q model %q cannot be admitted by models.allowed or models.blocked (or resolves to no models)", agent.Name, agent.Model))
+		}
+	}
+	return result, warnings
+}
+
+func expandModelPatterns(request string, aliases map[string][]string, defaultProvider string) []string {
+	var patterns []string
+	var expand func(string, map[string]bool, bool)
+	expand = func(model string, visited map[string]bool, fromAlias bool) {
+		model, _, _ = strings.Cut(model, "?")
+		if entries, ok := aliases[model]; ok {
+			if visited[model] {
+				return
+			}
+			visited[model] = true
+			for _, entry := range entries {
+				expand(entry, visited, true)
+			}
+			delete(visited, model)
+			return
+		}
+		if !fromAlias && strings.ContainsAny(model, "*[]") {
+			return
+		}
+		if suffix, ok := strings.CutPrefix(model, "copilot/"); ok {
+			model = "github-copilot/" + suffix
+		} else if !strings.Contains(model, "/") {
+			if !routingModelNamePattern.MatchString(model) {
+				return
+			}
+			model = path.Join(defaultProvider, model)
+		}
+		if provider, name, ok := strings.Cut(model, "/"); ok && provider != "" && name != "" {
+			patterns = append(patterns, model)
+		}
+	}
+	expand(request, make(map[string]bool), false)
+	return patterns
+}
+
+func (c *Compiler) warnRoutedSubAgentModels(data *WorkflowData) {
+	if !isModelRoutingEnabled(data) {
+		return
+	}
+	c.warnRoutedModelOverrides(data)
+	if len(data.SubAgentModels) == 0 {
+		return
+	}
+	for _, agent := range data.SubAgentModels {
+		for _, model := range expandSubagentModelPatterns(agent.Model, data, "github-copilot") {
+			if !modelRoutingEngineSupportsModel(data.EngineConfig.ID, model) {
+				warning := fmt.Sprintf("sub-agent %q model %q may be incompatible with the %s engine's model-routing API", agent.Name, agent.Model, data.EngineConfig.ID)
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
+				c.IncrementWarningCount()
+				break
+			}
+		}
+	}
+	firewall := getFirewallConfig(data)
+	if !awfVersionAtLeast(firewall, constants.AWFRoutingCandidateModelsMinVersion) {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
+			fmt.Sprintf("sub-agent models are limited to engine.model-routing.allowed-models with AWF %s; use AWF %s or newer to admit separately declared models",
+				getAWFImageTag(firewall), constants.AWFRoutingCandidateModelsMinVersion)))
+		c.IncrementWarningCount()
+		return
+	}
+	if !apiProxySupportsRoutingCandidateModels(data) {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
+			"sub-agent model routing requires an AWF apiProxy image with routing.candidateModels support (v0.28.33+); the configured image is older or its version is unknown. Pin a compatible image in sandbox.agent.images."))
+		c.IncrementWarningCount()
+	}
+	candidates, err := resolveModelRoutingAllowedModels(data.EngineConfig.ModelRouting)
+	if err != nil {
+		return
+	}
+	allowed, blocked := resolveModelPolicyForAWFConfig(data)
+	candidates, err = intersectModelRoutingPolicy(candidates, allowed, blocked)
+	if err != nil {
+		return
+	}
+	_, warnings := subAgentRequestModels(data, candidates, allowed, blocked)
+	for _, warning := range warnings {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
+		c.IncrementWarningCount()
+	}
+}
+
+func (c *Compiler) warnRoutedModelOverrides(data *WorkflowData) {
+	if !isModelRoutingEnabled(data) {
+		return
+	}
+	var warnings []string
+	if data.Model != "" {
+		warnings = append(warnings, "model")
+	}
+	if data.EngineConfig != nil {
+		for key := range data.EngineConfig.Env {
+			if isModelRoutingOverrideEnvKey(key) {
+				warnings = append(warnings, "engine.env."+key)
+			}
+		}
+		if data.EngineConfig.ID == "pi" && data.EngineConfig.Config != "" {
+			var config struct {
+				Settings struct {
+					DefaultThinkingLevel string `json:"defaultThinkingLevel"`
+				} `json:"settings"`
+			}
+			if json.Unmarshal([]byte(data.EngineConfig.Config), &config) == nil && config.Settings.DefaultThinkingLevel != "" {
+				warnings = append(warnings, "engine.config.settings.defaultThinkingLevel")
+			}
+		}
+	}
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
+		"model-routing selection overrides fixed model or effort settings: "+strings.Join(warnings, ", ")))
+	c.IncrementWarningCount()
+}
+
+func isModelRoutingOverrideEnvKey(key string) bool {
+	upperKey := strings.ToUpper(key)
+	return strings.EqualFold(key, "MODEL") ||
+		strings.HasSuffix(upperKey, "_MODEL") ||
+		strings.HasSuffix(upperKey, "_MODEL_ID") ||
+		strings.HasSuffix(upperKey, "_MODEL_NAME") ||
+		strings.HasPrefix(upperKey, "GH_AW_MODEL_AGENT_") ||
+		strings.HasPrefix(upperKey, "GH_AW_MODEL_DETECTION_") ||
+		strings.HasPrefix(upperKey, "GH_AW_MODEL_EVALS_") ||
+		strings.HasPrefix(upperKey, "GH_AW_DEFAULT_MODEL_")
+}
+
+func modelRoutingEngineSupportsModel(engineName, candidate string) bool {
+	if containsExpression(candidate) {
+		return true
+	}
+	_, model, qualified := strings.Cut(candidate, "/")
+	if qualified {
+		candidate = model
+	}
+	candidate = strings.TrimPrefix(candidate, "copilot/")
+	lowerModel := strings.ToLower(candidate)
+	switch strings.ToLower(engineName) {
+	case "copilot", "pi":
+		return true
+	case "claude":
+		return strings.HasPrefix(lowerModel, "claude-")
+	case "codex":
+		return strings.HasPrefix(lowerModel, "gpt-")
+	default:
+		return false
+	}
+}
+
+func modelRoutingProvider(engineName string, data *WorkflowData) LLMProvider {
+	switch strings.ToLower(engineName) {
+	case "claude":
+		return NewClaudeEngine().ResolveLLMProvider(data)
+	case "codex":
+		return NewCodexEngine().ResolveLLMProvider(data)
+	case "pi":
+		return NewPiEngine().ResolveLLMProvider(data)
+	default:
+		return LLMProviderGitHub
+	}
+}
+
+func apiProxySupportsRoutingCandidateModels(data *WorkflowData) bool {
+	if !isModelRoutingEnabled(data) {
+		return false
+	}
+	firewall := getFirewallConfig(data)
+	if !awfVersionAtLeast(firewall, constants.AWFRoutingCandidateModelsMinVersion) {
+		return false
+	}
+	image := getSandboxAgentImages(data)[awfImageRoleAPIProxy]
+	tag, found := imageReferenceTag(image)
+	return found && !strings.EqualFold(tag, "latest") &&
+		versionAtLeast(tag, "", string(constants.AWFRoutingCandidateModelsMinVersion))
+}
+
+func imageReferenceTag(image string) (string, bool) {
+	if digestIndex := strings.IndexByte(image, '@'); digestIndex >= 0 {
+		image = image[:digestIndex]
+	}
+	tagIndex := strings.LastIndexByte(image, ':')
+	if tagIndex <= strings.LastIndexByte(image, '/') || tagIndex == len(image)-1 {
+		return "", false
+	}
+	return image[tagIndex+1:], true
+}
+
+func matchesModelPolicy(model, qualifiedModel string, rules []string) bool {
+	for _, rule := range rules {
+		if rule == model || rule == qualifiedModel {
+			return true
+		}
+		if matched, _ := path.Match(rule, model); matched {
+			return true
+		}
+		if matched, _ := path.Match(rule, qualifiedModel); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func validateModelRouting(workflowData *WorkflowData, engineName string) error {
+	if !isModelRoutingEnabled(workflowData) {
+		return nil
+	}
+	routing := workflowData.EngineConfig.ModelRouting
+	engineName = strings.ToLower(engineName)
+	if engineName != "copilot" && engineName != "claude" && engineName != "codex" && engineName != "pi" {
+		return NewValidationError("engine.model-routing", engineName, "task-level model routing is supported only by Copilot, Claude, Codex, and pi engines", "Set engine.id to copilot, claude, codex, or pi, or remove engine.model-routing.")
+	}
+	if !isFirewallEnabled(workflowData) {
+		return NewValidationError("engine.model-routing", "", "task-level model routing requires the AWF firewall", "Enable the AWF firewall for this workflow.")
+	}
+	if engineName != "copilot" {
+		provider := modelRoutingProvider(engineName, workflowData)
+		if provider != LLMProviderGitHub {
+			return NewValidationError("engine.model-routing", string(provider), "task-level model routing requires GitHub Copilot inference", "Configure the engine's provider to use GitHub Copilot inference.")
+		}
+	}
+	if routing.Goal != "cost" && routing.Goal != "cost-speed" {
+		return NewValidationError("engine.model-routing.goal", routing.Goal, "unsupported model-routing goal", "Use cost or cost-speed.")
+	}
+	if routing.Mode != "economy" && routing.Mode != "balanced" && routing.Mode != "robust" && routing.Mode != "auto" {
+		return NewValidationError("engine.model-routing.mode", routing.Mode, "unsupported model-routing mode", "Use economy, balanced, robust, or auto.")
+	}
+	candidates, err := resolveModelRoutingAllowedModels(routing)
+	if err != nil {
+		return NewValidationError("engine.model-routing.allowed-models", strings.Join(routing.AllowedModels, ", "), "invalid model-routing candidates", err.Error())
+	}
+	for _, candidate := range routing.AllowedModels {
+		if !modelRoutingEngineSupportsModel(engineName, candidate) {
+			message := fmt.Sprintf("model %q is incompatible with the %s engine's Copilot API", candidate, engineName)
+			switch engineName {
+			case "claude":
+				message = fmt.Sprintf("model %q is incompatible with Claude's native Messages API; allow only Claude models", candidate)
+			case "codex":
+				message = fmt.Sprintf("model %q is incompatible with Codex's Responses API; allow only GPT models", candidate)
+			}
+			return NewValidationError("engine.model-routing.allowed-models", candidate, "incompatible model-routing candidate", message)
+		}
+	}
+	allowed, blocked := resolveModelPolicyForAWFConfig(workflowData)
+	if _, err := intersectModelRoutingPolicy(candidates, allowed, blocked); err != nil {
+		return NewValidationError("engine.model-routing.allowed-models", strings.Join(routing.AllowedModels, ", "), "model-routing candidates violate model policy", err.Error())
+	}
+	firewallConfig := getFirewallConfig(workflowData)
+	version := getAWFImageTag(firewallConfig)
+	if !versionAtLeast(version, string(constants.DefaultFirewallVersion), string(constants.AWFModelRoutingMinVersion)) {
+		return NewValidationError("engine.model-routing", version, fmt.Sprintf("task-level model routing requires AWF %s or newer", constants.AWFModelRoutingMinVersion), fmt.Sprintf("The effective AWF version is %s. Set sandbox.agent.version or firewall.version to %s or newer.", version, constants.AWFModelRoutingMinVersion))
+	}
+	return nil
+}
+
+func generateModelRoutingConversationStep(yaml *strings.Builder, data *WorkflowData) {
+	if !isModelRoutingEnabled(data) {
+		return
+	}
+	promptFilePath := constants.AwPromptsUserFile
+	fallbackFilePath := constants.AwPromptsFile
+	yaml.WriteString("      - name: Prepare model-routing conversation\n")
+	yaml.WriteString("        env:\n")
+	yaml.WriteString("          GH_AW_ROUTING_PROMPT: " + promptFilePath + "\n")
+	yaml.WriteString("          GH_AW_ROUTING_PROMPT_FALLBACK: " + fallbackFilePath + "\n")
+	yaml.WriteString("          GH_AW_ROUTING_CONVERSATION_FILE: " + modelRoutingConversationFile + "\n")
+	yaml.WriteString("        run: node -e \"const fs=require('node:fs'); const path=require('node:path'); const readPrompt=file=>{try{return fs.readFileSync(file,'utf8');}catch(error){if(error.code==='ENOENT')return '';throw error;}}; let prompt=readPrompt(process.env.GH_AW_ROUTING_PROMPT); if (!prompt.trim()) prompt=readPrompt(process.env.GH_AW_ROUTING_PROMPT_FALLBACK); if (!prompt.trim()) throw new Error('Rendered workflow prompt is empty; cannot route this task'); const destination=process.env.GH_AW_ROUTING_CONVERSATION_FILE; fs.mkdirSync(path.dirname(destination),{recursive:true,mode:0o700}); fs.writeFileSync(destination,JSON.stringify([{role:'user',parts:[{text:prompt}]}]),{mode:0o600});\"\n")
+}

@@ -5,7 +5,7 @@ sidebar:
   order: 655
 ---
 
-Use these variables to set organization- or repository-wide defaults without editing individual workflow frontmatter files.
+Use these variables to set organization- or repository-wide defaults and compiler policy without editing individual workflow frontmatter files.
 
 In this enterprise controls reference, OTLP defaults are the scope-sensitive exception: `GH_AW_DEFAULT_OTLP_ENDPOINT` can be a GitHub Actions variable at repository, organization, or enterprise scope, but the `GH_AW_DEFAULT_OTLP_ENDPOINT` and `GH_AW_DEFAULT_OTLP_HEADERS` secrets are limited to repository or organization scope.
 
@@ -13,6 +13,7 @@ In this enterprise controls reference, OTLP defaults are the scope-sensitive exc
 
 | Variable | Source | Purpose | Applies when |
 | --- | --- | --- | --- |
+| `GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS` | GitHub Actions `vars.*` at runtime | Retention period for all gh-aw artifacts | `artifact_retention_days` is not set in `.github/workflows/aw.json` |
 | `GH_AW_DEFAULT_MAX_AI_CREDITS` | GitHub Actions `vars.*` at runtime | Default AWF `apiProxy.maxAiCredits` budget | `max-ai-credits` is not set in frontmatter or any imported workflow |
 | `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` | Compiler process environment | Default AWF `apiProxy.maxCacheMisses` guardrail | `max-turn-cache-misses` is not set in frontmatter or any imported workflow |
 | `GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS` | GitHub Actions `vars.*` at runtime | Default threat-detection AWF `apiProxy.maxAiCredits` budget | `safe-outputs.threat-detection.max-ai-credits` is not set |
@@ -28,17 +29,75 @@ In this enterprise controls reference, OTLP defaults are the scope-sensitive exc
 | `GH_AW_DEFAULT_MODEL_CODEX` | GitHub Actions `vars.*` at runtime | Default fallback model for Codex | `GH_AW_MODEL_AGENT_CODEX` / `GH_AW_MODEL_DETECTION_CODEX` is unset |
 | `GH_AW_DEFAULT_OTLP_ENDPOINT` | GitHub Actions `secrets.*` or `vars.*` at runtime | Default OTLP exporter endpoint | `observability.otlp.endpoint` is not set in frontmatter or any imported workflow |
 | `GH_AW_DEFAULT_OTLP_HEADERS` | GitHub Actions `secrets.*` at runtime | Default OTLP exporter headers for `GH_AW_DEFAULT_OTLP_ENDPOINT` | `observability.otlp.endpoint` is not set in frontmatter or any imported workflow |
+| `GH_AW_REQUIRE_SELF_HOSTED_RUNNERS` | Compiler process environment | Fail compilation unless every generated job selects a self-hosted runner | Set to `true` in a trusted compile environment to enforce self-hosted-only runners |
 
-Use `gh aw env get` and `gh aw env update` to manage these
+Use `gh aw env get` and `gh aw env update` to manage `GH_AW_DEFAULT_*`
 variables in batch. These commands operate on GitHub Actions variables and support repo, org, or enterprise scope, so `default_otlp_endpoint` can still be managed as an enterprise variable. Set OTLP secrets separately with `gh secret set`; those secrets are limited to repository or organization scope. The defaults file uses
 `default_`-prefixed keys such as `default_max_ai_credits`, `default_max_turn_cache_misses`, `default_detection_max_ai_credits`, `default_max_daily_ai_credits`, `default_timeout_minutes`, `default_agent_job_timeout_minutes`, `default_detection_job_timeout_minutes`,
-`default_model_copilot`, `default_otlp_endpoint`, and `default_utc`. `gh aw env update --scope ent` writes only the `GH_AW_DEFAULT_OTLP_ENDPOINT` variable, not an endpoint secret. To mask the endpoint value, set `GH_AW_DEFAULT_OTLP_ENDPOINT` with
+`default_model_copilot`, `default_otlp_endpoint`, `default_artifact_retention_days`, and `default_utc`. `gh aw env update --scope ent` writes only the `GH_AW_DEFAULT_OTLP_ENDPOINT` variable, not an endpoint secret. To mask the endpoint value, set `GH_AW_DEFAULT_OTLP_ENDPOINT` with
 `gh secret set` at repository or organization scope instead. `GH_AW_DEFAULT_OTLP_HEADERS` is always a secret and must also be set with `gh secret set` at repository or organization scope. If both endpoint values exist, clearing only one leaves the other effective through the fallback expression; clear both the endpoint secret and variable to disable OTLP export.
+
+`GH_AW_REQUIRE_SELF_HOSTED_RUNNERS` is a compile-time enforcement setting, not a `GH_AW_DEFAULT_*` default, and is not managed by `gh aw env`. The same policy can be enabled persistently with `require_self_hosted_runners: true` in `.github/workflows/aw.json`, or for a single invocation with `gh aw compile --require-self-hosted-runners`.
+
+```yaml title="Required compile check"
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile workflows
+        env:
+          GH_AW_REQUIRE_SELF_HOSTED_RUNNERS: "true"
+        run: gh aw compile
+```
+
+When enabled, compilation checks the generated workflow jobs, including framework jobs and jobs whose runner comes from a default. Each job must include the `self-hosted` label or select a runner group. Custom labels alone are not sufficient because the compiler cannot verify that they identify self-hosted runners. An organization can make this check mandatory with a centrally managed required workflow or ruleset check.
 
 ```bash
 gh aw env update defaults.yml --scope org --org MY_ORG --visibility all
 gh aw env update defaults.yml --scope ent --enterprise MY_ENT --visibility all
 ```
+
+## Artifact Retention
+
+`artifact_retention_days` in `.github/workflows/aw.json` sets retention for all
+artifacts uploaded by compiled gh-aw workflows, including logs, inter-job staging,
+memory artifacts, safe-output uploads, custom `actions/upload-artifact` steps, and
+maintenance artifacts:
+
+```json title=".github/workflows/aw.json"
+{
+  "artifact_retention_days": 7
+}
+```
+
+The field accepts an integer from 1 to 400 or a single-line GitHub Actions
+expression that resolves to an integer in that range, such as
+`"${{ vars.ARTIFACT_RETENTION_DAYS || '7' }}"`. Expressions must use contexts
+available in every uploading job; prefer `vars` rather than job-specific `steps`
+or `needs` outputs. Recompile workflows after changing `aw.json`.
+
+Retention precedence is:
+
+1. `artifact_retention_days` in `.github/workflows/aw.json`
+2. `vars.GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS` at runtime
+3. The existing per-artifact setting or built-in default
+
+Both repository and enterprise settings override individual `retention-days`
+values. Without either setting, existing retention is preserved, including
+short-lived staging artifacts, the safe-output upload default of 30 days, and
+GitHub's repository default for uploads without an explicit retention period.
+
+Set `GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS` as a repository, organization, or
+enterprise Actions variable, or manage it through `gh aw env` using
+`default_artifact_retention_days: "7"` in the defaults file. The variable is
+resolved at workflow runtime, so changing it does not require recompilation of
+workflows already compiled with this support.
+
+GitHub's repository, organization, and enterprise retention limits still apply
+(public repositories allow up to 90 days; private repositories allow up to 400).
+This setting does not change Actions cache eviction, git-backed memory, published
+assets, or artifacts uploaded inside third-party actions.
 
 ## Project Timezone
 

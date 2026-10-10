@@ -28,6 +28,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -99,9 +100,12 @@ func createAndConfigureCompiler(config CompileConfig) *workflow.Compiler {
 		workflow.WithEngineOverride(config.EngineOverride),
 		workflow.WithFailFast(config.FailFast),
 	)
-	if config.activeModels != nil {
+	compiler.SetModelPricingResolver(func(_ context.Context, provider, model string) (map[string]float64, bool) {
+		return findExactModelPricing(provider, model)
+	})
+	if config.activeModels != nil || config.DryRun {
 		compiler.SetConfiguredModelValidator(func(data *workflow.WorkflowData) []string {
-			return unknownConfiguredModelMessages(data, config.activeModels)
+			return configuredModelValidationMessages(data, config.activeModels, config.DryRun)
 		})
 	}
 	compileCompilerSetupLog.Print("Created compiler instance")
@@ -142,6 +146,9 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	compiler.SetStrictMode(config.Strict)
 	compiler.SetAllowActionRefs(config.AllowActionRefs)
 	compiler.SetForceStaged(config.Staged)
+	compiler.SetDryRun(config.DryRun)
+	compiler.SetEnvironmentOverride(config.EnvironmentOverride)
+	compiler.SetRequireSelfHostedRunners(config.RequireSelfHostedRunners)
 
 	// Set trial mode if specified
 	if config.TrialMode {

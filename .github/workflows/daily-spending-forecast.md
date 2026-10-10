@@ -12,8 +12,8 @@ permissions:
   copilot-requests: write
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.3-codex
+  model-provider: github
+model: copilot/gpt-6.1-sol
 strict: true
 imports:
   - shared/trending-charts-simple.md
@@ -77,7 +77,7 @@ steps:
 post-steps:
   - name: Upload spending forecast report
     if: always()
-    uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
     with:
       name: spending-forecast-${{ github.run_id }}
       path: /tmp/gh-aw/agent/spending-forecast/
@@ -93,9 +93,6 @@ safe-outputs:
   mentions: false
   allowed-github-references: []
 timeout-minutes: 45
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: spending_forecast_analyzed
     question: Did the agent analyze the agentic workflow spending forecast and its data quality?

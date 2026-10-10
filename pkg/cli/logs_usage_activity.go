@@ -23,9 +23,29 @@ type usageActivitySummary struct {
 	Session     *usageActivitySession     `json:"session,omitempty"`
 	Gateway     *usageActivityGateway     `json:"gateway,omitempty"`
 	Integrity   *IntegrityFilterSummary   `json:"integrity,omitempty"`
+	Steering    *usageActivitySteering    `json:"steering,omitempty"`
+	Skills      *usageActivitySkills      `json:"skills,omitempty"`
 	SafeOutputs *usageActivitySafeOutputs `json:"safe_outputs,omitempty"`
+	Ledger      *LedgerActivity           `json:"ledger,omitempty"`
 	Experiments *usageActivityExperiments `json:"experiments,omitempty"`
 	WorkingSet  *WorkingSetMetrics        `json:"working_set,omitempty"`
+	Friction    *FrictionCostSummary      `json:"friction,omitempty"`
+}
+
+// LedgerActivity records ledger mutations and repo-memory compaction statistics.
+type LedgerActivity struct {
+	TransactionsAdded *int                      `json:"transactions_added,omitempty"`
+	Compaction        *LedgerCompactionActivity `json:"compaction,omitempty"`
+}
+
+type LedgerCompactionActivity struct {
+	Before      int     `json:"before"`
+	After       int     `json:"after"`
+	Selected    int     `json:"selected"`
+	Records     int     `json:"records"`
+	Replacement *string `json:"replacement"`
+	Retired     int     `json:"retired"`
+	Changed     bool    `json:"changed"`
 }
 
 // WorkingSetMetrics describes cumulative model-input traffic relative to the
@@ -70,11 +90,32 @@ type usageActivitySession struct {
 	FailedToolExecutions   int `json:"failed_tool_executions"`
 }
 
+type usageActivitySteering struct {
+	TotalEvents int            `json:"total_events"`
+	EventCounts map[string]int `json:"event_counts,omitempty"`
+}
+
+type usageActivitySkills struct {
+	TotalInvocations int                      `json:"total_invocations"`
+	UniqueSkills     int                      `json:"unique_skills"`
+	Items            []usageActivitySkillItem `json:"items,omitempty"`
+}
+
+type usageActivitySkillItem struct {
+	Name            string `json:"name"`
+	InvocationCount int    `json:"invocation_count"`
+	FailedCount     int    `json:"failed_count"`
+	FirstTimestamp  string `json:"first_timestamp,omitempty"`
+	LastTimestamp   string `json:"last_timestamp,omitempty"`
+}
+
 type usageActivityGateway struct {
 	TotalCalls      int                          `json:"total_calls"`
 	FailedCalls     int                          `json:"failed_calls"`
 	TotalInputSize  int                          `json:"total_input_size"`
 	TotalOutputSize int                          `json:"total_output_size"`
+	AvgInputSize    int                          `json:"avg_input_size"`
+	AvgOutputSize   int                          `json:"avg_output_size"`
 	MaxInputSize    int                          `json:"max_input_size"`
 	MaxOutputSize   int                          `json:"max_output_size"`
 	Servers         []usageActivityGatewayServer `json:"servers,omitempty"`
@@ -100,6 +141,10 @@ type usageActivityGatewayServer struct {
 	FailedCalls     int     `json:"failed_calls"`
 	TotalInputSize  int     `json:"total_input_size"`
 	TotalOutputSize int     `json:"total_output_size"`
+	AvgInputSize    int     `json:"avg_input_size"`
+	AvgOutputSize   int     `json:"avg_output_size"`
+	MaxInputSize    int     `json:"max_input_size"`
+	MaxOutputSize   int     `json:"max_output_size"`
 	AvgDurationMS   float64 `json:"avg_duration_ms"`
 }
 
@@ -110,6 +155,8 @@ type usageActivityGatewayTool struct {
 	FailedCalls     int     `json:"failed_calls"`
 	TotalInputSize  int     `json:"total_input_size"`
 	TotalOutputSize int     `json:"total_output_size"`
+	AvgInputSize    int     `json:"avg_input_size"`
+	AvgOutputSize   int     `json:"avg_output_size"`
 	MaxInputSize    int     `json:"max_input_size"`
 	MaxOutputSize   int     `json:"max_output_size"`
 	AvgDurationMS   float64 `json:"avg_duration_ms"`
@@ -160,12 +207,27 @@ func loadUsageActivitySummary(runDir string) (*usageActivitySummary, error) {
 }
 
 func applyUsageActivitySummaryToResult(summary *usageActivitySummary, result *DownloadResult, allowTurnBackfill bool) {
-	if summary == nil || result == nil {
+	if result == nil {
+		return
+	}
+	if summary == nil {
+		if result.Friction == nil {
+			result.Friction = deriveFrictionFallback(result.MCPToolUsage, nil)
+		}
 		return
 	}
 
 	if summary.WorkingSet != nil {
 		result.WorkingSet = summary.WorkingSet
+	}
+	if summary.Ledger != nil {
+		result.Ledger = summary.Ledger
+	}
+
+	// Friction is precomputed in the conclusion job: prefer it verbatim and never
+	// recompute it from raw logs when the section is present.
+	if summary.Friction != nil {
+		result.Friction = summary.Friction
 	}
 
 	// Preserve previously parsed turn counts (from full session artifacts/events.jsonl)
@@ -176,6 +238,11 @@ func applyUsageActivitySummaryToResult(summary *usageActivitySummary, result *Do
 
 	applyUsageActivityFirewallSummary(summary.Firewall, result)
 	applyUsageActivityMCPSummary(summary.Gateway, summary.Integrity, result)
+	applyUsageActivitySkills(summary.Skills, result)
+	if result.Friction == nil {
+		result.Friction = deriveFrictionFallback(result.MCPToolUsage, summary.Session)
+	}
+	applyUsageActivitySteeringSummary(summary.Steering, &result.TokenUsage)
 
 	// Backfill safe output item count from usage summary when the safe-outputs-items
 	// artifact was not downloaded separately. The count is 0-safe: only backfill when
@@ -186,6 +253,69 @@ func applyUsageActivitySummaryToResult(summary *usageActivitySummary, result *Do
 	}
 	if summary.SafeOutputs != nil && len(result.SafeOutputs) == 0 && len(summary.SafeOutputs.Items) > 0 {
 		result.SafeOutputs = summary.SafeOutputs.Items
+	}
+}
+
+func applyUsageActivitySkills(skills *usageActivitySkills, result *DownloadResult) {
+	if result == nil {
+		return
+	}
+	result.SkillActivations = mergeUsageActivitySkills(skills, result.Run, result.SkillActivations)
+}
+
+func mergeUsageActivitySkills(skills *usageActivitySkills, run WorkflowRun, activations []SkillActivation) []SkillActivation {
+	if skills == nil || len(skills.Items) == 0 {
+		return activations
+	}
+	aggregates := make(map[string]usageActivitySkillItem, len(skills.Items))
+	for _, skill := range skills.Items {
+		if skill.Name != "" && skill.InvocationCount > 0 {
+			aggregates[skill.Name] = skill
+		}
+	}
+	enriched := make([]SkillActivation, 0, len(activations)+len(aggregates))
+	for _, activation := range activations {
+		if skill, ok := aggregates[activation.Name]; ok {
+			activation.InvocationCount = skill.InvocationCount
+			activation.FailedCount = skill.FailedCount
+			delete(aggregates, activation.Name)
+		}
+		enriched = append(enriched, activation)
+	}
+	for _, skill := range skills.Items {
+		if _, ok := aggregates[skill.Name]; !ok {
+			continue
+		}
+		enriched = append(enriched, SkillActivation{
+			Name:            skill.Name,
+			Status:          "invoked",
+			Source:          "usage_summary",
+			InvocationCount: skill.InvocationCount,
+			FailedCount:     skill.FailedCount,
+			ReportProvenance: buildReportProvenance(
+				run,
+				skill.FirstTimestamp,
+				"",
+				"",
+			),
+		})
+		delete(aggregates, skill.Name)
+	}
+	return enriched
+}
+
+func applyUsageActivitySteeringSummary(steering *usageActivitySteering, tokenUsage **TokenUsageSummary) {
+	if steering == nil || steering.TotalEvents <= 0 {
+		return
+	}
+	if *tokenUsage == nil {
+		*tokenUsage = &TokenUsageSummary{ByModel: make(map[string]*ModelTokenUsage)}
+	}
+	if (*tokenUsage).TotalSteeringEvents == 0 {
+		(*tokenUsage).TotalSteeringEvents = steering.TotalEvents
+	}
+	if len((*tokenUsage).SteeringEventCounts) == 0 && len(steering.EventCounts) > 0 {
+		(*tokenUsage).SteeringEventCounts = maps.Clone(steering.EventCounts)
 	}
 }
 
@@ -270,20 +400,22 @@ func backfillUsageActivityMCPMetrics(gateway *usageActivityGateway, integritySum
 		for _, tool := range gateway.Tools {
 			activityTools[tool.ServerName+":"+tool.ToolName] = tool
 		}
-		for index := range usage.Summary {
-			tool := &usage.Summary[index]
+		updatedTools := make([]MCPToolSummary, 0, len(usage.Summary))
+		for _, tool := range usage.Summary {
 			tool.syncFieldsFromBase()
 			if activity, ok := activityTools[tool.ServerName+":"+tool.ToolName]; ok {
-				backfillUsageActivityToolMetrics(tool, activity)
+				backfillUsageActivityToolMetrics(&tool, activity)
 			}
+			updatedTools = append(updatedTools, tool)
 		}
+		usage.Summary = updatedTools
 
 		activityServers := make(map[string]usageActivityGatewayServer, len(gateway.Servers))
 		for _, server := range gateway.Servers {
 			activityServers[server.ServerName] = server
 		}
-		for index := range usage.Servers {
-			server := &usage.Servers[index]
+		updatedServers := make([]MCPServerStats, 0, len(usage.Servers))
+		for _, server := range usage.Servers {
 			if activity, ok := activityServers[server.ServerName]; ok {
 				if server.TotalInputSize == 0 {
 					server.TotalInputSize = activity.TotalInputSize
@@ -291,11 +423,25 @@ func backfillUsageActivityMCPMetrics(gateway *usageActivityGateway, integritySum
 				if server.TotalOutputSize == 0 {
 					server.TotalOutputSize = activity.TotalOutputSize
 				}
+				if server.AvgInputSize == 0 {
+					server.AvgInputSize = activity.AvgInputSize
+				}
+				if server.AvgOutputSize == 0 {
+					server.AvgOutputSize = activity.AvgOutputSize
+				}
+				if server.MaxInputSize == 0 {
+					server.MaxInputSize = activity.MaxInputSize
+				}
+				if server.MaxOutputSize == 0 {
+					server.MaxOutputSize = activity.MaxOutputSize
+				}
 				if server.AvgDuration == "" {
 					server.AvgDuration = formatActivityDuration(activity.AvgDurationMS)
 				}
 			}
+			updatedServers = append(updatedServers, server)
 		}
+		usage.Servers = updatedServers
 	}
 	if usage.Integrity == nil && len(usage.FilteredEvents) == 0 && integritySummary != nil {
 		usage.Integrity = cloneIntegrityFilterSummary(integritySummary)
@@ -329,6 +475,12 @@ func backfillUsageActivityToolMetrics(tool *MCPToolSummary, activity usageActivi
 	if tool.TotalOutputSize == 0 {
 		tool.TotalOutputSize = activity.TotalOutputSize
 	}
+	if tool.AvgInputSize == 0 {
+		tool.AvgInputSize = activity.AvgInputSize
+	}
+	if tool.AvgOutputSize == 0 {
+		tool.AvgOutputSize = activity.AvgOutputSize
+	}
 	if tool.MaxInputSize == 0 {
 		tool.MaxInputSize = activity.MaxInputSize
 	}
@@ -359,12 +511,24 @@ func cloneIntegrityFilterSummary(summary *IntegrityFilterSummary) *IntegrityFilt
 func buildUsageActivityTools(activityTools []usageActivityGatewayTool) []MCPToolSummary {
 	tools := make([]MCPToolSummary, 0, len(activityTools))
 	for _, tool := range activityTools {
+		avgInputSize := tool.AvgInputSize
+		avgOutputSize := tool.AvgOutputSize
+		if tool.CallCount > 0 {
+			if avgInputSize == 0 {
+				avgInputSize = tool.TotalInputSize / tool.CallCount
+			}
+			if avgOutputSize == 0 {
+				avgOutputSize = tool.TotalOutputSize / tool.CallCount
+			}
+		}
 		toolSummary := MCPToolSummary{
 			ServerName:      tool.ServerName,
 			ToolName:        tool.ToolName,
 			CallCount:       tool.CallCount,
 			TotalInputSize:  tool.TotalInputSize,
 			TotalOutputSize: tool.TotalOutputSize,
+			AvgInputSize:    avgInputSize,
+			AvgOutputSize:   avgOutputSize,
 			MaxInputSize:    tool.MaxInputSize,
 			MaxOutputSize:   tool.MaxOutputSize,
 			AvgDuration:     formatActivityDuration(tool.AvgDurationMS),
@@ -384,6 +548,16 @@ func buildUsageActivityServers(activityServers []usageActivityGatewayServer) []M
 		if requestCount == 0 {
 			requestCount = server.ToolCallCount
 		}
+		avgInputSize := server.AvgInputSize
+		avgOutputSize := server.AvgOutputSize
+		if server.ToolCallCount > 0 {
+			if avgInputSize == 0 {
+				avgInputSize = server.TotalInputSize / server.ToolCallCount
+			}
+			if avgOutputSize == 0 {
+				avgOutputSize = server.TotalOutputSize / server.ToolCallCount
+			}
+		}
 		servers = append(servers, MCPServerStats{
 			MCPServerStatsBase: MCPServerStatsBase{
 				ServerName:    server.ServerName,
@@ -393,6 +567,10 @@ func buildUsageActivityServers(activityServers []usageActivityGatewayServer) []M
 			RequestCount:    requestCount,
 			TotalInputSize:  server.TotalInputSize,
 			TotalOutputSize: server.TotalOutputSize,
+			AvgInputSize:    avgInputSize,
+			AvgOutputSize:   avgOutputSize,
+			MaxInputSize:    server.MaxInputSize,
+			MaxOutputSize:   server.MaxOutputSize,
 			AvgDuration:     formatActivityDuration(server.AvgDurationMS),
 		})
 	}

@@ -71,6 +71,7 @@ func (c *Compiler) generateCheckoutActionsFolder(data *WorkflowData) []string {
 			"          repository: github/gh-aw\n",
 			"          sparse-checkout: |\n",
 			"            actions\n",
+			"          fetch-depth: 1\n",
 			"          clean: false\n",
 			"          persist-credentials: false\n",
 		}
@@ -103,6 +104,7 @@ func (c *Compiler) generateRestoreActionsSetupStep() string {
 	step.WriteString("          sparse-checkout: |\n")
 	step.WriteString("            actions/setup\n")
 	step.WriteString("          sparse-checkout-cone-mode: true\n")
+	step.WriteString("          fetch-depth: 1\n")
 	step.WriteString("          clean: false\n")
 	step.WriteString("          persist-credentials: false\n")
 	return step.String()
@@ -216,6 +218,14 @@ func (c *Compiler) generateSetupStep(data *WorkflowData, setupActionRef string, 
 	return c.generateSetupStepWithArtifactClientCondition(data, setupActionRef, destination, enableArtifactClient, traceID, parentSpanID, "")
 }
 
+func (c *Compiler) generateSetupStepForJob(jobName string, data *WorkflowData, setupActionRef string, destination string, enableArtifactClient bool, traceID string, parentSpanID string, artifactClientCondition string) []string {
+	steps := c.generateSetupStepWithArtifactClientCondition(data, setupActionRef, destination, enableArtifactClient, traceID, parentSpanID, artifactClientCondition)
+	if data != nil && strings.Contains(strings.Join(steps, ""), "id: "+otlpOIDCMintStepID+"\n") {
+		c.recordGeneratedWildcardAppTokenStep(jobName, getOTLPGitHubAppTokenConfig(data.RawFrontmatter), otlpOIDCMintStepID)
+	}
+	return steps
+}
+
 func (c *Compiler) generateSetupStepWithArtifactClientCondition(data *WorkflowData, setupActionRef string, destination string, enableArtifactClient bool, traceID string, parentSpanID string, artifactClientCondition string) []string { //nolint:largefunc // Existing setup-step emission is intentionally centralized.
 	lines := c.generateOTLPOIDCMintStep(data)
 	hasOTLPOIDC := len(lines) > 0
@@ -258,6 +268,9 @@ func (c *Compiler) generateSetupStepWithArtifactClientCondition(data *WorkflowDa
 			}
 			if setupEngineID != "" {
 				setupLines = append(setupLines, fmt.Sprintf("          GH_AW_INFO_ENGINE_ID: %q\n", setupEngineID))
+			}
+			if hasWorkflowCallOrDispatchTrigger(data.On) {
+				setupLines = append(setupLines, "          GH_AW_SETUP_AW_CONTEXT: ${{ inputs.aw_context }}\n")
 			}
 		}
 		if traceID != "" {
@@ -323,7 +336,7 @@ func (c *Compiler) generateSetupStepWithArtifactClientCondition(data *WorkflowDa
 	if setupEngineID != "" {
 		setupLines = append(setupLines, fmt.Sprintf("          GH_AW_INFO_ENGINE_ID: %q\n", setupEngineID))
 	}
-	if hasWorkflowCallTrigger(data.On) {
+	if hasWorkflowCallOrDispatchTrigger(data.On) {
 		setupLines = append(setupLines, "          GH_AW_SETUP_AW_CONTEXT: ${{ inputs.aw_context }}\n")
 	}
 	lines = append(lines, setupLines...)

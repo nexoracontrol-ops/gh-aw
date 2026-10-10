@@ -90,18 +90,6 @@ func (s *logsBatchScheduler) acquire(ctx context.Context, targetID int) error {
 	}
 }
 
-// waitingCount reports how many targets are currently parked waiting for a
-// batch turn. It exists so callers can observe that a target has actually
-// blocked rather than inferring it from timing.
-func (s *logsBatchScheduler) waitingCount() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.waiting
-}
-
 func (s *logsBatchScheduler) release(targetID int) {
 	if s == nil {
 		return
@@ -228,6 +216,8 @@ func logsTargetContinuationOptions(opts LogsDownloadOptions) continuationOptions
 		startDate:             opts.StartDate,
 		endDate:               opts.EndDate,
 		engine:                opts.Engine,
+		dryRun:                opts.DryRun,
+		noDryRun:              opts.NoDryRun,
 		branch:                opts.Ref,
 		afterRunID:            opts.AfterRunID,
 		ignoreWorkflowRuns:    opts.IgnoreWorkflowRuns,
@@ -307,6 +297,7 @@ func DownloadWorkflowLogsForTargets( //nolint:largefunc // Keeps shared collecti
 		audit:             opts.Audit,
 		verbose:           opts.Verbose,
 		artifactFilter:    artifactFilter,
+		includeWorkQueue:  workQueueEvidenceRequested(opts.ArtifactSets),
 		startDate:         opts.StartDate,
 		endDate:           opts.EndDate,
 		checkStaleness:    true,

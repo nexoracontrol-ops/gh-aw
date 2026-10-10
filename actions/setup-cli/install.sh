@@ -187,6 +187,163 @@ else
     print_info "Using specified version: $VERSION"
 fi
 
+compare_semver() {
+    local candidate="$1"
+    local current="$2"
+    local candidate_part current_part
+    local candidate_parts current_parts
+    local i
+
+    IFS=. read -r -a candidate_parts <<< "${candidate#v}"
+    IFS=. read -r -a current_parts <<< "${current#v}"
+    candidate_parts[2]="${candidate_parts[2]%%+*}"
+    current_parts[2]="${current_parts[2]%%+*}"
+    for i in 0 1 2; do
+        candidate_part="${candidate_parts[$i]}"
+        current_part="${current_parts[$i]}"
+        if [ "${#candidate_part}" -gt "${#current_part}" ]; then
+            return 0
+        elif [ "${#candidate_part}" -lt "${#current_part}" ]; then
+            return 1
+        elif [[ "$candidate_part" > "$current_part" ]]; then
+            return 0
+        elif [[ "$candidate_part" < "$current_part" ]]; then
+            return 1
+        fi
+    done
+    return 1
+}
+
+if [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)$ ]]; then
+    CHANNEL_MAJOR="${BASH_REMATCH[1]}"
+    BEST_TAG=""
+    PAGE=1
+    PER_PAGE=100
+
+    while :; do
+        RELEASES_URL="https://api.github.com/repos/$REPO/releases?per_page=$PER_PAGE&page=$PAGE"
+        RELEASES_CURL_ARGS=(-sLf --connect-timeout 15 --max-time 30 -H "Accept: application/vnd.github+json" -H "User-Agent: gh-aw-install-gh-aw.sh" -H "X-GitHub-Api-Version: 2022-11-28")
+        if [ -n "${GH_TOKEN:-}" ]; then
+            AUTHORIZATION_HEADER="Authorization: Bearer "
+            AUTHORIZATION_HEADER+="$GH_TOKEN"
+            RELEASES_CURL_ARGS+=(-H "$AUTHORIZATION_HEADER")
+        fi
+        if ! RELEASES_RESPONSE=$(curl "${RELEASES_CURL_ARGS[@]}" "$RELEASES_URL"); then
+            print_error "Failed to resolve stable releases for version channel $VERSION from GitHub API."
+            exit 1
+        fi
+
+        RELEASE_RECORDS=$(printf '%s\n' "$RELEASES_RESPONSE" | awk '
+            function parse_field(    value) {
+                value = field
+                if (match(value, /^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                    value = substr(value, 1, RLENGTH)
+                    sub(/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"/, "", value)
+                    sub(/"$/, "", value)
+                    release_tag = value
+                } else if (match(value, /^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                    sub(/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    release_draft = value
+                } else if (match(value, /^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                    sub(/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    release_prerelease = value
+                }
+            }
+            function emit_release() {
+                if (release_tag != "" && release_draft != "" && release_prerelease != "") {
+                    print release_tag, release_draft, release_prerelease
+                }
+            }
+            {
+                for (i = 1; i <= length($0); i++) {
+                    char = substr($0, i, 1)
+                    if (in_string) {
+                        field = field char
+                        if (escaped) {
+                            escaped = 0
+                        } else if (char == "\\") {
+                            escaped = 1
+                        } else if (char == "\"") {
+                            in_string = 0
+                        }
+                        continue
+                    }
+
+                    if (char == "\"" && depth > 0) {
+                        field = field char
+                        in_string = 1
+                        continue
+                    }
+
+                    if (depth == 1 && array_depth == object_array_depth && char == ",") {
+                        parse_field()
+                        field = ""
+                        continue
+                    }
+                    if (depth == 1 && array_depth == object_array_depth && char == "}") {
+                        parse_field()
+                        emit_release()
+                        depth--
+                        field = ""
+                        release_tag = ""
+                        release_draft = ""
+                        release_prerelease = ""
+                        continue
+                    }
+
+                    if (depth > 0) {
+                        field = field char
+                    }
+                    if (char == "{") {
+                        if (depth == 0) {
+                            object_array_depth = array_depth
+                            field = ""
+                            release_tag = ""
+                            release_draft = ""
+                            release_prerelease = ""
+                        }
+                        depth++
+                    } else if (char == "}") {
+                        depth--
+                    } else if (char == "[") {
+                        array_depth++
+                    } else if (char == "]") {
+                        array_depth--
+                    }
+                }
+            }
+        ')
+        PAGE_RELEASE_COUNT=$(printf '%s\n' "$RELEASE_RECORDS" | awk 'NF { count++ } END { print count+0 }')
+
+        while IFS=' ' read -r release_tag draft prerelease; do
+            [ -n "$release_tag" ] || continue
+            if [ "$draft" != false ] || [ "$prerelease" != false ]; then
+                continue
+            fi
+            if [[ "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] &&
+                [ "${BASH_REMATCH[1]}" = "$CHANNEL_MAJOR" ]; then
+                if [ -z "$BEST_TAG" ] || compare_semver "$release_tag" "$BEST_TAG"; then
+                    BEST_TAG="$release_tag"
+                fi
+            fi
+        done <<< "$RELEASE_RECORDS"
+
+        if [ "$PAGE_RELEASE_COUNT" -lt "$PER_PAGE" ]; then
+            break
+        fi
+        PAGE=$((PAGE + 1))
+    done
+
+    if [ -z "$BEST_TAG" ]; then
+        print_error "No stable release found for version channel $VERSION."
+        exit 1
+    fi
+    print_info "Resolved version channel $VERSION to $BEST_TAG"
+    VERSION="$BEST_TAG"
+fi
+
 # Try gh extension install if requested (and gh is available)
 if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
     print_info "Attempting to install gh-aw using 'gh extension install'..."
@@ -234,7 +391,8 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
                 print_info "Falling back to manual installation..."
             else
                 # Verify the installed version matches the requested version (if specific version was requested)
-                if [ "$VERSION" != "latest" ] && [ "$INSTALLED_VERSION" != "$VERSION" ]; then
+                REQUESTED_VERSION="${VERSION%%+*}"
+                if [ "$VERSION" != "latest" ] && [ "$INSTALLED_VERSION" != "$REQUESTED_VERSION" ]; then
                     print_warning "Version mismatch: requested $VERSION but gh extension install installed $INSTALLED_VERSION"
                     print_info "Falling back to manual installation to install the correct version..."
                 else
@@ -300,7 +458,6 @@ fi
 
 INSTALL_DIR="$HOME/.local/share/gh/extensions/gh-aw"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
-CHECKSUMS_PATH="$INSTALL_DIR/checksums.txt"
 
 print_info "Download URL: $DOWNLOAD_URL"
 print_info "Installation directory: $INSTALL_DIR"
@@ -312,9 +469,19 @@ if [ ! -d "$INSTALL_DIR" ]; then
 fi
 
 # Check if binary already exists
-if [ -f "$BINARY_PATH" ]; then
-    print_warning "Binary '$BINARY_PATH' already exists. It will be overwritten."
+if [ -e "$BINARY_PATH" ] || [ -L "$BINARY_PATH" ]; then
+    print_warning "Binary '$BINARY_PATH' already exists. It will be replaced after verification."
 fi
+
+if ! STAGING_DIR=$(mktemp -d "$INSTALL_DIR/.gh-aw-install.XXXXXX"); then
+    print_error "Failed to create temporary installation directory in '$INSTALL_DIR'."
+    exit 1
+fi
+STAGED_BINARY_PATH="$STAGING_DIR/$BINARY_NAME"
+CHECKSUMS_PATH="$STAGING_DIR/checksums.txt"
+trap 'rm -rf -- "$STAGING_DIR"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Download the binary with retry logic
 print_info "Downloading gh-aw binary..."
@@ -325,7 +492,7 @@ download_binary_with_retry() {
     local delay="$RETRY_DELAY"
 
     for attempt in $(seq 1 $MAX_RETRIES); do
-        if curl -L -f --connect-timeout 15 --max-time 120 -o "$BINARY_PATH" "$url"; then
+        if curl -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
             print_success "Binary downloaded successfully"
             return 0
         fi
@@ -398,7 +565,7 @@ if [ "$SKIP_CHECKSUM" = false ]; then
             print_warning "Checksum verification will be skipped."
         else
             # Compute the actual checksum of the downloaded binary
-            ACTUAL_CHECKSUM=$($CHECKSUM_CMD "$BINARY_PATH" | awk '{print $1}')
+            ACTUAL_CHECKSUM=$($CHECKSUM_CMD "$STAGED_BINARY_PATH" | awk '{print $1}')
             
             if [ "$ACTUAL_CHECKSUM" = "$EXPECTED_CHECKSUM" ]; then
                 print_success "Checksum verification passed!"
@@ -410,7 +577,6 @@ if [ "$SKIP_CHECKSUM" = false ]; then
                 print_error "Actual:   $ACTUAL_CHECKSUM"
                 print_error "The downloaded binary may be corrupted or tampered with."
                 print_info "To skip checksum verification, use: ./install-gh-aw.sh $VERSION --skip-checksum"
-                rm -f "$BINARY_PATH"
                 exit 1
             fi
         fi
@@ -424,7 +590,7 @@ fi
 
 # Make it executable
 print_info "Making binary executable..."
-chmod +x "$BINARY_PATH"
+chmod +x "$STAGED_BINARY_PATH"
 
 # On Windows, executing a freshly downloaded binary may stall while Windows Defender
 # scans it.  Wrap verification calls with a timeout so the script doesn't hang.
@@ -437,16 +603,26 @@ fi
 # Verify the binary
 print_info "Verifying binary..."
 # shellcheck disable=SC2086
-if $BINARY_EXEC_TIMEOUT "$BINARY_PATH" --help > /dev/null 2>&1; then
+if $BINARY_EXEC_TIMEOUT "$STAGED_BINARY_PATH" --help > /dev/null 2>&1; then
     print_success "Binary is working correctly!"
 else
     if [ "$OS_NAME" = "windows" ]; then
         print_warning "Binary verification timed out — Windows Defender may still be scanning the binary."
-        print_warning "Installation is complete. Verify manually with: '$BINARY_PATH' --help"
+        print_warning "After installation completes, verify manually with: '$BINARY_PATH' --help"
     else
         print_error "Binary verification failed. The downloaded file may be corrupted or incompatible."
         exit 1
     fi
+fi
+
+if [ -d "$BINARY_PATH" ]; then
+    print_error "Cannot install gh-aw: '$BINARY_PATH' is a directory."
+    exit 1
+fi
+
+if ! mv -f -- "$STAGED_BINARY_PATH" "$BINARY_PATH"; then
+    print_error "Failed to replace gh-aw at '$BINARY_PATH'."
+    exit 1
 fi
 
 # Show file info

@@ -180,6 +180,13 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 
     Every job emits setup and conclusion spans with rich attributes (`gh-aw.job.name`, `gh-aw.workflow.name`, `gh-aw.engine.id`, token usage). All jobs in a run share one trace ID. Dispatched child workflows inherit the parent's trace context via `aw_context`.
 
+    To emit a custom span from a `github-script` step, resolve the helper through `RUNNER_TEMP` rather than a hardcoded `/tmp` path:
+
+    ```javascript
+    const path = require('path');
+    const otlp = require(path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions', 'otlp.cjs'));
+    ```
+
 - **`runtimes:`** - Runtime environment version overrides (object)
   - Allows customizing runtime versions (e.g., Node.js, Python) or defining new runtimes
   - Runtimes from imported shared workflows are also merged
@@ -339,8 +346,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
     strict: false
     ```
 
-  - **`sandbox.agent.runtime`** (string) selects the sandbox security and topology profile: `docker` (default: rootless AWF with network isolation), `docker-sudo-iptables` (privileged AWF with legacy iptables networking and host/service access), `gvisor` (gVisor `runsc` kernel-level isolation), `docker-sbx` (KVM microVM), or `cloud-hypervisor` (preview KVM runtime). Omitting the field is equivalent to `docker`. gVisor and Docker sbx are incompatible with `runner.topology: arc-dind`; the compiler derives the privileged setup each runtime needs. Docker sbx also requires `DOCKER_PAT`/`DOCKER_USERNAME` secrets and a KVM-capable runner when runtime installation is enabled.
-  - **`sandbox.agent.runtime-install`** (boolean) controls generated gVisor or Docker sbx provisioning and defaults to `true`. Set it to `false` only when the runner is pre-provisioned; Docker sbx credential refresh still runs. False wins when imported workflows merge this field. See [agent-runtime-instructions.md](agent-runtime-instructions.md) for requirements and troubleshooting.
+  - **`sandbox.agent.runtime`** (string) selects the sandbox security and topology profile: `docker` (default: rootless AWF with network isolation), `docker-sudo-iptables` (privileged AWF with legacy iptables networking and host/service access), or `cloud-hypervisor` (preview KVM runtime). Omitting the field is equivalent to `docker`. Cloud Hypervisor is incompatible with `runner.topology: arc-dind`.
   - **`sandbox.agent.allow-host-ports`** (array of integers) additional host TCP ports the agent may connect to. Requires `runtime: docker-sudo-iptables`. Ports published by `services:` are reached via `--allow-host-service-ports` instead; use this only for host daemons not declared there. There is no `sandbox.agent.legacy-security` field — that mode was replaced by `runtime: docker-sudo-iptables`.
   - **Strict mode**: `sandbox.agent` blocks without an explicit `id: awf` are rejected in strict mode. Any non-nil, non-disabled agent config without `id`/`type` defaults to AWF at runtime.
 

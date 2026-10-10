@@ -34,6 +34,7 @@ network:
     - playwright
     - local
     - node
+    - host.docker.internal
 jobs:
   agent:
     timeout-minutes: 15
@@ -109,9 +110,6 @@ steps:
       done
       echo "Dev server is ready"
 
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Visual Regression Checker

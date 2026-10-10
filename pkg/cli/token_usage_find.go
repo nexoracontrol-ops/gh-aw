@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/fileutil"
+	"golang.org/x/sync/singleflight"
 )
 
 // findTokenUsageFile searches for token-usage.jsonl in the run directory
@@ -36,24 +38,9 @@ func findTokenUsageFile(runDir string) string {
 		return awfAuditPath
 	}
 
-	// Check legacy firewall-audit-logs artifact directory (backward compat for older runs)
-	entries, err := os.ReadDir(runDir)
-	if err != nil {
-		return ""
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasPrefix(name, "firewall-audit-logs") || strings.HasPrefix(name, "firewall-logs") {
-			candidate := filepath.Join(runDir, name, tokenUsageJSONLPath)
-			if fileutil.FileExists(candidate) {
-				tokenUsageLog.Printf("Found token usage file in %s: %s", name, candidate)
-				return candidate
-			}
-		}
+	if legacy := findLegacyAPIProxyLogFile(runDir, tokenUsageJSONLPath); legacy != "" {
+		tokenUsageLog.Printf("Found token usage file in legacy artifact: %s", legacy)
+		return legacy
 	}
 
 	// Walk sandbox directory for any token-usage.jsonl
@@ -142,12 +129,7 @@ func findUsageJSONLFiles(runDir string) []string {
 	return files
 }
 
-func findAPIProxyEventsFile(runDir string) string {
-	primary := filepath.Join(runDir, "sandbox", "firewall", "logs", proxyEventsJSONLPath)
-	if fileutil.FileExists(primary) {
-		return primary
-	}
-
+func findLegacyAPIProxyLogFile(runDir, relativePath string) string {
 	entries, err := os.ReadDir(runDir)
 	if err != nil {
 		return ""
@@ -158,39 +140,104 @@ func findAPIProxyEventsFile(runDir string) string {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasPrefix(name, "firewall-audit-logs") || strings.HasPrefix(name, "firewall-logs") {
-			candidate := filepath.Join(runDir, name, proxyEventsJSONLPath)
+		if isLegacyAPIProxyLogDir(name) {
+			candidate := filepath.Join(runDir, name, relativePath)
 			if fileutil.FileExists(candidate) {
 				return candidate
 			}
 		}
 	}
-
 	return ""
 }
 
-func findAgentStdioFile(runDir string) string {
-	primary := filepath.Join(runDir, "agent-stdio.log")
-	if fileutil.FileExists(primary) {
-		return primary
-	}
+func isLegacyAPIProxyLogDir(name string) bool {
+	return strings.HasPrefix(name, "firewall-audit-logs") || strings.HasPrefix(name, "firewall-logs")
+}
 
-	var found string
-	if walkErr := filepath.Walk(runDir, func(path string, info os.FileInfo, err error) error {
+var (
+	apiProxySteeringLogCache sync.Map
+	apiProxySteeringLogGroup singleflight.Group
+)
+
+type apiProxySteeringLogCacheEntry struct {
+	log *apiProxySteeringLog
+}
+
+func loadAPIProxySteeringLogCache(cacheKey string) (apiProxySteeringLogCacheEntry, bool) {
+	cached, ok := apiProxySteeringLogCache.Load(cacheKey)
+	if !ok {
+		return apiProxySteeringLogCacheEntry{}, false
+	}
+	entry, ok := cached.(apiProxySteeringLogCacheEntry)
+	if !ok {
+		apiProxySteeringLogCache.Delete(cacheKey)
+		return apiProxySteeringLogCacheEntry{}, false
+	}
+	return entry, true
+}
+
+// findAPIProxyEventsLog caches the compact parsed result because audit, logs,
+// and token-usage analysis can request it concurrently for the same run.
+func findAPIProxyEventsLog(runDir string) (*apiProxySteeringLog, error) {
+	cacheKey := filepath.Clean(runDir)
+	if cached, ok := loadAPIProxySteeringLogCache(cacheKey); ok {
+		return cached.log, nil
+	}
+	result, err, _ := apiProxySteeringLogGroup.Do(cacheKey, func() (any, error) {
+		if cached, ok := loadAPIProxySteeringLogCache(cacheKey); ok {
+			return cached, nil
+		}
+		log, err := discoverAPIProxyEventsLog(cacheKey)
 		if err != nil {
-			return nil
+			return nil, err
 		}
-		if info == nil || info.IsDir() {
-			return nil
-		}
-		if info.Name() == "agent-stdio.log" {
-			found = path
-			return filepath.SkipAll
-		}
-		return nil
-	}); walkErr != nil && !errors.Is(walkErr, filepath.SkipAll) {
-		tokenUsageLog.Printf("findAgentStdioFile walk error: %v", walkErr)
+		entry := apiProxySteeringLogCacheEntry{log: log}
+		apiProxySteeringLogCache.Store(cacheKey, entry)
+		return entry, nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	entry, ok := result.(apiProxySteeringLogCacheEntry)
+	if !ok {
+		return nil, fmt.Errorf("unexpected API proxy steering log cache result type %T", result)
+	}
+	return entry.log, nil
+}
 
-	return found
+func discoverAPIProxyEventsLog(runDir string) (*apiProxySteeringLog, error) {
+	relativePaths := []string{proxyEventLogsJSONLPath, proxyEventsJSONLPath}
+	roots := []string{
+		filepath.Join(runDir, "sandbox", "firewall", "logs"),
+		filepath.Join(runDir, "sandbox", "firewall", "audit"),
+	}
+	for _, legacyRoot := range []string{runDir, filepath.Join(runDir, "sandbox")} {
+		if entries, err := os.ReadDir(legacyRoot); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() && isLegacyAPIProxyLogDir(entry.Name()) {
+					roots = append(roots, filepath.Join(legacyRoot, entry.Name()))
+				}
+			}
+		}
+	}
+	var firstErr error
+	for _, root := range roots {
+		for _, relativePath := range relativePaths {
+			candidate := filepath.Join(root, relativePath)
+			if !fileutil.FileExists(candidate) {
+				continue
+			}
+			log, err := parseAPIProxySteeringLog(candidate)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if len(log.eventCounts) > 0 {
+				return log, nil
+			}
+		}
+	}
+	return nil, firstErr
 }

@@ -48,6 +48,11 @@ timeout-minutes: 45
 sandbox:
   agent:
     id: awf
+    runtime: cloud-hypervisor
+    config:
+      filesystem:
+        allow-write:
+          - /tmp/gh-aw/agent
 tools:
   bash:
   - cat pkg/workflow/js/safe_outputs_tools.json
@@ -60,10 +65,30 @@ tools:
   - "git log -1 --format=\"%ai\" -- actions/setup/js/*.cjs"
   - "git log -3 --format=\"%ai %s\" -- actions/setup/js/*.cjs"
   cache-memory: true
+  ledger:
+    concurrency-audits:
+      schema:
+        type: object
+        required: [record_type, run_id, analyzed_tool, status]
+        properties:
+          record_type:
+            enum: [mcp_concurrency_audit]
+          run_id:
+            type: string
+          analyzed_tool:
+            type: string
+          status:
+            type: string
+          issue_number:
+            type: integer
+            minimum: 1
+        additionalProperties: false
+      max-record-kb: 4
+      max-patch-kb: 10
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
 tracker-id: mcp-concurrency-analysis
@@ -97,6 +122,7 @@ When issues are identified, create detailed issues with specific recommendations
 
 - **Repository**: ${{ github.repository }}
 - **Analysis Date**: $(date +%Y-%m-%d)
+- **Run ID**: ${{ github.run_id }}
 - **Workspace**: ${{ github.workspace }}
 - **Tools Location**: `actions/setup/js/*.cjs`
 - **Tool Definitions**: `pkg/workflow/js/safe_outputs_tools.json`
@@ -523,6 +549,23 @@ If you emitted any actionable safe outputs, do not emit `noop`.
 ```json
 {"noop": {"message": "No actionable concurrency issues found in <tool_name>; analysis completed and cache state updated."}}
 ```
+
+After the safe output, query the generic records projection at `/tmp/gh-aw/ledgers/concurrency-audits/ledger.db` for this run ID:
+
+```sql
+SELECT json_extract(payload, '$.run_id') AS run_id,
+       json_extract(payload, '$.analyzed_tool') AS analyzed_tool,
+       json_extract(payload, '$.status') AS status,
+       json_extract(payload, '$.issue_number') AS issue_number
+FROM records
+WHERE json_extract(payload, '$.record_type') = 'mcp_concurrency_audit'
+  AND json_extract(payload, '$.run_id') = '${{ github.run_id }}'
+LIMIT 1;
+```
+
+If absent, submit one `ledger_append` record with `record_type: mcp_concurrency_audit`. Include only the run ID, analyzed tool, status, and issue number if one was created; do not store code or raw analysis notes. Do not edit ledger branches directly.
+For the latest audit status per analyzed tool, filter `records` by
+`json_extract(payload, '$.analyzed_tool')` and order by `ordinal DESC LIMIT 1`.
 
 ## Concurrency Analysis Best Practices
 

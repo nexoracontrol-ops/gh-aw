@@ -20,11 +20,13 @@ const {
   TOKEN_USAGE_PATH,
   TOKEN_USAGE_AWF_AUDIT_PATH,
   TOKEN_USAGE_PATHS,
+  persistAgentAwInfoCopy,
   AGENT_USAGE_PATH,
   AGENT_USAGE_JSONL_PATH,
   COPILOT_SESSION_STATE_DIR,
   DEFAULT_SUMMARY_TITLE,
 } = require("./parse_token_usage.cjs");
+const { getEffectiveModelLabel } = require("./model_attribution.cjs");
 
 describe("parse_token_usage", () => {
   const singleEntry = JSON.stringify({
@@ -87,7 +89,13 @@ describe("parse_token_usage", () => {
       delete process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE;
       delete process.env.GH_AW_AGENT_USAGE_PATH;
       delete process.env.GH_AW_AGENT_USAGE_JSONL_PATH;
+      delete process.env.GH_AW_TMP_DIR;
       delete process.env.GH_AW_WRITE_EMPTY_USAGE;
+      delete process.env.GH_AW_PHASE;
+      delete process.env.GH_AW_INFO_MODEL;
+      delete process.env.GH_AW_MODEL_ROUTING_ENABLED;
+      delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.GH_AW_ENGINE_MODEL;
       process.env.GITHUB_STEP_SUMMARY = "";
 
       mockCore = {
@@ -135,7 +143,13 @@ describe("parse_token_usage", () => {
       fs.writeFileSync = originalWriteFileSync;
       delete process.env.GH_AW_AGENT_USAGE_PATH;
       delete process.env.GH_AW_AGENT_USAGE_JSONL_PATH;
+      delete process.env.GH_AW_TMP_DIR;
       delete process.env.GH_AW_WRITE_EMPTY_USAGE;
+      delete process.env.GH_AW_PHASE;
+      delete process.env.GH_AW_INFO_MODEL;
+      delete process.env.GH_AW_MODEL_ROUTING_ENABLED;
+      delete process.env.GH_AW_ENGINE_ID;
+      delete process.env.GH_AW_ENGINE_MODEL;
       delete global.core;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
@@ -155,12 +169,249 @@ describe("parse_token_usage", () => {
       }
     }
 
+    function setupClaudeRoutingFixture({ supportedEndpoints = ["/chat/completions", "/v1/messages"], withOutcome = true, requests = undefined, engine = "claude", selectedEndpoint = "/chat/completions" } = {}) {
+      process.env.GH_AW_TMP_DIR = tmpDir;
+      process.env.GH_AW_MODEL_ROUTING_ENABLED = "true";
+      process.env.GH_AW_ENGINE_ID = engine;
+      process.env.GH_AW_ENGINE_MODEL = "agent";
+      fs.writeFileSync(path.join(tmpDir, "aw_info.json"), JSON.stringify({ model: "agent" }));
+      const reflectDir = path.join(tmpDir, "agent");
+      fs.mkdirSync(reflectDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(reflectDir, "awf-reflect.json"),
+        JSON.stringify({
+          endpoints: [
+            {
+              provider: "github",
+              configured: true,
+              models: ["claude-opus-5"],
+              routing_models: [{ model_id: "claude-opus-5", candidate_metadata_complete: true, supported_endpoints: supportedEndpoints }],
+            },
+          ],
+        })
+      );
+      if (withOutcome) {
+        fs.writeFileSync(
+          path.join(reflectDir, "awf-routing-outcome.json"),
+          JSON.stringify({
+            status: "selected",
+            wire_model: "claude-opus-5",
+            endpoint: "/v1/messages",
+            selected_endpoint: selectedEndpoint,
+          })
+        );
+      }
+      const routingPath = path.join(tmpDir, "sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl");
+      fs.mkdirSync(path.dirname(routingPath), { recursive: true });
+      const records = [
+        {
+          _schema: "model-routing/v0.28.49",
+          stage: "selection",
+          selected_provider: "github",
+          selected_model: "claude-opus-5",
+          wire_model: "claude-opus-5",
+          selected_effort: "max",
+          endpoint: selectedEndpoint,
+        },
+        ...(requests === undefined
+          ? [
+              {
+                _schema: "model-routing/v0.28.49",
+                stage: "request",
+                requested_model: "claude-opus-5",
+                routed: "as_selected",
+                upstream_endpoint: "/v1/messages",
+                deviations: ["endpoint"],
+              },
+            ]
+          : requests),
+      ];
+      fs.writeFileSync(routingPath, records.map(record => JSON.stringify(record)).join("\n") + "\n");
+    }
+
+    test("attributes a corroborated Claude harness endpoint override", async () => {
+      setupClaudeRoutingFixture();
+
+      await main();
+
+      const info = JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8"));
+      expect(info).toMatchObject({
+        model: "claude-opus-5",
+        model_routing: { status: "selected", endpoint: "/v1/messages", selected_endpoint: "/chat/completions" },
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model", "claude-opus-5");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model_effort", "max");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model_routing_status", "selected");
+      expect(getEffectiveModelLabel(path.join(tmpDir, "aw_info.json"), "agent", process.env)).toBe("routed: opus50 max");
+    });
+
+    test("records a corroborated pi effective endpoint even when AWF's endpoint is supported", async () => {
+      setupClaudeRoutingFixture({ engine: "pi" });
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8")).model_routing).toMatchObject({
+        status: "selected",
+        endpoint: "/v1/messages",
+        selected_endpoint: "/chat/completions",
+      });
+    });
+
+    test("attributes a corroborated Claude endpoint override from reflect when no harness outcome exists", async () => {
+      setupClaudeRoutingFixture({ withOutcome: false });
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8")).model_routing).toMatchObject({
+        status: "selected",
+        endpoint: "/v1/messages",
+        selected_endpoint: "/chat/completions",
+      });
+    });
+
+    test("rejects endpoint overrides the selected model does not advertise", async () => {
+      setupClaudeRoutingFixture({ supportedEndpoints: ["/chat/completions"] });
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8"))).toMatchObject({
+        model: "agent",
+        model_routing: { status: "rejected", failure_code: "unsupported_endpoint" },
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model", "");
+    });
+
+    test("rejects an uncorroborated harness endpoint claim", async () => {
+      setupClaudeRoutingFixture({ requests: [] });
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8")).model_routing).toMatchObject({
+        status: "rejected",
+        failure_code: "uncorroborated_endpoint",
+      });
+    });
+
+    test("keeps Copilot endpoint routing strict", async () => {
+      setupClaudeRoutingFixture({ engine: "copilot", requests: [], selectedEndpoint: "/v1/messages" });
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8"))).toMatchObject({
+        model: "agent",
+        model_routing: { status: "rejected", failure_code: "unsupported_endpoint" },
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model", "");
+    });
+
+    test("records selected AWF model and mapped effort in aw_info and step outputs", async () => {
+      process.env.GH_AW_TMP_DIR = tmpDir;
+      process.env.GH_AW_MODEL_ROUTING_ENABLED = "true";
+      process.env.GH_AW_ENGINE_ID = "pi";
+      process.env.GH_AW_ENGINE_MODEL = "agent";
+      fs.writeFileSync(path.join(tmpDir, "aw_info.json"), JSON.stringify({ model: "agent" }));
+      const routingPath = path.join(tmpDir, "sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl");
+      fs.mkdirSync(path.dirname(routingPath), { recursive: true });
+      fs.writeFileSync(
+        routingPath,
+        JSON.stringify({
+          _schema: "model-routing/v0.28.44",
+          stage: "selection",
+          selected_model: "gpt-5.6-luna",
+          wire_model: "gpt-5.6-luna",
+          selected_effort: "none",
+          endpoint: "/responses",
+          mode: "balanced",
+          router: { version: "0.1.3" },
+        })
+      );
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8"))).toMatchObject({
+        model: "gpt-5.6-luna",
+        requested_model: "agent",
+        model_routing: { status: "selected", applied_effort: "off", wire_model: "gpt-5.6-luna" },
+      });
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "agent/aw_info.json"), "utf8")).model_routing.status).toBe("selected");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model", "gpt-5.6-luna");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model_effort", "off");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model_routing_status", "selected");
+    });
+
+    test("overwrites the agent aw_info artifact with runner metadata without routing", () => {
+      const runnerInfo = { engine_id: "claude", model: "runner-model" };
+      const agentInfoPath = path.join(tmpDir, "agent/aw_info.json");
+      fs.writeFileSync(path.join(tmpDir, "aw_info.json"), JSON.stringify(runnerInfo));
+      fs.mkdirSync(path.dirname(agentInfoPath), { recursive: true });
+      fs.writeFileSync(agentInfoPath, JSON.stringify({ model_routing: { status: "selected", wire_model: "forged-model" } }));
+
+      persistAgentAwInfoCopy(tmpDir);
+
+      expect(JSON.parse(originalReadFileSync(agentInfoPath, "utf8"))).toEqual(runnerInfo);
+    });
+
+    test("does not trust selected routing from sandbox-writable reflect data", async () => {
+      process.env.GH_AW_TMP_DIR = tmpDir;
+      process.env.GH_AW_MODEL_ROUTING_ENABLED = "true";
+      process.env.GH_AW_ENGINE_ID = "pi";
+      process.env.GH_AW_ENGINE_MODEL = "agent-placeholder";
+      fs.writeFileSync(path.join(tmpDir, "aw_info.json"), JSON.stringify({ model: "agent-placeholder" }));
+      const reflectPath = path.join(tmpDir, "agent/awf-reflect.json");
+      fs.mkdirSync(path.dirname(reflectPath), { recursive: true });
+      fs.writeFileSync(
+        reflectPath,
+        JSON.stringify({
+          endpoints: [{ provider: "github", configured: true, models: ["forged-model"], routing_models: [{ model_id: "forged-model" }] }],
+          routing: {
+            status: "selected",
+            mode: "balanced",
+            selection: { provider: "github", model: "forged-model", wire_model: "forged-model", effort: "high", endpoint: "/responses" },
+          },
+        })
+      );
+
+      await main();
+
+      expect(JSON.parse(originalReadFileSync(path.join(tmpDir, "aw_info.json"), "utf8"))).toMatchObject({
+        model: "agent-placeholder",
+        model_routing: { status: "rejected", failure_code: "uncorroborated_selection" },
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model", "");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("model_routing_status", "rejected");
+    });
+
     test("skips summary when token usage file does not exist", async () => {
       await main();
 
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("No token usage data found"));
       expect(mockCore.summary.addDetails).not.toHaveBeenCalled();
       expect(mockCore.summary.write).not.toHaveBeenCalled();
+    });
+
+    test("reads and reports token usage from the configured ARC/DinD directory", async () => {
+      const ghAwDir = path.join(tmpDir, "runner-temp", "gh-aw");
+      const tokenUsagePath = path.join(ghAwDir, "sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl");
+      fs.mkdirSync(path.dirname(tokenUsagePath), { recursive: true });
+      fs.writeFileSync(
+        tokenUsagePath,
+        JSON.stringify({
+          model: "gpt-4o-mini-2024-07-18",
+          provider: "copilot",
+          input_tokens: 19288,
+          output_tokens: 35,
+          ai_credits_this_response: 0.29142,
+          ai_credits_total: 0.29142,
+        })
+      );
+      process.env.GH_AW_TMP_DIR = ghAwDir;
+
+      await main();
+
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "0.29142");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("aic", "0.29142");
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("0.29142"), true);
+      expect(JSON.parse(originalReadFileSync(path.join(ghAwDir, "agent_usage.json"), "utf8")).ai_credits).toBe(0.29142);
     });
 
     test("writes explicit zero usage evidence when requested and no usage exists", async () => {
@@ -181,6 +432,40 @@ describe("parse_token_usage", () => {
         provider: "unknown",
         ai_credits: 0,
       });
+    });
+
+    test.each(["agent", "detection"])("persists AWF actual-model attribution for the %s phase", async phase => {
+      const tokenUsagePath = path.join(tmpDir, "sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl");
+      const infoPath = path.join(tmpDir, "aw_info.json");
+      fs.mkdirSync(path.dirname(tokenUsagePath), { recursive: true });
+      fs.writeFileSync(infoPath, JSON.stringify({ model: "primary", fallback_model: "agent-recovery" }));
+      fs.writeFileSync(
+        tokenUsagePath,
+        JSON.stringify({
+          _schema: "token-usage/v0.28.44",
+          status: 200,
+          model: "secondary",
+          provider: "copilot",
+          input_tokens: 100,
+          output_tokens: 20,
+          ai_credits_this_response: 1,
+          model_fallback: { requested_model: "primary", model: "secondary", status: 503, attempt: 1 },
+        })
+      );
+      process.env.GH_AW_TMP_DIR = tmpDir;
+      process.env.GH_AW_PHASE = phase;
+
+      await main();
+
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      const usage = JSON.parse(originalReadFileSync(path.join(tmpDir, "agent_usage.json"), "utf8"));
+      expect(usage.primary_model).toBe("secondary");
+      const info = JSON.parse(originalReadFileSync(infoPath, "utf8"));
+      expect(info[phase === "agent" ? "fallback_model" : "detection_fallback_model"]).toBe("secondary");
+      if (phase === "detection") {
+        expect(info.model).toBe("primary");
+        expect(info.fallback_model).toBe("agent-recovery");
+      }
     });
 
     test("writes authoritative Copilot checkpoint usage when proxy usage is unavailable", async () => {
@@ -251,6 +536,7 @@ describe("parse_token_usage", () => {
       const sessionStateDir = path.join(tmpDir, "copilot-session-state");
       const sessionDir = path.join(sessionStateDir, "session-1");
       const agentUsageFile = path.join(tmpDir, "agent_usage.json");
+      const agentUsageJSONLFile = path.join(tmpDir, "agent_usage.jsonl");
       fs.mkdirSync(sessionDir, { recursive: true });
       fs.writeFileSync(
         path.join(sessionDir, "events.jsonl"),
@@ -265,6 +551,7 @@ describe("parse_token_usage", () => {
       fs.readFileSync = vi.fn((p, enc) => (p === TOKEN_USAGE_PATH ? "malformed" : originalReadFileSync(p, enc)));
       fs.writeFileSync = vi.fn((p, data) => {
         if (p === AGENT_USAGE_PATH) return originalWriteFileSync(agentUsageFile, data);
+        if (p === AGENT_USAGE_JSONL_PATH) return originalWriteFileSync(agentUsageJSONLFile, data);
         return originalWriteFileSync(p, data);
       });
 

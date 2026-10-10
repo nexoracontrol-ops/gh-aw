@@ -162,6 +162,9 @@ const (
 	// AWFAPIProxyContainerIP is the fixed api-proxy sidecar address inside the AWF sandbox network.
 	AWFAPIProxyContainerIP = "172.30.0.30"
 
+	// AWFAPIProxyHostname is the api-proxy sidecar's DNS alias inside the AWF sandbox network.
+	AWFAPIProxyHostname = "api-proxy"
+
 	// DefaultMCPGatewayPort is the default port for the MCP gateway HTTP service
 	DefaultMCPGatewayPort = 8080
 
@@ -239,11 +242,17 @@ const AWFDefaultCommand CommandPrefix = "awf"
 // sudo supplies SUDO_UID and SUDO_GID for AWF to recover the invoking identity.
 const AWFCloudHypervisorCommand = "sudo --preserve-env awf"
 
+// AWFNVXCommand runs AWF with the host privileges required to create NVX microVMs.
+const AWFNVXCommand = "sudo --preserve-env awf"
+
 // DefaultCloudHypervisorVCPUs and DefaultCloudHypervisorMemoryMiB are the
 // minimum viable guest sizing defaults for the Cloud Hypervisor agent runtime.
 const (
 	DefaultCloudHypervisorVCPUs     = 2
 	DefaultCloudHypervisorMemoryMiB = 4096
+	DefaultNVXMemoryMiB             = 512
+	DefaultNVXMemoryMaxBytes        = 536870912
+	DefaultNVXPidsMax               = 128
 )
 
 // AWFLegacySecurityCommand runs the trusted system AWF binary with the runner's
@@ -321,6 +330,9 @@ const DefaultMCPGatewayPayloadSizeThreshold = 524288
 
 // DefaultFirewallRegistry is the container image registry for AWF (gh-aw-firewall) Docker images
 const DefaultFirewallRegistry = "ghcr.io/github/gh-aw-firewall"
+
+// DefaultRouterRegistry is the container image registry for the gh-aw model router.
+const DefaultRouterRegistry = "ghcr.io/githubnext/gh-aw-router"
 
 // DefaultNodeAlpineLTSImage is the default Node.js Alpine LTS container image for MCP servers
 // Using node:lts-alpine provides the latest LTS version with minimal footprint
@@ -539,6 +551,19 @@ const WorkflowsLockYmlGitAttributesEntryLegacy = WorkflowsLockYmlGlob + " lingui
 // TmpGhAwDir is the root /tmp/gh-aw directory (without trailing slash).
 const TmpGhAwDir = "/tmp/gh-aw"
 
+// WorkQueueSnapshotPath is the activation artifact mounted into the queue MCP server.
+const WorkQueueSnapshotPath = TmpGhAwDir + "/work-queue.snapshot.json"
+const WorkQueueFinishIntentPath = TmpGhAwDir + "/work-queue.finish.jsonl"
+const WorkQueueAuthorizationPath = TmpGhAwDir + "/work-queue.authorizations.json"
+const WorkQueueDeliveryReceiptPath = TmpGhAwDir + "/work-queue.deliveries.json"
+const WorkQueueIntentPath = TmpGhAwDir + "/work-queue.intents.jsonl"
+const WorkQueueClaimArtifactsPath = TmpGhAwDir + "/claims"
+const WorkQueueFinishIntentDir = GhAwRootDirShell + "/safeoutputs/work-queue"
+const WorkQueueFinishIntentMount = WorkQueueFinishIntentDir + ":" + WorkQueueFinishIntentDir + ":rw"
+
+// WorkQueueSnapshotMount exposes the activation snapshot read-only to the queue MCP server.
+const WorkQueueSnapshotMount = WorkQueueSnapshotPath + ":" + WorkQueueSnapshotPath + ":ro"
+
 // TmpGhAwDirSlash is TmpGhAwDir with a trailing slash.
 // Use for path prefix comparisons (e.g. strings.HasPrefix).
 const TmpGhAwDirSlash = TmpGhAwDir + "/"
@@ -567,6 +592,12 @@ const AwPromptsFileExpr = GhAwRootDir + "/aw-prompts/prompt.txt"
 
 // AwPromptsFileShell is the runtime prompt file path in shell env-var form for host-side paths.
 const AwPromptsFileShell = GhAwRootDirShell + "/aw-prompts/prompt.txt"
+
+// AwPromptsUserFile is the runtime task-only prompt file path.
+const AwPromptsUserFile = TmpGhAwDir + "/aw-prompts/user.txt"
+
+// AwPromptsUserFileExpr is the host-side task-only prompt path in GitHub Actions expression form.
+const AwPromptsUserFileExpr = GhAwRootDir + "/aw-prompts/user.txt"
 
 // TmpMcpConfigDir is the mcp-config directory in the /tmp/gh-aw tree.
 // Engines that require a writable MCP config directory (e.g. Codex) use this path.

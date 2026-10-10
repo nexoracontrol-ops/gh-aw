@@ -14,10 +14,32 @@ This project hosts custom ESLint linters for `/actions/setup/js`.
 - `npm run lint:setup-js` — build and lint all `../actions/setup/js/**/*.cjs` files.
 - `npm run lint:setup-js:changed` — build and lint `../actions/setup/js/*.cjs` files.
 
+## Factory lifecycle and formal validation
+
+The [bounded TLA+ model and executable code comparison](../specs/eslint-factory/README.md)
+cover the dispatcher and miner/refiner/monster Claim lifecycle. Queue policy,
+authorized producers and worker profiles are provisioned externally; these
+workflows do not install an automatic miner → refiner → monster DAG. Issue
+creation is not queue admission. Workers use authenticated version-3 assignments
+with immutable original membership; permitted homogeneous batches require each
+output to retain its originating Claim scope. Completion alone is neither
+verified delivery nor a Result, and output count contracts are per Claim rather
+than automatically run-wide.
+
+The JS/TS mining goals above do not describe current scan coverage: configured
+rules apply to non-test CJS files. Most rules warn; the HTTP response-error-listener
+rule is an error. Monster's precheck marks a scan clean on ESLint exit zero,
+**including warning-only diagnostics**. Installation/build/tool failures are not
+evidence of defect-free source. Build/test/quality bars and the prompt's three
+total Copilot assignments are agent obligations, not guarantees proved by the
+finite model. The linked checker records assumptions, source/tool identities,
+negative controls and validated readable traces without live effects.
+
 ## Rules
 
 | Rule | Description |
 |---|---|
+| [`no-async-foreach-callback`](#no-async-foreach-callback) | Disallow `async` callbacks passed to `Array.prototype.forEach()`, which ignores returned promises |
 | [`no-core-exportvariable-non-string`](#no-core-exportvariable-non-string) | Require explicit string values for `core.exportVariable` calls |
 | [`no-core-setoutput-non-string`](#no-core-setoutput-non-string) | Require explicit string values for `core.setOutput` calls |
 | [`no-empty-catch-block`](#no-empty-catch-block) | Disallow undocumented empty `catch` blocks |
@@ -29,6 +51,8 @@ This project hosts custom ESLint linters for `/actions/setup/js`.
 | [`no-json-stringify-set-or-map`](#no-json-stringify-set-or-map) | Disallow `JSON.stringify()` directly on `Set` or `Map` instances |
 | [`no-math-minmax-array-spread`](#no-math-minmax-array-spread) | Disallow spreading a non-literal array into `Math.min(...)` / `Math.max(...)` |
 | [`no-misplaced-error-code-definition`](#no-misplaced-error-code-definition) | Require exported error-code constants to be defined in `error_codes.cjs` |
+| [`no-single-char-string-replace`](#no-single-char-string-replace) | Disallow `String.prototype.replace()` with a single-character string pattern, which replaces only the first occurrence |
+| [`no-string-fallback-for-non-string-message`](#no-string-fallback-for-non-string-message) | Disallow stringifying a container object instead of its non-string `.message` value in a fallback |
 | [`no-throw-plain-object`](#no-throw-plain-object) | Disallow throwing plain object literals |
 | [`no-unsafe-catch-error-property`](#no-unsafe-catch-error-property) | Disallow unsafe property access on `catch` error bindings |
 | [`no-unsafe-promise-catch-error-property`](#no-unsafe-promise-catch-error-property) | Disallow unsafe property access in promise rejection handlers |
@@ -49,6 +73,7 @@ This project hosts custom ESLint linters for `/actions/setup/js`.
 | [`require-fs-close-sync`](#require-fs-close-sync) | Require `fs.openSync(...)` file descriptors to be closed with `fs.closeSync(fd)` in the same function |
 | [`require-fs-io-try-catch`](#require-fs-io-try-catch) | Require try/catch around `fs.statSync`, `readdirSync`, `copyFileSync`, `unlinkSync`, and `renameSync` |
 | [`require-fs-sync-try-catch`](#require-fs-sync-try-catch) | Require try/catch around `fs.readFileSync`, `writeFileSync`, and `appendFileSync` |
+| [`require-http-response-error-listener`](#require-http-response-error-listener) | Require an `'error'` listener on response objects in `http` / `https` request and get callbacks |
 | [`require-json-parse-try-catch`](#require-json-parse-try-catch) | Require try/catch around `JSON.parse(...)` calls |
 | [`require-mkdirsync-try-catch`](#require-mkdirsync-try-catch) | Require try/catch around `fs.mkdirSync` calls |
 | [`require-mkdtempsync-try-catch`](#require-mkdtempsync-try-catch) | Require try/catch around `fs.mkdtempSync` calls |
@@ -78,6 +103,8 @@ This project hosts custom ESLint linters for `/actions/setup/js`.
 | [`require-page-counter-increment-in-while-true-loop`](#require-page-counter-increment-in-while-true-loop) | Require page counters to advance in manual `while (true)` pagination loops |
 | [`require-getexecoutput-exitcode-check`](#require-getexecoutput-exitcode-check) | Require `exitCode` / returned exit code to be read after `getExecOutput()` or `exec()` with `{ ignoreReturnCode: true }` |
 | [`prefer-actions-exec-over-child-process`](#prefer-actions-exec-over-child-process) | Prefer `@actions/exec` over `child_process` to spawn processes that run to completion |
+| [`no-unguarded-async-timer-callback`](#no-unguarded-async-timer-callback) | Require async timer callbacks to wrap their entire body in try/catch |
+| [`require-finite-check-before-date-toisostring`](#require-finite-check-before-date-toisostring) | Validate dynamic dates before calling `toISOString()` or `toJSON()` |
 
 ### `no-empty-catch-block`
 
@@ -1186,3 +1213,45 @@ const branch = stdout.trim();
 - `child_process.spawn()` and `child_process.spawnSync()` — used for long-running, detached, or interactively-streamed processes (background servers, sidecars, and similar) for which `@actions/exec` has no equivalent, since `exec()` / `getExecOutput()` always wait for the command to finish before resolving
 - `exec()` / `execFile()` calls that retain the returned `ChildProcess` handle (used as a value: assigned, returned, member-accessed, passed to another call, ...) — those callers can write to `child.stdin`, stream `child.stdout`, or manage the process lifecycle, which `@actions/exec` cannot express; only calls whose result is discarded (pure callback style) are flagged
 - Calls to `exec`/`execSync`/`execFile`/`execFileSync` from any module other than `child_process` (or `node:child_process`)
+
+### `no-async-foreach-callback`
+
+Disallow `async` callbacks passed to `Array.prototype.forEach()`. `forEach()` ignores each callback's returned promise, so the work is not sequenced and rejections can go unhandled.
+
+**Flagged form:**
+```js
+items.forEach(async item => {
+  await processItem(item);
+});
+```
+
+**Safe alternatives:**
+```js
+for (const item of items) {
+  await processItem(item);
+}
+
+await Promise.all(items.map(async item => processItem(item)));
+```
+
+### `no-single-char-string-replace`
+
+Disallow `String.prototype.replace()` with a single-character string pattern, which only replaces the first occurrence. Use `replaceAll()` or a global regular expression when every occurrence should be replaced.
+
+**Flagged form:**
+```js
+const normalized = value.replace("_", "-");
+```
+
+**Safe alternative:**
+```js
+const normalized = value.replaceAll("_", "-");
+```
+
+### `no-unguarded-async-timer-callback`
+
+Disallow async callbacks passed to `setTimeout()`, `setInterval()`, or `setImmediate()` unless the entire callback body is wrapped in `try/catch`. These timer functions discard the callback's returned promise, so uncaught errors become unhandled rejections.
+
+### `require-finite-check-before-date-toisostring`
+
+Require validation of dynamic values passed to `new Date(...)` before calling `toISOString()` or `toJSON()`, since invalid dates throw a `RangeError`. Validate the input with `Number.isFinite()` / `Number.isNaN()` or wrap the serialization in `try/catch`.

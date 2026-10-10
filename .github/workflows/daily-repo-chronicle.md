@@ -3,8 +3,6 @@ private: true
 emoji: "📅"
 description: Creates a narrative chronicle of daily repository activity including commits, PRs, issues, and discussions
 on:
-  schedule:
-    - cron: "daily around 16:00 on weekdays"  # ~8 AM PST (4 PM UTC), weekdays only
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,8 +13,8 @@ permissions:
 tracker-id: daily-repo-chronicle
 engine:
   id: pi
-  model-provider: openai
-model: openai/gpt-5.4
+  model-provider: github
+model: copilot/grok-4.7
 
 timeout-minutes: 45
 
@@ -29,6 +27,9 @@ sandbox:
   agent:
     id: awf
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   edit:
   bash:
@@ -48,6 +49,7 @@ safe-outputs:
     title-prefix: "📰 "
     close-older-discussions: true
 imports:
+  - shared/daily-report-worker.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[repo-chronicle] "

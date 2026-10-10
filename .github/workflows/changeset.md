@@ -14,10 +14,10 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-model: openai/gpt-5.3-codex
+model: copilot/gpt-5.6-sol
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
 strict: true
 safe-outputs:
   push-to-pull-request-branch:
@@ -56,9 +56,6 @@ imports:
 
   - shared/otlp.md
   - shared/graders.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: changeset-created
     question: Did the agent create a valid changeset file for the labeled pull request?

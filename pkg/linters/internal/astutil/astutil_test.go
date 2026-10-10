@@ -127,6 +127,52 @@ func TestRhsExprForIndex(t *testing.T) {
 	}
 }
 
+func TestMatchDiscardedErrorCall(t *testing.T) {
+	t.Parallel()
+
+	pass, file := typecheckSnippet(t, `package p
+import conv "strconv"
+type local struct{}
+func (local) Atoi(string) (int, error) { return 0, nil }
+func f() {
+	n, _ := conv.Atoi("1")
+	n, err := conv.Atoi("1")
+	var value local
+	n, _ = value.Atoi("1")
+	_ = n
+	_ = err
+}`)
+
+	var assigns []*ast.AssignStmt
+	ast.Inspect(file, func(node ast.Node) bool {
+		if assign, ok := node.(*ast.AssignStmt); ok {
+			if len(assign.Rhs) == 1 {
+				if _, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+					assigns = append(assigns, assign)
+				}
+			}
+		}
+		return true
+	})
+
+	if len(assigns) != 3 {
+		t.Fatalf("found %d assignments, want 3", len(assigns))
+	}
+
+	call, pkgPath, funcName, ok := MatchDiscardedErrorCall(pass, assigns[0])
+	if !ok {
+		t.Fatal("MatchDiscardedErrorCall() did not match aliased package call")
+	}
+	if call == nil || pkgPath != "strconv" || funcName != "Atoi" {
+		t.Fatalf("MatchDiscardedErrorCall() = (%v, %q, %q), want a strconv.Atoi call", call, pkgPath, funcName)
+	}
+	for _, assign := range assigns[1:] {
+		if call, pkgPath, funcName, ok := MatchDiscardedErrorCall(pass, assign); ok {
+			t.Errorf("MatchDiscardedErrorCall() = (%v, %q, %q, true), want no match", call, pkgPath, funcName)
+		}
+	}
+}
+
 func TestIsStringLiteral(t *testing.T) {
 	t.Parallel()
 
@@ -135,6 +181,13 @@ func TestIsStringLiteral(t *testing.T) {
 	}
 	if IsStringLiteral(&ast.BasicLit{Kind: token.INT, Value: "1"}) {
 		t.Fatal("did not expect int literal to be detected as string")
+	}
+	parenthesized := &ast.ParenExpr{X: &ast.ParenExpr{X: &ast.BasicLit{Kind: token.STRING, Value: `"alice"`}}}
+	if !IsStringLiteral(parenthesized) {
+		t.Fatal("expected parenthesized string literal to be detected")
+	}
+	if value, ok := StringLitValue(parenthesized); !ok || value != "alice" {
+		t.Fatalf("StringLitValue(parenthesized) = %q, %v", value, ok)
 	}
 }
 
@@ -472,65 +525,6 @@ func TestCallQualifierText(t *testing.T) {
 	directCall := &ast.CallExpr{Fun: ast.NewIdent("Index")}
 	if got := CallQualifierText(fset, directCall); got != "" {
 		t.Fatalf("CallQualifierText(non-selector) = %q, want %q", got, "")
-	}
-}
-
-func TestBuildContainsFix(t *testing.T) {
-	t.Parallel()
-
-	expr := &ast.BinaryExpr{
-		X:  ast.NewIdent("a"),
-		Op: token.NEQ,
-		Y:  ast.NewIdent("b"),
-	}
-
-	fixes := BuildContainsFix(nil, expr, "strings", "s", "sub", false, "test message")
-	if len(fixes) != 1 {
-		t.Fatalf("got %d fixes, want 1", len(fixes))
-	}
-	if fixes[0].Message != "test message" {
-		t.Fatalf("Message = %q, want %q", fixes[0].Message, "test message")
-	}
-	if got := string(fixes[0].TextEdits[0].NewText); got != "strings.Contains(s, sub)" {
-		t.Fatalf("NewText = %q, want %q", got, "strings.Contains(s, sub)")
-	}
-
-	// negated
-	fixes = BuildContainsFix(nil, expr, "strings", "s", "sub", true, "negated message")
-	if got := string(fixes[0].TextEdits[0].NewText); got != "!strings.Contains(s, sub)" {
-		t.Fatalf("negated NewText = %q, want %q", got, "!strings.Contains(s, sub)")
-	}
-	if fixes[0].Message != "negated message" {
-		t.Fatalf("negated Message = %q, want %q", fixes[0].Message, "negated message")
-	}
-
-	// overlapping comment suppresses fix
-	src := `package p
-func f() bool {
-	return strings.Count("a", "b" /* comment */) > 0
-}`
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("ParseFile failed: %v", err)
-	}
-	var binExpr *ast.BinaryExpr
-	ast.Inspect(file, func(n ast.Node) bool {
-		if be, ok := n.(*ast.BinaryExpr); ok {
-			binExpr = be
-			return false
-		}
-		return true
-	})
-	if binExpr == nil {
-		t.Fatal("expected BinaryExpr")
-	}
-	if !HasOverlappingComment([]*ast.File{file}, binExpr.Pos(), binExpr.End()) {
-		t.Fatal("expected HasOverlappingComment to be true for test expression")
-	}
-	fixesWithComment := BuildContainsFix([]*ast.File{file}, binExpr, "strings", "s", "sub", false, "test message")
-	if len(fixesWithComment) != 0 {
-		t.Fatalf("got %d fixes with overlapping comment, want 0", len(fixesWithComment))
 	}
 }
 

@@ -55,6 +55,7 @@ safe-outputs:
     custom-agent: "agent-id"   # default custom agent ID (optional)
     custom-instructions: "..."  # default custom instructions (optional)
     allowed: [copilot]         # restrict to specific agents (optional)
+    required-labels: [copilot-ready] # assign only while all labels are present (optional)
     max: 1                     # max assignments (default: 1)
     target: "triggering"       # "triggering" (default), "*", or number
     target-repo: "owner/repo"  # where the issue lives (cross-repository)
@@ -98,6 +99,10 @@ When an `allowed` list is configured, existing agent assignees not in the list a
 Both safe outputs require a fine-grained PAT. The default `GITHUB_TOKEN` lacks the necessary permissions.
 
 See the [official GitHub Copilot cloud agent API documentation](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api#using-the-issues-api) for full details on token requirements.
+
+`assign-to-agent` attempts assignment without a separate credential preflight. Only failed authentication or assignment attempts add credential diagnostics: the selected token source, PAT permissions, and an authentication remedy link. Diagnostics do not make additional API calls or retry assignment with a lower-priority credential, and remain visible in assignment error outputs even with `ignore-if-error: true`.
+
+If you see `Bad credentials`, replace or renew the selected user token and check its repository access and organization approval/SSO. The target checks and assignment API enforce repository permissions and Copilot availability; a green workflow conclusion alone does not prove that Copilot was assigned.
 
 ### Using a Personal Access Token (PAT)
 

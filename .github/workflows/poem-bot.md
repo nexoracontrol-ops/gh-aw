@@ -27,10 +27,10 @@ permissions:
   pull-requests: read
 
 # AI engine configuration
-model: openai/gpt-5.3-codex
+model: copilot/gpt-5.6-sol
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
 
 # Import shared reporting guidelines
 imports:
@@ -157,9 +157,6 @@ evals:
     question: Does the agent output confirm the poem is related to the requested theme or topic?
   - id: poem-present
     question: Does the agent output include actual poem text (lines of verse) rather than only a description?
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Poem Bot - A Creative Agentic Workflow

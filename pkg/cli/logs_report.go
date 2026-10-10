@@ -44,10 +44,40 @@ type LogsData struct {
 	StaleWarning        string                      `json:"stale_warning,omitempty" console:"-"`
 	GitHubAPIRateLimit  *GitHubAPIRateLimitReport   `json:"github_api_rate_limit,omitempty" console:"-"`
 	GitHubAPIRateLimits []*GitHubAPIRateLimitReport `json:"github_api_rate_limits,omitempty" console:"-"`
+	ModelRouting        *ModelRoutingLogsSummary    `json:"model_routing,omitempty" console:"title:Model Routing,omitempty"`
+}
+
+type ModelRoutingLogsSummary struct {
+	Routes                 []ModelRoutingRouteSummary `json:"routes,omitempty" console:"title:Model Routing Mix,omitempty"`
+	ClassifierAIC          float64                    `json:"classifier_aic,omitempty" console:"header:Classifier AIC"`
+	MainAgentCost          ModelRoutingCost           `json:"main_agent_cost,omitzero" console:"-"`
+	SubagentCosts          []ModelRoutingAgentCost    `json:"subagent_costs,omitempty" console:"-"`
+	TotalRequests          int                        `json:"total_requests,omitempty" console:"header:Routing Requests"`
+	DeviatedRequests       int                        `json:"deviated_requests,omitempty" console:"header:Deviated Requests"`
+	DeviatedTrafficShare   float64                    `json:"deviated_traffic_share,omitempty" console:"header:Deviated Traffic Share"`
+	EndpointOnlyNormalized bool                       `json:"endpoint_only_deviation_normalized,omitempty" console:"header:Legacy Endpoint Normalized"`
+}
+
+type ModelRoutingRouteSummary struct {
+	TaskType          string  `json:"task_type,omitempty" console:"header:Task"`
+	Scope             string  `json:"scope,omitempty" console:"header:Scope"`
+	Complexity        string  `json:"task_complexity,omitempty" console:"header:Complexity"`
+	Mode              string  `json:"mode,omitempty" console:"header:Mode"`
+	Model             string  `json:"model,omitempty" console:"header:Model"`
+	Effort            string  `json:"effort,omitempty" console:"header:Effort"`
+	RouterVersion     string  `json:"router_version,omitempty" console:"header:Router"`
+	Endpoint          string  `json:"endpoint,omitempty" console:"header:Endpoint"`
+	EffectiveEndpoint string  `json:"effective_endpoint,omitempty" console:"header:Effective Endpoint"`
+	SelectedEndpoint  string  `json:"selected_endpoint,omitempty" console:"header:Selected Endpoint"`
+	RunCount          int     `json:"run_count" console:"header:Runs"`
+	TotalAIC          float64 `json:"total_aic" console:"header:Total AIC"`
+	AverageAIC        float64 `json:"average_aic" console:"header:Average AIC"`
 }
 
 // ContinuationData provides parameters to continue an incomplete logs query.
 type ContinuationData struct {
+	DryRun                bool    `json:"dry_run,omitempty"`
+	NoDryRun              bool    `json:"no_dry_run,omitempty"`
 	Message               string  `json:"message"`
 	WorkflowName          string  `json:"workflow_name,omitempty"`
 	Count                 int     `json:"count,omitempty"`
@@ -141,6 +171,10 @@ type RunData struct {
 	Agent              string `json:"agent,omitempty" console:"header:Agent,omitempty"`
 	Engine             string `json:"engine,omitempty" console:"-"`
 	EngineID           string `json:"engine_id,omitempty" console:"-"`
+	Model              string `json:"model,omitempty" console:"header:Model,omitempty"`
+	RequestedModel     string `json:"requested_model,omitempty" console:"-"`
+	ModelEffort        string `json:"model_effort,omitempty" console:"header:Effort,omitempty"`
+	ModelRoutingStatus string `json:"model_routing_status,omitempty" console:"-"`
 	Status             string `json:"status" console:"header:Status"`
 	Conclusion         string `json:"conclusion,omitempty" console:"-"`
 	Classification     string `json:"classification" console:"-"`
@@ -159,7 +193,11 @@ type RunData struct {
 	AIC                        float64                `json:"aic"`
 	AmbientContext             *AmbientContextMetrics `json:"ambient_context,omitempty" console:"-"`
 	WorkingSet                 *WorkingSetMetrics     `json:"working_set,omitempty" console:"-"`
-	WSRF                       string                 `json:"-" console:"header:WSRF,omitempty"` // Working-Set Rebuild Factor, pre-formatted for table display
+	Ledger                     *LedgerActivity        `json:"ledger,omitempty" console:"-"`
+	WorkQueue                  *WorkQueueReport       `json:"work_queue,omitempty" console:"-"`
+	Friction                   *FrictionCostSummary   `json:"friction,omitempty" console:"-"`
+	WSRF                       string                 `json:"-" console:"header:WSRF,omitempty"`         // Working-Set Rebuild Factor, pre-formatted for table display
+	FrictionAIC                string                 `json:"-" console:"header:Friction AIC,omitempty"` // Precomputed friction cost in AI credits, pre-formatted for table display
 	Turns                      int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
 	ErrorCount                 int                    `json:"error_count,omitempty" console:"header:Errors"`
 	WarningCount               int                    `json:"warning_count,omitempty" console:"header:Warnings"`
@@ -197,6 +235,7 @@ type RunData struct {
 	AgenticAssessments         []AgenticAssessment    `json:"agentic_assessments,omitempty" console:"-"`
 	AwContext                  *AwContext             `json:"context,omitempty" console:"-"`                                                        // aw_context data from aw_info.json
 	TokenUsageSummary          *TokenUsageSummary     `json:"token_usage_summary,omitempty" console:"-"`                                            // Token usage from firewall proxy
+	ModelRouting               *ModelRoutingSummary   `json:"model_routing,omitempty" console:"-"`                                                  // AWF model routing and per-run cost attribution
 	GitHubAPICalls             int                    `json:"github_api_calls,omitempty" console:"header:GitHub API Calls,format:number,omitempty"` // GitHub API calls made during the run
 	AvgTimeBetweenTurns        string                 `json:"avg_time_between_turns,omitempty" console:"-"`                                         // Average time between consecutive LLM API calls (TBT)
 	Experiments                *ExperimentData        `json:"experiments,omitempty" console:"-"`                                                    // A/B experiment assignments for this run
@@ -398,8 +437,9 @@ type runEngineInfo struct {
 // aw_context, falling back to the processed run's context when unavailable.
 func extractRunEngineInfo(pr ProcessedRun) runEngineInfo {
 	var info runEngineInfo
-	awInfoPath := filepath.Join(pr.Run.LogsPath, "aw_info.json")
+	awInfoPath := findAwInfoPath(pr.Run.LogsPath)
 	if parsed, err := parseAwInfo(awInfoPath, false); err == nil && parsed != nil {
+		clearUntrustedAgentRoutingMetadata(pr.Run.LogsPath, awInfoPath, parsed)
 		info.awInfo = parsed
 		info.engineID = parsed.EngineID
 		info.engineName = parsed.EngineName
@@ -416,10 +456,11 @@ func extractRunEngineInfo(pr ProcessedRun) runEngineInfo {
 
 // applyAwInfoToRunData copies repository/ref metadata from aw_info.json onto the run data.
 func applyAwInfoToRunData(runData *RunData, awInfo *AwInfo) {
+	runData.ModelRouting = applyAwInfoModelRoutingInfo(runData.ModelRouting, awInfo)
 	if awInfo.Repository != "" {
 		runData.Repository = awInfo.Repository
-		if parts := strings.SplitN(awInfo.Repository, "/", 2); len(parts) == 2 {
-			runData.Organization = parts[0]
+		if organization, _, found := strings.Cut(awInfo.Repository, "/"); found {
+			runData.Organization = organization
 		}
 	}
 	if awInfo.Ref != "" {
@@ -468,8 +509,8 @@ func applyGitHubMetadataToRunData(runData *RunData, run WorkflowRun) {
 	if run.Attempt > 0 {
 		runData.RunAttempt = strconv.Itoa(run.Attempt)
 	}
-	if parts := strings.SplitN(run.Repository, "/", 2); len(parts) == 2 {
-		runData.Organization = parts[0]
+	if organization, _, found := strings.Cut(run.Repository, "/"); found {
+		runData.Organization = organization
 	}
 }
 
@@ -505,6 +546,8 @@ func buildRunData(pr ProcessedRun, processedRuns []ProcessedRun, localRepo strin
 	comparison := buildAuditComparisonForProcessedRuns(pr, processedRuns)
 
 	runData := newRunData(pr, engineInfo, chainMetrics, comparison, failureKind, gitHubAPICalls)
+	runData.ModelRouting = pr.ModelRouting
+	runData.Ledger = pr.Ledger
 	runData.awInfo = engineInfo.awInfo
 	if engineInfo.awInfo != nil {
 		applyAwInfoToRunData(&runData, engineInfo.awInfo)
@@ -537,11 +580,7 @@ func buildRunData(pr ProcessedRun, processedRuns []ProcessedRun, localRepo strin
 // newRunData assembles the base RunData fields for a processed run.
 func newRunData(pr ProcessedRun, engineInfo runEngineInfo, chainMetrics SafeOutputChainMetrics, comparison *AuditComparisonData, failureKind string, gitHubAPICalls int) RunData {
 	run := pr.Run
-	var ambientContext *AmbientContextMetrics
-	if pr.TokenUsage != nil {
-		ambientContext = pr.TokenUsage.AmbientContext
-	}
-
+	modelAttribution := resolveEffectiveModelAttribution(pr.Run.LogsPath, engineInfo.awInfo, pr.ModelRouting, pr.TokenUsage)
 	runData := RunData{
 		RunID:                      run.DatabaseID,
 		Number:                     run.Number,
@@ -556,9 +595,11 @@ func newRunData(pr ProcessedRun, engineInfo runEngineInfo, chainMetrics SafeOutp
 		FailureKind:                failureKind,
 		TokenUsage:                 run.TokenUsage,
 		AIC:                        0,
-		AmbientContext:             ambientContext,
+		AmbientContext:             runAmbientContext(pr),
 		WorkingSet:                 pr.WorkingSet,
 		WSRF:                       wsrfDisplayValue(pr.WorkingSet),
+		Friction:                   pr.Friction,
+		FrictionAIC:                frictionDisplayValue(pr.Friction),
 		ActionMinutes:              run.ActionMinutes,
 		Turns:                      run.Turns,
 		ErrorCount:                 run.ErrorCount,
@@ -593,9 +634,25 @@ func newRunData(pr ProcessedRun, engineInfo runEngineInfo, chainMetrics SafeOutp
 		Experiments:                extractExperimentData(run.LogsPath),
 		Graders:                    extractGradersData(run.LogsPath),
 		SafeOutputs:                pr.SafeOutputs,
+		WorkQueue:                  pr.WorkQueue,
 	}
+	applyModelAttributionToRunData(&runData, modelAttribution)
 	applyGitHubMetadataToRunData(&runData, run)
 	return runData
+}
+
+func applyModelAttributionToRunData(runData *RunData, attribution effectiveModelAttribution) {
+	runData.Model = attribution.Model
+	runData.RequestedModel = attribution.RequestedModel
+	runData.ModelEffort = attribution.Effort
+	runData.ModelRoutingStatus = attribution.RoutingStatus
+}
+
+func runAmbientContext(pr ProcessedRun) *AmbientContextMetrics {
+	if pr.TokenUsage == nil {
+		return nil
+	}
+	return pr.TokenUsage.AmbientContext
 }
 
 // buildLogsData creates structured logs data from processed runs
@@ -666,6 +723,7 @@ func buildLogsSections(processedRuns []ProcessedRun) LogsData {
 		FirewallLog: buildFirewallLogSummary(processedRuns),
 		// Build redacted domains summary
 		RedactedDomains: buildRedactedDomainsSummary(processedRuns),
+		ModelRouting:    buildModelRoutingLogsSummary(processedRuns),
 	}
 }
 
@@ -826,14 +884,24 @@ func renderLogsConsoleToWriter(w io.Writer, data LogsData) {
 	mcpFailures := data.MCPFailures
 	consoleData := data
 	consoleData.MCPFailures = nil
-	fmt.Fprint(w, console.RenderStruct(consoleData))
-	fmt.Fprint(w, console.RenderStruct(struct {
+	if _, err := fmt.Fprint(w, console.RenderStructStdout(consoleData)); err != nil {
+		console.PrintErrorMessage("Cannot render log diagnostics: " + err.Error())
+		return
+	}
+	if _, err := fmt.Fprint(w, console.RenderStructStdout(struct {
 		MCPFailures []mcpFailureSummaryDisplay `console:"title:⚠️  MCP Server Failures,omitempty"`
-	}{MCPFailures: mcpFailureSummaryDisplays(mcpFailures)}))
+	}{MCPFailures: mcpFailureSummaryDisplays(mcpFailures)})); err != nil {
+		console.PrintErrorMessage("Cannot render log diagnostics: " + err.Error())
+		return
+	}
+	if err := renderLogsWorkQueueToWriter(w, data.Runs); err != nil {
+		console.PrintErrorMessage("Cannot render work queue diagnostics: " + err.Error())
+		return
+	}
 
 	// Display concise summary at the end
 	fmt.Fprintln(os.Stderr, "") // Blank line for spacing
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Downloaded %d workflow logs to %s", data.Summary.TotalRuns, data.LogsLocation)))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Downloaded %d workflow logs to %s", data.Summary.TotalRuns, data.LogsLocation)))
 
 	// Show key metrics in a concise format
 	if data.Summary.TotalErrors > 0 || data.Summary.TotalWarnings > 0 {

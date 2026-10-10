@@ -57,7 +57,7 @@ describe("assign_to_agent", () => {
   // This mirrors the production flow without requiring any backward-compat changes in
   // assign_to_agent.cjs itself.
   const STANDALONE_RUNNER = `
-    const _config = {};
+    const _config = { target: "*" };
     if (process.env.GH_AW_AGENT_DEFAULT?.trim()) _config.name = process.env.GH_AW_AGENT_DEFAULT.trim();
     if (process.env.GH_AW_AGENT_MODEL?.trim()) _config.model = process.env.GH_AW_AGENT_MODEL.trim();
     if (process.env.GH_AW_AGENT_MAX_COUNT?.trim()) _config.max = process.env.GH_AW_AGENT_MAX_COUNT.trim();
@@ -108,6 +108,7 @@ describe("assign_to_agent", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSleep.mockClear();
+    vi.stubEnv("GH_AW_PROMPTS_DIR", path.join(process.cwd(), "../md"));
 
     // Reset REST mocks to default implementations (vi.clearAllMocks() cleared them)
     mockGithub.request.mockResolvedValue({ data: { id: "task-123" } });
@@ -157,6 +158,167 @@ describe("assign_to_agent", () => {
       fs.unlinkSync(tempFilePath);
     }
     sleepSpy?.mockRestore();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  describe("failure-only credential diagnostics", () => {
+    it("renders the credential remedy from its markdown template", async () => {
+      const diagnostic = await eval(`(async () => {
+        ${assignToAgentScript};
+        return describeAssignmentCredentialFailure({}, "Bad credentials");
+      })()`);
+      const template = fs.readFileSync(path.join(process.cwd(), "../md/copilot_assignment_credential_remedy.md"), "utf8").trim();
+      expect(diagnostic.endsWith(template)).toBe(true);
+      expect(mockGithub.request).not.toHaveBeenCalled();
+    });
+
+    it("preserves explicit token, dedicated token, and step client precedence", async () => {
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "github_pat_dedicated");
+      const getOctokit = vi.fn().mockReturnValue(mockGithub);
+      vi.stubGlobal("getOctokit", getOctokit);
+      await eval(`(async () => {
+        ${assignToAgentScript};
+        await createAssignToAgentGitHubClient({ "github-token": "github_pat_explicit" });
+        await createAssignToAgentGitHubClient({});
+      })()`);
+      expect(getOctokit.mock.calls).toEqual([["github_pat_explicit"], ["github_pat_dedicated"]]);
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "");
+      const client = await eval(`(async () => {
+        ${assignToAgentScript};
+        return createAssignToAgentGitHubClient({});
+      })()`);
+      expect(client).toBe(mockGithub);
+      expect(getOctokit).toHaveBeenCalledTimes(2);
+    });
+
+    it("identifies installation tokens only in failure diagnostics without token disclosure", async () => {
+      const token = "ghs_test_installation_secret";
+      const diagnostic = await eval(`(async () => {
+        ${assignToAgentScript};
+        return describeAssignmentCredentialFailure({ "github-token": token }, "Bad credentials");
+      })()`);
+      expect(diagnostic).toMatch(/configured assign-to-agent credential.*GitHub App installation token.*GH_AW_AGENT_TOKEN/);
+      expect(diagnostic).not.toContain(token);
+      expect(mockGithub.request).not.toHaveBeenCalled();
+      expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+    });
+
+    it("reports the step-token fallback remedy when no dedicated assignment token is available", async () => {
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "");
+      mockGithub.request.mockRejectedValue(Object.assign(new Error("Resource not accessible by integration"), { status: 403 }));
+      const handler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*" });
+      })()`);
+      const result = await handler({ type: "assign_to_agent", issue_number: 42 }, {}, new Map());
+      expect(result.error).toContain("credential source: the step-level GitHub token");
+      expect(result.error).toContain("Configure GH_AW_AGENT_TOKEN or assign-to-agent.github-token");
+      expect(result.error).toContain("GITHUB_TOKEN");
+      expect(mockGithub.request).toHaveBeenCalledExactlyOnceWith("GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}", expect.anything());
+    });
+
+    it("keeps each successful assignment one shot with no diagnostic requests", async () => {
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "ghu_test_user_token");
+      vi.stubGlobal("getOctokit", vi.fn().mockReturnValue(mockGithub));
+      mockGithub.rest.issues.get.mockImplementation(({ issue_number }) => Promise.resolve({ data: { id: 12345, number: issue_number, assignees: [] } }));
+      const handler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*", max: 2 });
+      })()`);
+      for (const issue_number of [42, 43]) {
+        await expect(handler({ type: "assign_to_agent", issue_number }, {}, new Map())).resolves.toMatchObject({ success: true });
+      }
+      expect(mockGithub.request.mock.calls.map(([route]) => route)).toEqual([
+        "GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}",
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees",
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees",
+      ]);
+      expect(mockGithub.request.mock.calls.filter(([route]) => route === "POST /repos/{owner}/{repo}/issues/{issue_number}/assignees")).toHaveLength(2);
+      expect(handler.getAssignToAgentAssigned()).toBe("issue:42:copilot\nissue:43:copilot");
+    });
+
+    it("adds actionable diagnostics only after failed attempts, including ignored 401 errors", async () => {
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "github_pat_test_expired");
+      vi.stubGlobal("getOctokit", vi.fn().mockReturnValue(mockGithub));
+      mockGithub.request.mockRejectedValue(Object.assign(new Error("Unauthorized"), { status: 401 }));
+      const handler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*", max: 2, "ignore-if-error": true });
+      })()`);
+      for (const issue_number of [42, 43]) {
+        await expect(handler({ type: "assign_to_agent", issue_number }, {}, new Map())).resolves.toMatchObject({ success: true, skipped: true });
+      }
+      const errors = handler.getAssignToAgentErrors();
+      expect(errors).toContain("issue:42:copilot:Bad credentials (HTTP 401)");
+      expect(errors).toContain("issue:43:copilot:Bad credentials (HTTP 401)");
+      expect(errors).toContain("GH_AW_ASSIGN_TO_AGENT_TOKEN (GH_AW_AGENT_TOKEN, GH_AW_GITHUB_TOKEN, or GITHUB_TOKEN)");
+      expect(errors).toContain("Bad credentials (HTTP 401)");
+      expect(errors).toContain("metadata: read");
+      expect(errors).toContain("organization approval/SSO");
+      expect(errors).toContain("https://github.github.com/gh-aw/reference/copilot-cloud-agent/#authentication");
+      expect(errors).not.toContain("github_pat_test_expired");
+      expect(handler.getAssignToAgentErrorCount()).toBe(0);
+      expect(handler.getAssignToAgentAssigned()).toBe("");
+      expect(mockGithub.request.mock.calls.map(([route]) => route)).toEqual(["GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}", "GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}"]);
+      expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+    });
+
+    it.each([403, 429, 500])("does not misclassify a non-authentication HTTP %i assignment failure", async status => {
+      const message = status === 403 ? "API rate limit exceeded" : "Request failed";
+      mockGithub.request.mockImplementation(route => {
+        if (route.startsWith("POST ")) return Promise.reject(Object.assign(new Error(message), { status }));
+        return Promise.resolve({});
+      });
+      mockGithub.rest.issues.get.mockResolvedValue({ data: { number: 42, id: 12345, assignees: [] } });
+      const handler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*", "ignore-if-error": true });
+      })()`);
+      const result = await handler({ type: "assign_to_agent", issue_number: 42 }, {}, new Map());
+      expect(result).toMatchObject({ success: false, error: expect.stringContaining("Failed to assign copilot via REST") });
+      expect(result.error).not.toContain("Bad credentials");
+      expect(handler.getAssignToAgentErrorCount()).toBe(1);
+      expect(mockGithub.request).toHaveBeenCalledTimes(2);
+      expect(mockGithub.request.mock.calls.some(([route]) => route === "GET /user")).toBe(false);
+    });
+
+    it("does not authenticate staged assignments", async () => {
+      const stagedHandler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*", staged: true });
+      })()`);
+      await stagedHandler({ type: "assign_to_agent", issue_number: 42 }, {}, new Map());
+      expect(mockGithub.request).not.toHaveBeenCalled();
+    });
+
+    it("does not diagnose filtered assignments", async () => {
+      const filteredHandler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*", required_labels: ["copilot-ready"] });
+      })()`);
+      mockGithub.rest.issues.get.mockResolvedValue({ data: { number: 42, id: 12345, assignees: [], labels: [] } });
+      await expect(filteredHandler({ type: "assign_to_agent", issue_number: 42 }, {}, new Map())).resolves.toMatchObject({ skipped: true });
+      expect(mockGithub.request).toHaveBeenCalledExactlyOnceWith("GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}", expect.anything());
+      expect(filteredHandler.getAssignToAgentErrors()).toBe("");
+    });
+
+    it("attempts assignment with the selected credential before adding diagnostics", async () => {
+      vi.stubEnv("GH_AW_ASSIGN_TO_AGENT_TOKEN", "ghs_test_installation_token");
+      vi.stubGlobal("getOctokit", vi.fn().mockReturnValue(mockGithub));
+      const handler = await eval(`(async () => {
+        ${assignToAgentScript};
+        return main({ target: "*" });
+      })()`);
+      mockGithub.request.mockRejectedValue(Object.assign(new Error("Bad credentials"), { status: 401 }));
+
+      const result = await handler({ type: "assign_to_agent", issue_number: 42 }, {}, new Map());
+
+      expect(result.error).toContain("GitHub App installation token");
+      expect(mockGithub.request).toHaveBeenCalledExactlyOnceWith("GET /repos/{owner}/{repo}/issues/{issue_number}/assignees/{assignee}", expect.anything());
+      expect(mockGithub.rest.issues.get).not.toHaveBeenCalled();
+      expect(mockGithub.rest.issues.createComment).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("should handle empty agent output", async () => {
@@ -249,6 +411,42 @@ describe("assign_to_agent", () => {
         }),
       })
     );
+  });
+
+  it("should skip assignment when the target lacks a required label", async () => {
+    const handler = await eval(`(async () => {
+      ${assignToAgentScript};
+      return main({ target: "*", required_labels: ["copilot-ready", "maintainer-approved"] });
+    })()`);
+    mockGithub.rest.issues.get
+      .mockResolvedValueOnce({
+        data: { id: 12345, number: 42, assignees: [], labels: [{ name: "copilot-ready" }, { name: "maintainer-approved" }], html_url: "", title: "", body: "" },
+      })
+      .mockResolvedValueOnce({
+        data: { id: 12345, number: 42, assignees: [], labels: [{ name: "copilot-ready" }], html_url: "", title: "", body: "" },
+      });
+
+    const result = await handler({ type: "assign_to_agent", issue_number: 42, agent: "copilot" }, {}, new Map());
+
+    expect(result).toMatchObject({ success: false, skipped: true, error: "Item does not match required-labels filter" });
+    expect(mockGithub.request).not.toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/assignees", expect.anything());
+    expect(mockGithub.rest.issues.get).toHaveBeenCalledTimes(2);
+    expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("does not match required-labels filter"));
+  });
+
+  it("should assign when the target has every required label", async () => {
+    const handler = await eval(`(async () => {
+      ${assignToAgentScript};
+      return main({ target: "*", required_labels: ["copilot-ready", "maintainer-approved"] });
+    })()`);
+    mockGithub.rest.issues.get.mockResolvedValue({
+      data: { id: 12345, number: 42, assignees: [], labels: [{ name: "copilot-ready" }, { name: "maintainer-approved" }], html_url: "", title: "", body: "" },
+    });
+
+    const result = await handler({ type: "assign_to_agent", issue_number: 42, agent: "copilot" }, {}, new Map());
+
+    expect(result).toMatchObject({ success: true });
+    expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/assignees", expect.anything());
   });
 
   it("should respect max count configuration", async () => {
@@ -360,7 +558,7 @@ describe("assign_to_agent", () => {
     // Call main() factory then invoke the handler directly so we can inspect the deferred result
     const deferred = await eval(`(async () => {
       ${assignToAgentScript};
-      const _handler = await main({});
+      const _handler = await main({ target: "*" });
       const { loadTemporaryIdMap } = require("./temporary_id.cjs");
       const _map = loadTemporaryIdMap();
       return _handler({ type: "assign_to_agent", issue_number: "#aw_abc123", agent: "copilot" }, {}, _map);
@@ -893,7 +1091,46 @@ describe("assign_to_agent", () => {
     expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to assign 1 agent(s)"));
   });
 
+  it("should ignore model-provided issue_number/pull_number conflict when target is not '*'", async () => {
+    process.env.GH_AW_AGENT_TARGET = "triggering";
+    mockContext.eventName = "issues";
+    mockContext.payload = {
+      issue: { number: 123 },
+    };
+    mockContext.repo = {
+      owner: "test-owner",
+      repo: "test-repo",
+    };
+
+    setAgentOutput({
+      items: [
+        {
+          type: "assign_to_agent",
+          issue_number: 42,
+          pull_number: 99,
+          agent: "copilot",
+        },
+      ],
+      errors: [],
+    });
+
+    mockGithub.rest.issues.checkUserCanBeAssigned.mockResolvedValueOnce({});
+    mockGithub.rest.users.getByUsername.mockResolvedValueOnce({ data: { id: 99999 } });
+    mockGithub.rest.issues.get.mockResolvedValueOnce({
+      data: { id: 12345, number: 123, assignees: [], html_url: "", title: "", body: "" },
+    });
+    mockGithub.request.mockResolvedValueOnce({ data: { id: "task-123" } });
+
+    await eval(`(async () => { ${assignToAgentScript}; ${STANDALONE_RUNNER} })()`);
+
+    // The mutual-exclusivity check should be skipped since target isn't "*", so the
+    // triggering issue #123 should be used instead of the ignored issue_number/pull_number.
+    expect(mockCore.error).not.toHaveBeenCalledWith("Cannot specify both issue_number and pull_number in the same assign_to_agent item");
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+  });
+
   it("should auto-resolve issue number from context when not provided (triggering target)", async () => {
+    process.env.GH_AW_AGENT_TARGET = "triggering";
     // Set up context to simulate an issue event
     mockContext.eventName = "issues";
     mockContext.payload = {
@@ -935,6 +1172,7 @@ describe("assign_to_agent", () => {
   });
 
   it("should skip when context doesn't match triggering target", async () => {
+    process.env.GH_AW_AGENT_TARGET = "triggering";
     // Set up context that doesn't support triggering target (e.g., push event)
     mockContext.eventName = "push";
 
@@ -1413,7 +1651,7 @@ describe("assign_to_agent", () => {
 
     const result = await eval(`(async () => {
       ${assignToAgentScript};
-      const _handler = await main({ max: "1", name: "copilot" });
+      const _handler = await main({ max: "1", name: "copilot", target: "*" });
       const _invalid = await _handler({ type: "assign_to_agent", issue_number: 1, pull_number: 2, agent: "copilot" }, {}, new Map());
       const _valid = await _handler({ type: "assign_to_agent", issue_number: 3, agent: "copilot" }, {}, new Map());
       return {
@@ -1446,7 +1684,7 @@ describe("assign_to_agent", () => {
 
     const result = await eval(`(async () => {
       ${assignToAgentScript};
-      const _handler = await main({ max: "2", name: "copilot" });
+      const _handler = await main({ max: "2", name: "copilot", target: "*" });
       await _handler({ type: "assign_to_agent", issue_number: 1, agent: "copilot" }, {}, new Map());
       return {
         second: _handler({ type: "assign_to_agent", issue_number: 2, agent: "copilot" }, {}, new Map()),
@@ -1472,8 +1710,8 @@ describe("assign_to_agent", () => {
 
     const result = await eval(`(async () => {
       ${assignToAgentScript};
-      const _handlerA = await main({ max: "5", name: "copilot" });
-      const _handlerB = await main({ max: "5", name: "copilot" });
+      const _handlerA = await main({ max: "5", name: "copilot", target: "*" });
+      const _handlerB = await main({ max: "5", name: "copilot", target: "*" });
       await _handlerA({ type: "assign_to_agent", issue_number: 11, agent: "copilot" }, {}, new Map());
       return {
         assignedA: getAssignToAgentAssigned(_handlerA),

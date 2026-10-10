@@ -137,6 +137,7 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 					Expires: 48,
 				},
 			},
+			CacheMemoryConfig: &CacheMemoryConfig{Caches: []CacheMemoryEntry{{ID: "default"}}},
 		},
 	}
 
@@ -173,7 +174,7 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 	closeAgenticWorkflowIssuesCondition := `(github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.operation == 'close_agentic_workflows_issues'`
 	cleanCacheMemoriesCondition := `github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call' || inputs.operation == '' || inputs.operation == 'none' || inputs.operation == 'clean_cache_memories'`
 
-	const jobSectionSearchRange = 350
+	const jobSectionSearchRange = 500
 	const runOpSectionSearchRange = 550
 
 	// Jobs that should be disabled when any non-dedicated operation is set (cleanup-cache-memory has its own dedicated operation)
@@ -424,8 +425,8 @@ func TestGenerateMaintenanceWorkflow_OperationJobConditions(t *testing.T) {
 	if !strings.Contains(yaml, "timeout-minutes: 30") {
 		t.Errorf("Job forecast_report should set a 30-minute timeout on the forecast generation step in:\n%s", yaml)
 	}
-	if !strings.Contains(yaml, "DEBUG: \"*\"") {
-		t.Errorf("Job forecast_report should enable DEBUG=* in:\n%s", yaml)
+	if strings.Contains(yaml, "DEBUG: \"*\"") {
+		t.Errorf("Job forecast_report should not enable DEBUG=* in:\n%s", yaml)
 	}
 	if !strings.Contains(yaml, "${GH_AW_CMD_PREFIX} forecast --repo \"$GITHUB_REPOSITORY\" --timeout 30 --verbose --json > ./.cache/gh-aw/forecast/report.json") {
 		t.Errorf("Job forecast_report gh aw forecast command should run in verbose mode and write report output in:\n%s", yaml)

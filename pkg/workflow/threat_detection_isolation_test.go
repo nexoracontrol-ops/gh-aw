@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +16,122 @@ import (
 
 	"github.com/github/gh-aw/pkg/testutil"
 )
+
+func TestThreatDetectionSplitEngineProviderIsolation(t *testing.T) {
+	for _, mainEngine := range []string{"claude", "codex"} {
+		for _, externalDetector := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/external=%t", mainEngine, externalDetector), func(t *testing.T) {
+				baseURL, apiKey := "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"
+				if mainEngine == "codex" {
+					baseURL, apiKey = "OPENAI_BASE_URL", "OPENAI_API_KEY"
+				}
+				tmpDir := testutil.TempDir(t, "split-engine-provider-*")
+				workflowPath := filepath.Join(tmpDir, "split-engine.md")
+				content := fmt.Sprintf(`---
+on: push
+engine:
+  id: %s
+  env:
+    %s: https://openrouter.ai/api
+    %s: ${{ secrets.OPENROUTER_API_KEY }}
+network:
+  allowed: [defaults, openrouter.ai]
+safe-outputs:
+  create-issue:
+  threat-detection:
+    engine:
+      id: copilot
+      model: sonnet
+features:
+  gh-aw-detection: %t
+---
+Review documentation.
+`, mainEngine, baseURL, apiKey, externalDetector)
+				if err := os.WriteFile(workflowPath, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+					t.Fatal(err)
+				}
+				result, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+				if err != nil {
+					t.Fatal(err)
+				}
+				compiled := string(result)
+				agent := extractJobSection(compiled, "agent")
+				if !strings.Contains(agent, "openrouter.ai") || !strings.Contains(agent, "secrets.OPENROUTER_API_KEY") {
+					t.Fatal("main agent provider settings must remain intact")
+				}
+				detection := extractJobSection(compiled, "detection")
+				if detection == "" {
+					t.Fatal("detection job missing")
+				}
+				for _, forbidden := range []string{baseURL, apiKey, "openrouter.ai", "secrets.OPENROUTER_API_KEY"} {
+					if strings.Contains(detection, forbidden) {
+						t.Errorf("main provider setting %q leaked into compiled detection job", forbidden)
+					}
+				}
+				conclusion := extractJobSection(compiled, "conclusion")
+				if !strings.Contains(conclusion, "::warning::Threat detection produced no security verdict.") {
+					t.Fatal("conclusion must visibly warn about a missing verdict")
+				}
+			})
+		}
+	}
+}
+
+func TestCompiledOTLPEnvExcludedFromAgentDetectionAndEvals(t *testing.T) {
+	for _, external := range []bool{false, true} {
+		t.Run(fmt.Sprintf("external=%t", external), func(t *testing.T) {
+			workflowPath := filepath.Join(t.TempDir(), "otlp-detection.md")
+			content := fmt.Sprintf(`---
+on: push
+engine: copilot
+observability:
+  otlp:
+    endpoint:
+      - url: https://primary.example.com:4317
+        headers: ${{ secrets.OTLP_HEADERS }}
+      - url: https://secondary.example.com:4317
+safe-outputs:
+  create-issue:
+  threat-detection: true
+evals:
+  - id: completed
+    question: Did the workflow complete?
+features:
+  gh-aw-detection: %t
+---
+Test workflow
+`, external)
+			if err := os.WriteFile(workflowPath, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+				t.Fatal(err)
+			}
+			result, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			compiled := string(result)
+			for _, name := range otlpSandboxExcludedEnvVarNames {
+				if !strings.Contains(compiled, name+":") {
+					t.Errorf("host-side OTLP environment must retain %s", name)
+				}
+				for _, job := range []string{"agent", "detection", "evals"} {
+					section := extractJobSection(compiled, job)
+					if section == "" {
+						t.Fatalf("%s job missing", job)
+					}
+					if !strings.Contains(section, "--exclude-env "+name) {
+						t.Errorf("%s AWF command must exclude %s", job, name)
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestThreatDetectionIsolation(t *testing.T) {
 	compiler := NewCompiler()
@@ -271,6 +388,12 @@ Test workflow`
 	installStepBlock := extractInstallThreatDetectStepBlock(t, detectionSection)
 	if !strings.Contains(installStepBlock, "continue-on-error: true") {
 		t.Error("Install threat-detect binary step must set continue-on-error: true in warn mode")
+	}
+	if !strings.Contains(detectionSection, "steps.threat_detect_install.outcome == 'success'") {
+		t.Error("External detector execution must require a successful verified installation")
+	}
+	if !strings.Contains(detectionSection, "THREAT_DETECT_INSTALL_OUTCOME: ${{ steps.threat_detect_install.outcome }}") {
+		t.Error("External detector conclude step must receive the install outcome so it can fail closed without invoking a detector")
 	}
 	if !strings.Contains(detectionSection, "install_copilot_cli.sh") {
 		t.Error("External detector path must emit engine installation step for copilot")
@@ -675,6 +798,10 @@ permissions:
   copilot-requests: write
 safe-outputs:
   create-issue:
+  threat-detection:
+    engine:
+      id: codex
+      model-provider: github
 features:
   gh-aw-detection: true
 tools:
@@ -753,6 +880,7 @@ func TestExternalDetectorCodexConfigUsesOpenAIProxyPort(t *testing.T) {
 	tests := []struct {
 		name       string
 		engineYAML string
+		wantError  string
 	}{
 		{
 			name:       "default provider",
@@ -761,6 +889,7 @@ func TestExternalDetectorCodexConfigUsesOpenAIProxyPort(t *testing.T) {
 		{
 			name:       "anthropic provider override",
 			engineYAML: "engine:\n  id: codex\n  model-provider: anthropic\n",
+			wantError:  "Responses-compatible",
 		},
 	}
 
@@ -786,7 +915,12 @@ Test workflow`
 			if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
 				t.Fatalf("Failed to write workflow file: %v", err)
 			}
-			if err := compiler.CompileWorkflow(workflowPath); err != nil {
+			if err := compiler.CompileWorkflow(workflowPath); tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("Expected unsupported provider error containing %q, got %v", tt.wantError, err)
+				}
+				return
+			} else if err != nil {
 				t.Fatalf("Failed to compile workflow: %v", err)
 			}
 

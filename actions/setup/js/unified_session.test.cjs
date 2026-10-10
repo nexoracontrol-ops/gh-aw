@@ -1,0 +1,1104 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { collectUnifiedSession, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, sessionTimestamp, writeUnifiedSession } from "./unified_session.cjs";
+import { serializeSessionArtifact, writeSessionArtifact } from "./session_artifact.cjs";
+import { normalizeUnifiedSessionEvent } from "./unified_session_payload.cjs";
+
+const req = require;
+const { writeDetectionUsageResult } = req("./generate_usage_activity_summary.cjs");
+const { parseCustomLog } = req("./parse_custom_log.cjs");
+const { success: piSuccess } = req("./fixtures/pi_ci_stream.cjs");
+const claudeFixtures = req("./fixtures/claude_ci_sessions.cjs");
+const { dynamicWorkflow } = req("./fixtures/claude_dynamic_workflow.cjs");
+const codexNoTools = fs.readFileSync(new URL("./test_data/codex_ci_no_tools.jsonl", import.meta.url), "utf8");
+
+describe("Unified conclusion session", () => {
+  let root;
+  let originalEnv;
+  let originalCore;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-unified-session-"));
+    originalEnv = { ...process.env };
+    originalCore = global.core;
+    global.core = { info: vi.fn(), warning: vi.fn() };
+  });
+  afterEach(() => {
+    process.env = originalEnv;
+    global.core = originalCore;
+    vi.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function write(file, entries) {
+    const target = path.join(root, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, typeof entries === "string" ? entries : file.endsWith(".json") ? JSON.stringify(entries) : entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    return target;
+  }
+
+  it.each([
+    { engine: "copilot", metadata: undefined, restricted: false },
+    { engine: "custom", metadata: undefined, restricted: false },
+    { engine: undefined, metadata: undefined, restricted: false },
+    { engine: "aider", metadata: undefined, restricted: true },
+    { engine: undefined, metadata: "aider", restricted: true },
+    { engine: undefined, metadata: "copilot", restricted: false },
+    { engine: "copilot", metadata: "aider", restricted: false },
+  ])("selects raw Aider diagnostic policy only from trusted caller or runner context: %j", ({ engine, metadata, restricted }) => {
+    const nativeError = { type: "session.error", data: { sourceEngine: "aider", code: 400, errorType: "NativeError", message: "genuine provider failure" } };
+    write("agent-session.jsonl", [{ type: "assistant.message", data: { sourceEngine: "aider", content: "observed answer" } }, nativeError]);
+    write("agent-stdio.log", JSON.stringify({ type: "session.error", data: { sourceEngine: "copilot", code: 429, errorType: "ProviderError", message: "CAPIError: 429 Too Many Requests" } }));
+    write("agent_execution_exit_code.txt", "0\n");
+    if (metadata !== undefined) write("aw_info.json", { engine_id: metadata });
+    const events = collectUnifiedSession({ rootDir: root, engine, warn() {} }).events;
+    const execution = events.find(event => event.type === "agent.execution");
+    expect(execution.data).toEqual({
+      categories: restricted ? [] : ["capi_quota_exceeded_error"],
+      errorCodes: restricted ? [400] : [400, 429],
+      errorTypes: restricted ? ["NativeError"] : ["NativeError", "ProviderError"],
+      exitCode: 0,
+    });
+    expect(events.find(event => event.type === "assistant.message").data.content).toBe("observed answer");
+    expect(events.find(event => event.type === "session.error").data).toEqual(normalizeUnifiedSessionEvent(nativeError).data);
+  });
+
+  it("persists Claude workflow launch and lifecycle projections without scripts, prompts, or duplicate parent usage", () => {
+    write("agent-stdio.log", dynamicWorkflow.map(JSON.stringify).join("\n"));
+    const events = writeUnifiedSession({ rootDir: root, engine: "claude" });
+    const launch = events.find(event => event.type === "tool.execution_complete");
+    expect(launch.data).toMatchObject({
+      toolName: "Workflow",
+      toolCallId: "workflow-tool",
+      success: true,
+      status: "async_launched",
+      taskId: "dynamic-task",
+      taskType: "local_workflow",
+      workflowName: "smoke-claude-dynamic",
+      workflowRunId: "dynamic-run",
+    });
+    const started = events.find(event => event.type === "dynamicWorkflows.task_started");
+    expect(started.data).toMatchObject({ taskId: "dynamic-task", toolCallId: "workflow-tool", taskType: "local_workflow", workflowName: "smoke-claude-dynamic", sessionId: "dynamic-session" });
+    const progress = events.filter(event => event.type === "dynamicWorkflows.task_progress");
+    expect(progress[0].data.usage).toEqual({ totalTokens: 0, toolUses: 0, durationMs: 0 });
+    expect(progress[1].data.workflowProgress[1]).toMatchObject({ agentId: "dynamic-agent", phaseIndex: 1, model: "claude-sonnet-4-6", state: "done" });
+    expect(events.find(event => event.type === "dynamicWorkflows.task_updated").data).toMatchObject({ taskId: "dynamic-task", status: "completed" });
+    expect(events.find(event => event.type === "dynamicWorkflows.task_notification").data).toMatchObject({
+      taskId: "dynamic-task",
+      toolCallId: "workflow-tool",
+      status: "completed",
+      usage: { totalTokens: 250, toolUses: 2, durationMs: 5000 },
+    });
+    expect(events.some(event => event.type.startsWith("claude.task_") || event.type === "claude.background_tasks_changed")).toBe(false);
+    expect(events.find(event => event.type === "session.result").data.usage).toEqual({ inputTokens: 7, outputTokens: 11, inputTokensIncludeCache: false });
+    const persisted = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    expect(persisted).not.toContain("PRIVATE_");
+    for (const event of events.filter(event => event.type !== "session.collection")) {
+      expect(normalizeUnifiedSessionEvent(normalizeUnifiedSessionEvent(event))).toEqual(normalizeUnifiedSessionEvent(event));
+    }
+  });
+
+  it.each([0, 2])("preserves explicit mixed native execution exit %i without a runtime exit artifact", exitCode => {
+    const execution = { type: "agent.execution", data: { categories: [], errorCodes: [], errorTypes: [], exitCode } };
+    const entries = [{ type: "assistant", message: { content: "observed answer" } }, execution];
+    expect(parseEngineSession(entries.map(JSON.stringify).join("\n"), "cursor").filter(event => event.type === "agent.execution")).toEqual([execution]);
+    write("agent-session.jsonl", entries);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "cursor" });
+    expect(events.filter(event => event.type === "agent.execution").map(event => event.data)).toEqual([execution.data]);
+    expect(events.filter(event => event.type === "assistant.message").map(event => event.data.content)).toEqual(["observed answer"]);
+  });
+
+  it("uses the last observed native execution exit when no runtime exit artifact exists", () => {
+    const observations = [2, 0].map(exitCode => ({ type: "agent.execution", data: { categories: [], errorCodes: [], errorTypes: [], exitCode } }));
+    const entries = [{ type: "assistant", message: { content: "observed answer" } }, ...observations];
+    expect(parseEngineSession(entries.map(JSON.stringify).join("\n"), "cursor").filter(event => event.type === "agent.execution")).toEqual(observations);
+    write("agent-session.jsonl", entries);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "cursor" });
+    expect(events.filter(event => event.type === "agent.execution").map(event => event.data)).toEqual([observations[1].data]);
+  });
+
+  it("includes both activation prompts verbatim with distinct provenance when present", () => {
+    const system = "System instructions\n";
+    const user = "User request\n";
+    write("aw-prompts/system.txt", system);
+    write("aw-prompts/user.txt", user);
+    const events = writeUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.provenance.component === "prompt")).toEqual([
+      { type: "prompt.system", data: { content: system }, provenance: { component: "prompt", phase: "activation", path: "aw-prompts/system.txt", index: 0 } },
+      { type: "prompt.user", data: { content: user }, provenance: { component: "prompt", phase: "activation", path: "aw-prompts/user.txt", index: 0 } },
+    ]);
+    expect(fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8")).toContain(
+      JSON.stringify({ type: "prompt.user", data: { content: user }, provenance: { component: "prompt", phase: "activation", path: "aw-prompts/user.txt", index: 0 } })
+    );
+    expect(events.at(-1).data.absentComponents).toContain("agent");
+  });
+
+  it("does not follow a symlinked prompt or invent missing prompt content", () => {
+    write("aw-prompts/user.txt", "");
+    fs.symlinkSync(write("private.txt", "not a prompt"), path.join(root, "aw-prompts/system.txt"));
+    const warnings = [];
+    const { events } = collectUnifiedSession({ rootDir: root, warn: warning => warnings.push(warning) });
+    expect(events.filter(event => event.provenance.component === "prompt")).toMatchObject([{ type: "prompt.user", data: { content: "" } }]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("aw-prompts/system.txt");
+  });
+
+  it("records the daily AIC activation decision once, including zero accounting values", () => {
+    const dailyAIC = {
+      GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS: "exceeded",
+      GH_AW_DAILY_AI_CREDITS_EXCEEDED: "true",
+      GH_AW_DAILY_AI_CREDITS_TOTAL: "0",
+      GH_AW_DAILY_AI_CREDITS_ESTIMATED: "0",
+      GH_AW_DAILY_AI_CREDITS_THRESHOLD: "0",
+    };
+    const events = writeUnifiedSession({ rootDir: root, dailyAIC });
+    expect(events.filter(event => event.type === "guardrail.daily_aic")).toEqual([
+      {
+        type: "guardrail.daily_aic",
+        data: { status: "exceeded", exceeded: true, total: 0, estimated: 0, threshold: 0 },
+        provenance: { component: "guardrail", phase: "activation", path: "usage/aw_session.jsonl", index: 0 },
+      },
+    ]);
+    expect(fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8")).toContain('"type":"guardrail.daily_aic"');
+    expect(writeUnifiedSession({ rootDir: root, dailyAIC })).toEqual(events);
+  });
+
+  it("omits an absent decision and does not duplicate existing guardrail evidence", () => {
+    expect(collectUnifiedSession({ rootDir: root, dailyAIC: {} }).events.some(event => event.type === "guardrail.daily_aic")).toBe(false);
+    const existing = { type: "guardrail.daily_aic", data: { status: "skipped", exceeded: false } };
+    write("agent-session.jsonl", [existing]);
+    const events = collectUnifiedSession({ rootDir: root, dailyAIC: { GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS: "under_budget" } }).events;
+    expect(events.filter(event => event.type === "guardrail.daily_aic")).toMatchObject([{ data: existing.data }]);
+    expect(events.filter(event => event.type === "guardrail.daily_aic")).toHaveLength(1);
+  });
+
+  it("emits one execution entry across canonical, stdio, persisted detector, and exit-code evidence", () => {
+    const execution = { type: "agent.execution", data: { categories: ["agentic_engine_timeout"], errorCodes: [502], errorTypes: ["server_error"], exitCode: 1 } };
+    write("agent-session.jsonl", [...require("./claude_session.cjs").normalizeClaudeSession(claudeFixtures.failure), execution]);
+    write("agent-errors.jsonl", [execution]);
+    write("agent-stdio.log", claudeFixtures.failure.map(JSON.stringify).join("\n") + "\n[claude-harness] done: exitCode=1\n");
+    write("agent_execution_exit_code.txt", "0\n");
+    const events = writeUnifiedSession({ rootDir: root, engine: "claude" });
+    const executions = events.filter(event => event.type === "agent.execution");
+    expect(executions).toHaveLength(1);
+    expect(executions[0]).toMatchObject({
+      data: { categories: ["agentic_engine_timeout"], errorCodes: [502], errorTypes: ["UnknownError", "api_error", "server_error"], exitCode: 0 },
+      provenance: { component: "execution", phase: "agent", path: "agent-errors.jsonl" },
+    });
+    expect(executions[0]).not.toHaveProperty("timestamp");
+    expect(events.filter(event => event.type === "claude.assistant_error")).toHaveLength(0);
+    expect(events.filter(event => event.type === "session.result" && event.data.errors?.some(error => error?.error === "server_error"))).toHaveLength(1);
+    expect(writeUnifiedSession({ rootDir: root, engine: "claude" })).toEqual(events);
+  });
+
+  it("uses an execution snapshot exit code when the raw exit-code file is absent", () => {
+    write("usage/agent/execution.json", { exit_code: 0, outcome: "success" });
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.type === "agent.execution")).toMatchObject([{ data: { categories: [], errorCodes: [], errorTypes: [], exitCode: 0 }, provenance: { path: "usage/agent/execution.json" } }]);
+  });
+
+  it("prefers persisted live detector exit evidence over an earlier canonical observation", () => {
+    const data = { categories: [], errorCodes: [], errorTypes: [] };
+    write("agent-session.jsonl", [{ type: "agent.execution", data: { ...data, exitCode: 1 } }]);
+    write("agent-errors.jsonl", [{ type: "agent.execution", data: { ...data, exitCode: 0 } }]);
+    expect(collectUnifiedSession({ rootDir: root }).events.filter(event => event.type === "agent.execution")).toMatchObject([{ data: { exitCode: 0 } }]);
+  });
+
+  it("retains observed execution results without requiring a conversation", () => {
+    write("agent-stdio.log", "Access denied by policy settings\n[copilot-harness] done: exitCode=1\n");
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "copilot" });
+    expect(events.filter(event => event.type === "agent.execution")).toMatchObject([{ data: { categories: ["inference_access_error"], exitCode: 1 } }]);
+  });
+
+  it("normalizes mixed legacy Cursor entries without letting canonical execution suppress the conversation", () => {
+    write("agent-session.jsonl", [
+      { type: "system", subtype: "init", model: null, session_id: null },
+      { type: "user", message: { content: [{ type: "text", text: "PRIVATE_USER_PROMPT" }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "First answer\nSecond line" }] } },
+      { type: "result", num_turns: 1, usage: {} },
+      { type: "agent.execution", data: { categories: [], errorCodes: [], errorTypes: [], exitCode: 0 } },
+    ]);
+    write("agent-stdio.log", "Assistant: duplicate raw answer");
+    const events = writeUnifiedSession({
+      rootDir: root,
+      engine: "cursor",
+      warn: message => {
+        throw new Error(message);
+      },
+    });
+    expect(events.filter(event => event.type === "assistant.message")).toMatchObject([{ data: { content: "First answer\nSecond line" }, provenance: { path: "agent-session.jsonl" } }]);
+    expect(events.find(event => event.type === "session.init").data.sourceEngine).toBe("cursor");
+    expect(events.filter(event => event.type === "agent.execution")).toHaveLength(1);
+    const persisted = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    expect(require("./log_parser_shared.cjs").generateCopilotCliStyleSummary(events)).not.toContain("PRIVATE_USER_PROMPT");
+    expect(persisted).not.toContain("duplicate raw answer");
+  });
+
+  it("recovers declared-engine stdout when persisted evidence contains only execution", () => {
+    const source = "Assistant: recovered answer\n";
+    const expectedEvents = parseCustomLog(source, "cursor").logEntries;
+    const expectedAssistantEvents = expectedEvents.filter(event => event.type === "assistant.message");
+    expect(expectedAssistantEvents).toHaveLength(1);
+    write("agent-session.jsonl", [{ type: "agent.execution", data: { categories: ["agentic_engine_timeout"], errorCodes: [], errorTypes: [], exitCode: 1 } }]);
+    write("agent-stdio.log", source);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "cursor" });
+    expect(events.filter(event => event.type === "assistant.message")).toEqual(
+      expectedAssistantEvents.map(event => ({
+        ...normalizeUnifiedSessionEvent(event, "agent"),
+        provenance: { component: "agent", phase: "agent", path: "agent-stdio.log", index: expectedEvents.indexOf(event) },
+      }))
+    );
+    expect(events.filter(event => event.type === "agent.execution")).toMatchObject([{ data: { categories: ["agentic_engine_timeout"], exitCode: 1 } }]);
+  });
+
+  it("keeps canonical messages authoritative over equivalent legacy records and raw fallback", () => {
+    const canonical = { type: "assistant.message", data: { content: "answer" } };
+    const legacy = { type: "assistant", message: { content: [{ type: "text", text: "answer" }] } };
+    write("agent-session.jsonl", [legacy, canonical, legacy, { type: "assistant", message: { content: [{ type: "text", text: "another answer" }] } }]);
+    write("agent-stdio.log", "Assistant: must not be selected");
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "cursor" });
+    expect(events.filter(event => event.type === "assistant.message").map(event => event.data.content)).toEqual(["answer", "another answer"]);
+    expect(events.filter(event => event.provenance.component === "agent").every(event => event.provenance.path === "agent-session.jsonl")).toBe(true);
+  });
+
+  it("does not convert runtime tool metadata into fabricated native tool transcripts", () => {
+    write("agent-stdio.log", "Assistant: completed\n");
+    write("mcp-logs/rpc-messages.jsonl", [{ event: "rpc_request", method: "tools/call", payload: { params: { name: "bash", arguments: { command: "pwd" } } } }]);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "cursor" });
+    expect(events.filter(event => event.type === "assistant.message")).toHaveLength(1);
+    expect(events.some(event => event.type === "tool.execution_start" || event.type === "tool.execution_complete")).toBe(false);
+    expect(events.filter(event => event.type === "mcp.rpc.request")).toHaveLength(1);
+  });
+
+  it("rejects malformed recorded exit codes and does not follow an exit-code symlink", () => {
+    write("agent_execution_exit_code.txt", "1 trailing");
+    expect(() => collectUnifiedSession({ rootDir: root })).toThrow("Invalid agent execution exit code");
+    fs.unlinkSync(path.join(root, "agent_execution_exit_code.txt"));
+    fs.symlinkSync(write("private-exit.txt", "139"), path.join(root, "agent_execution_exit_code.txt"));
+    const warnings = [];
+    const { events } = collectUnifiedSession({ rootDir: root, warn: warning => warnings.push(warning) });
+    expect(events.some(event => event.type === "agent.execution")).toBe(false);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("reconstructs OpenCode sessions from stdio with native timestamps and tool correlation", () => {
+    write("aw_info.json", { engine_id: "opencode", agent_version: "fixture" });
+    write("agent-stdio.log", [
+      { type: "text", sessionID: "ses_fixture", timestamp: 1790899201000, part: { id: "text", text: "Done." } },
+      {
+        type: "tool_use",
+        sessionID: "ses_fixture",
+        timestamp: 1790899202000,
+        part: { id: "tool", callID: "call", tool: "bash", state: { status: "completed", input: { command: "pwd" }, output: "/workspace", time: { start: 1790899200500, end: 1790899202000 } } },
+      },
+      { type: "step_finish", sessionID: "ses_fixture", timestamp: 1790899203000, part: { id: "finish", cost: 0, tokens: { input: 10, output: 5, cache: { read: 20, write: 0 } } } },
+    ]);
+    const events = writeUnifiedSession({
+      rootDir: root,
+      warn: message => {
+        throw new Error(message);
+      },
+    });
+    const start = events.find(event => event.type === "tool.execution_start");
+    expect(start).toMatchObject({ provenance: { path: "agent-stdio.log", timestampMs: 1790899202000 }, data: { toolCallId: "call", toolName: "bash", input: { command: "pwd" } } });
+    expect(events.find(event => event.type === "tool.execution_complete").data).toMatchObject({ toolCallId: "call", success: true, durationMs: 1500 });
+    expect(events.find(event => event.type === "session.result").data).toMatchObject({ totalCostUsd: 0, numTurns: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 20 } });
+    expect(events.find(event => event.type === "assistant.message").data.content).toBe("Done.");
+  });
+
+  it("merges every required component with essential payloads and timestamp ordering", () => {
+    const message = { type: "assistant.message", id: "same-id", timestamp: "2026-10-02T00:00:03Z", data: { content: "Done.\n", extra: [0, false, null] }, nativeField: "preserved" };
+    const rpc = { timestamp: "2026-10-02T00:00:02+00:00", event: "rpc_response", payload: { jsonrpc: "2.0", id: 0, result: { content: [{ text: "response" }] } }, server_id: "github", direction: "IN" };
+    const audit = { ts: 1790899201.25, host: "example.com", decision: "TCP_DENIED", status: 403, extra: false };
+    write("agent-session.jsonl", [message]);
+    write("mcp-logs/rpc-messages.jsonl", [rpc]);
+    write("sandbox/firewall/audit/audit.jsonl", [audit]);
+    write("sandbox/firewall/logs/api-proxy-logs/events.jsonl", [{ timestamp: "2026-10-02T00:00:03.5Z", eventName: "token_steering", message: "budget warning" }]);
+    write("sandbox/firewall/logs/api-proxy-logs/token-tracker-audit.jsonl", [{ ts: 1790899203600, event: "TRACK_END", rid: "request" }]);
+    write("threat-detection/sandbox/firewall/logs/audit.jsonl", [{ timestamp: "2026-10-02T00:00:04Z", event: "http_access", status: 200 }]);
+    write("safeoutputs.jsonl", [{ type: "create_issue", title: "Requested" }]);
+    write("safe-output-items.jsonl", [{ type: "create_issue", timestamp: "2026-10-02T00:00:05Z", url: "https://github.com/example/repo/issues/1" }]);
+    write("safe-output-errors.json", { errors: [{ type: "add_comment", error: "rejected" }] });
+    write("experiments/assignments.json", { experiment: "variant-b" });
+    write("experiments/state.jsonl", [{ run_id: "1", timestamp: "2026-10-02T00:00:00Z", assignments: { experiment: "variant-b" } }]);
+    write("agent/graders/grader_manifest.json", { graders: [{ id: "quality" }] });
+    write("agent/graders/grader_results.json", { results: [{ id: "quality", score: 0, passed: false }] });
+    write("evals/evals.jsonl", [{ id: "quality", timestamp: "2026-10-02T00:00:06Z", answer: "no" }]);
+    write("usage/agent/execution.json", { outcome: "failure", duration_ms: 0 });
+    write("usage/detection/detection_result.json", { conclusion: "failure", secret_leak: false });
+    const events = writeUnifiedSession({ rootDir: root });
+    const persisted = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8").trimEnd().split("\n").map(JSON.parse);
+    expect(persisted).toEqual(events);
+    expect(persisted[0]).toEqual({
+      type: "session.format",
+      data: { version: 1 },
+      provenance: { component: "collector", phase: "conclusion", path: "usage/aw_session.jsonl", index: 0 },
+    });
+    expect(persisted.filter(event => event.type === "session.format")).toHaveLength(1);
+    expect(new Set(events.map(event => event.provenance.component))).toEqual(new Set(["agent", "mcp", "firewall", "safe_output", "experiment", "grader", "eval", "execution", "detection", "collector"]));
+    expect(events.find(event => event.type === "assistant.message")).toMatchObject(normalizeUnifiedSessionEvent(message));
+    expect(events.find(event => event.type === "assistant.message")).not.toHaveProperty("nativeField");
+    expect(events.find(event => event.type === "mcp.rpc.response").data).toEqual({ serverName: "github", direction: "IN", rpcId: 0 });
+    expect(events.find(event => event.type === "firewall.http_access").data).toEqual({ host: "example.com", decision: "TCP_DENIED", status: 403 });
+    expect(events.find(event => event.type === "firewall.http_access").provenance.timestampMs).toBe(1790899201250);
+    expect(events.find(event => event.data.requestId === "request").provenance.timestampMs).toBe(1790899203600);
+    expect(events.filter(event => event.provenance.phase === "detection")).toHaveLength(2);
+    expect(events.find(event => event.type === "grader.result").data.results[0]).toEqual({ id: "quality", score: 0, passed: false });
+    const times = events.slice(1).map(event => event.provenance.timestampMs ?? Infinity);
+    expect(times).toEqual([...times].sort((a, b) => (a === b ? 0 : a < b ? -1 : 1)));
+    expect(events.at(-1).type).toBe("session.collection");
+    expect(events.at(-1).data).toMatchObject({ warnings: 0, absentComponents: ["workflow"] });
+    const original = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    writeUnifiedSession({ rootDir: root });
+    expect(fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8")).toBe(original);
+  });
+
+  it("collects available tool and engine versions from workflow metadata", () => {
+    write("aw_info.json", {
+      cli_version: "v1.2.3",
+      awf_version: "v0.4.5",
+      awmg_version: "v0.6.7",
+      engine_id: "copilot",
+      agent_version: "v2.3.4",
+      model: "fixture",
+      event_name: "workflow_dispatch",
+      secret: "omit",
+    });
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.find(event => event.type === "workflow.info")).toMatchObject({
+      data: {
+        cliVersion: "v1.2.3",
+        awfVersion: "v0.4.5",
+        mcpgVersion: "v0.6.7",
+        engineId: "copilot",
+        agentVersion: "v2.3.4",
+        requestedModel: "fixture",
+        triggerType: "workflow_dispatch",
+      },
+      provenance: { path: "aw_info.json", component: "workflow" },
+    });
+    expect(events.find(event => event.type === "workflow.info").data).not.toHaveProperty("secret");
+  });
+
+  it("prefers runner routing metadata over agent metadata and preserves the harness outcome", () => {
+    write("aw_info.json", {
+      engine_id: "claude",
+      model: "runner-model",
+      requested_model: "agent",
+      model_routing: { status: "selected", wire_model: "runner-model", effort: "medium", applied_effort: "low", endpoint: "/v1/messages" },
+    });
+    write("agent/aw_info.json", {
+      engine_id: "claude",
+      model: "forged-model",
+      model_routing: { status: "selected", wire_model: "forged-model", effort: "max" },
+    });
+    write("agent/awf-routing-outcome.json", {
+      status: "rejected",
+      wire_model: "forged-model",
+      endpoint: "/forged",
+      selected_endpoint: "/forged-selected",
+      effort: "forged-effort",
+      applied_effort: "forged-applied-effort",
+      failure_code: "forged-failure",
+      detail: "omit this detail",
+    });
+
+    const { events } = collectUnifiedSession({ rootDir: root, warn: vi.fn() });
+    const workflow = events.find(event => event.type === "workflow.info");
+    expect(workflow).toMatchObject({
+      data: {
+        model: "runner-model",
+        requestedModel: "agent",
+        modelRouting: {
+          status: "selected",
+          wireModel: "runner-model",
+          effort: "medium",
+          appliedEffort: "low",
+          effectiveEndpoint: "/v1/messages",
+        },
+      },
+      provenance: { component: "workflow", phase: "activation", path: "aw_info.json" },
+    });
+    const outcome = events.find(event => event.type === "model_routing.outcome");
+    expect(outcome).toMatchObject({
+      data: {
+        status: "rejected",
+        wireModel: "forged-model",
+        effectiveEndpoint: "/forged",
+        selectedEndpoint: "/forged-selected",
+        effort: "forged-effort",
+        appliedEffort: "forged-applied-effort",
+        failureCode: "forged-failure",
+      },
+      provenance: { component: "agent", phase: "agent", path: "agent/awf-routing-outcome.json" },
+    });
+    expect(outcome.data).not.toHaveProperty("detail");
+    expect(events.at(-1).data.absentComponents).not.toContain("workflow");
+  });
+
+  it("does not promote agent-only aw_info metadata to workflow.info", () => {
+    write("agent/aw_info.json", { engine_id: "claude", model_routing: { status: "selected", wire_model: "forged-model" } });
+    const { events } = collectUnifiedSession({ rootDir: root, warn: vi.fn() });
+    expect(events.some(event => event.type === "workflow.info")).toBe(false);
+  });
+
+  it.each([true, false])("persists dry_run=%s in workflow.info", dryRun => {
+    write("aw_info.json", { engine_id: "copilot", dry_run: dryRun });
+    writeUnifiedSession({ rootDir: root, engine: "copilot" });
+    const persisted = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8").trimEnd().split("\n").map(JSON.parse);
+    expect(persisted.find(event => event.type === "workflow.info").data.dryRun).toBe(dryRun);
+  });
+
+  it("collects rate-limit state and provenance without duplicating the copied artifact or leaking unknown fields", () => {
+    const rateLimits = [
+      {
+        timestamp: "2026-10-02T00:00:01Z",
+        source: "response_headers",
+        credentialSource: "pat",
+        operation: "issues.get",
+        resource: "core",
+        limit: 5000,
+        remaining: 4999,
+        used: 1,
+        reset: "2026-10-02T01:00:00Z",
+        authorization: "do not publish",
+      },
+      { timestamp: "2026-10-02T00:00:02Z", source: "rate_limit_api", resource: "graphql", limit: 5000, remaining: 4998, used: 2 },
+      { timestamp: "2026-10-02T00:00:03Z", source: "retry", credential_source: "app", status: 403, attempt: 1, delay_ms: 1000 },
+    ];
+    write("github_rate_limits.jsonl", rateLimits);
+    write("usage/github_rate_limits.jsonl", rateLimits);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const observed = events.filter(event => event.type === "github_api.rate_limit");
+    expect(observed).toHaveLength(3);
+    expect(observed[0]).toEqual({
+      type: "github_api.rate_limit",
+      timestamp: rateLimits[0].timestamp,
+      data: { source: "response_headers", credentialSource: "pat", operation: "issues.get", resource: "core", limit: 5000, remaining: 4999, used: 1, reset: "2026-10-02T01:00:00Z" },
+      provenance: { component: "github_api", phase: "workflow", path: "github_rate_limits.jsonl", index: 0, timestampMs: Date.parse(rateLimits[0].timestamp) },
+    });
+    expect(observed[1].data).not.toHaveProperty("credentialSource");
+    expect(observed[2].data).toMatchObject({ source: "retry", credentialSource: "app", status: 403, attempt: 1, delayMs: 1000 });
+    expect(events.at(-1).data.sources).toContainEqual({ component: "github_api", phase: "workflow", path: "github_rate_limits.jsonl", events: 3, timestampUnit: "milliseconds" });
+  });
+
+  it("uses the usage copy when needed and skips malformed rate-limit lines without losing valid entries", () => {
+    write("usage/github_rate_limits.jsonl", '{"source":"rate_limit_api","remaining":0}\ninvalid\n{"source":"response_headers","credentialSource":"github_actions","limit":5000}\n');
+    const warnings = [];
+    const { events } = collectUnifiedSession({ rootDir: root, warn: message => warnings.push(message) });
+    expect(events.filter(event => event.type === "github_api.rate_limit")).toMatchObject([
+      { data: { source: "rate_limit_api", remaining: 0 }, provenance: { path: "usage/github_rate_limits.jsonl", index: 0 } },
+      { data: { source: "response_headers", credentialSource: "github_actions", limit: 5000 }, provenance: { path: "usage/github_rate_limits.jsonl", index: 1 } },
+    ]);
+    expect(warnings).toEqual([expect.stringContaining("usage/github_rate_limits.jsonl:2")]);
+    expect(collectUnifiedSession({ rootDir: root }).events.filter(event => event.type === "github_api.rate_limit")).toHaveLength(2);
+  });
+
+  it("resolves detection and eval AIC per observation without adding overlapping checkpoints", () => {
+    write("threat-detection/detection_usage.jsonl", [
+      { provider: "openai", model: "gpt-4o-mini", input_tokens: 1000, output_tokens: 100 },
+      { provider: "openai", model: "unknown-model", input_tokens: 10 },
+      { provider: "openai", model: "gpt-4o-mini", ai_credits: 0, input_tokens: 100 },
+      { usage: { provider: "openai", model: "gpt-4o-mini", ai_credits: 0, input_tokens: 100 } },
+    ]);
+    write("evals/evals_token_usage.jsonl", [
+      { provider: "openai", model: "gpt-4o-mini", ai_credits_this_response: 0.25, input_tokens: 100 },
+      { provider: "openai", model: "gpt-4o-mini", input_tokens: 100, output_tokens: 0 },
+    ]);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const detection = events.filter(event => event.type === "usage.report" && event.provenance.phase === "detection");
+    const evals = events.filter(event => event.type === "usage.report" && event.provenance.phase === "evals");
+    expect(detection[0].data.aic).toBeGreaterThan(0);
+    expect(detection[0].data.usage).toEqual({ inputTokens: 1000, outputTokens: 100 });
+    expect(detection[1].data).not.toHaveProperty("aic");
+    expect(detection[2].data).toMatchObject({ totalAic: 0 });
+    expect(detection[2].data).not.toHaveProperty("aic");
+    expect(detection[3].data).toMatchObject({ provider: "openai", model: "gpt-4o-mini", totalAic: 0, usage: { inputTokens: 100 } });
+    expect(detection[3].data).not.toHaveProperty("aic");
+    expect(evals[0].data).toMatchObject({ aic: 0.25 });
+    expect(evals[1].data.aic).toBeGreaterThan(0);
+    expect(evals[1].data.usage.outputTokens).toBe(0);
+    for (const event of [...detection, ...evals]) {
+      expect(Object.keys(event.data).every(key => !key.includes("_"))).toBe(true);
+      expect(Object.keys(event.data.usage ?? {}).every(key => !key.includes("_"))).toBe(true);
+    }
+  });
+
+  it("retains native provenance, equal-time source order, and invalid/absent timestamps without mutation", () => {
+    const sources = [
+      {
+        component: "agent",
+        phase: "agent",
+        path: "session",
+        events: [
+          { type: "vendor.notice", timestamp: "invalid", data: { flag: false }, provenance: { vendor: 1 } },
+          { type: "assistant.message", timestamp: "2026-10-02T00:00:01Z", id: "duplicate", data: { content: "" } },
+          { type: "assistant.message", timestamp: "2026-10-02T00:00:01Z", id: "duplicate", data: { content: "second" } },
+        ],
+      },
+      { component: "mcp", phase: "agent", path: "rpc", events: [{ type: "mcp.event", timestamp: "2026-10-02T00:00:01Z", data: {} }] },
+    ];
+    const original = structuredClone(sources);
+    const events = mergeSessionSources(sources);
+    expect(events.map(event => event.data.content)).toEqual(["", "second", undefined, undefined]);
+    expect(events.at(-1).provenance).toMatchObject({ native: { vendor: 1 }, index: 0 });
+    expect(events.at(-1).timestamp).toBe("invalid");
+    expect(events.at(-1).provenance).not.toHaveProperty("timestampMs");
+    expect(sources).toEqual(original);
+    expect(mergeSessionSources(sources)).toEqual(events);
+  });
+
+  it("normalizes pretty-printed source JSON to compact JSONL without losing payload whitespace", () => {
+    const native = [
+      { type: "assistant.message", data: { content: "  first line\nsecond line\t\n", structured: { empty: "", zero: 0, flag: false } } },
+      { type: "vendor.extension", data: { nested: [{ key: null }] } },
+    ];
+    const prettyPrinted = JSON.stringify(native, null, 2);
+    write("aw_info.json", { engine_id: "custom" });
+    write("agent-stdio.log", prettyPrinted);
+    writeUnifiedSession({ rootDir: root });
+    const content = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    expect(content.endsWith("\n")).toBe(true);
+    expect(content).not.toContain("\n\n");
+    const lines = content.trimEnd().split("\n");
+    for (const line of lines) expect(line).toBe(JSON.stringify(JSON.parse(line)));
+    const agent = lines.map(JSON.parse).filter(event => event.provenance.component === "agent");
+    expect(agent.map(({ provenance, ...event }) => event)).toEqual(native.map(normalizeUnifiedSessionEvent));
+    expect(lines.some(line => line.includes("\\nsecond line\\t\\n"))).toBe(true);
+  });
+
+  it("uses source-schema timestamp units and nested Pi message times without fabricating time", () => {
+    expect(sessionTimestamp({ ts: 1.25 }, "seconds")).toBe(1250);
+    expect(sessionTimestamp({ ts: 1250 })).toBe(1250);
+    expect(sessionTimestamp({ timestamp: 0 })).toBe(0);
+    expect(sessionTimestamp({ message: { timestamp: 1250 } })).toBe(1250);
+    for (const value of ["", "123", "2026-10-02", NaN, Infinity, 8640000000000001]) expect(sessionTimestamp({ timestamp: value })).toBeUndefined();
+  });
+
+  it("normalizes native Copilot sessions before projecting unified payloads", () => {
+    const nativePath = "sandbox/agent/logs/copilot-session-state/uuid/events.jsonl";
+    write(nativePath, [
+      { type: "session.start", timestamp: "2026-10-02T00:00:00Z", data: { sessionId: "native", selectedModel: "fixture-model" } },
+      { type: "assistant.message_delta", data: { messageId: "message", deltaContent: "Recovered response." } },
+      { type: "tool.execution_start", data: { toolCallId: "call", toolName: "bash", arguments: { command: "pwd" } } },
+      { type: "tool.execution_complete", data: { toolCallId: "call", success: true, shellExecution: { exitCode: 0 } } },
+      { type: "assistant.turn_end", data: { turnId: "1" } },
+      {
+        type: "session.shutdown",
+        timestamp: "2026-10-02T00:00:05Z",
+        data: { sessionStartTime: 1790899200000, modelMetrics: { "fixture-model": { usage: { inputTokens: 10, outputTokens: 4 } } } },
+      },
+    ]);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.find(event => event.type === "session.init").data).toMatchObject({ sourceEngine: "copilot", model: "fixture-model" });
+    expect(events.find(event => event.type === "assistant.message").data.content).toBe("Recovered response.");
+    expect(events.find(event => event.type === "tool.execution_complete").data).toMatchObject({ toolName: "bash", success: true, exitCode: 0 });
+    expect(events.filter(event => event.type === "session.result").map(event => event.data)).toEqual([
+      { sourceEngine: "copilot", sessionId: "native", durationMs: 5000, usage: { inputTokens: 10, outputTokens: 4 } },
+      { sourceEngine: "copilot", sessionId: "native", numTurns: 1 },
+    ]);
+    expect(events.filter(event => event.provenance.component === "agent").every(event => event.provenance.path === nativePath)).toBe(true);
+    const { generatePlainTextSummary } = require("./log_parser_shared.cjs");
+    const summary = generatePlainTextSummary(events);
+    expect(summary).toContain("fixture-model");
+    expect(summary).toContain("Turns: 1");
+    expect(summary).toContain("Tokens: 14 total (10 in / 4 out)");
+    expect(summary).toContain("Tools: 1/1 succeeded");
+  });
+
+  it.each([[`{"type":"session.start","data":{"sessionId":"native"}}\n`], [`{"type":"session.start","data":{"sessionId":"native"}}\n{"type":"assistant.message",`]])(
+    "falls back to stdio when native Copilot events are incomplete",
+    nativeContent => {
+      const nativePath = "sandbox/agent/logs/copilot-session-state/uuid/events.jsonl";
+      write(nativePath, nativeContent);
+      write("agent-stdio.log", JSON.stringify({ type: "assistant.message", data: { content: "recovered stdio" } }));
+      const { events } = collectUnifiedSession({ rootDir: root, engine: "copilot" });
+      const agentEvents = events.filter(event => event.provenance.component === "agent");
+      expect(agentEvents).toEqual([
+        expect.objectContaining({ type: "session.start", provenance: expect.objectContaining({ path: nativePath }) }),
+        expect.objectContaining({ type: "session.init", provenance: expect.objectContaining({ path: nativePath }) }),
+        expect.objectContaining({ type: "assistant.message", data: { content: "recovered stdio" }, provenance: expect.objectContaining({ path: "agent-stdio.log" }) }),
+      ]);
+      expect(events.some(event => event.type === "session.collection_warning" && event.data.path === nativePath)).toBe(true);
+      expect(events.at(-1).data.sources).toContainEqual(expect.objectContaining({ path: nativePath, events: 2 }));
+    }
+  );
+
+  it("prefers persisted canonical events over raw logs and avoids replicated firewall accounting", () => {
+    write("agent-session.jsonl", [{ type: "vendor.extension", data: { preserved: true } }]);
+    write("sandbox/agent/logs/copilot-session-state/uuid/events.jsonl", [{ type: "user.message", data: { content: "duplicate" } }]);
+    write("agent-stdio.log", "not a session");
+    write("sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl", "");
+    write("sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl", [{ timestamp: "2026-10-02T00:00:01Z", event: "token_usage", input_tokens: 999 }]);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.provenance.component === "agent")).toHaveLength(1);
+    expect(events.some(event => event.data.input_tokens === 999)).toBe(false);
+    expect(events.at(-1).data.sources).toContainEqual(expect.objectContaining({ path: "sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl", events: 0 }));
+  });
+
+  it.each([false, true])("deduplicates identified stdio snapshots against retained initialization-only native evidence (answer: %s)", hasAnswer => {
+    const nativePath = "sandbox/agent/logs/copilot-session-state/partial/events.jsonl";
+    const start = { type: "session.start", id: "same-start", data: { sessionId: "partial" } };
+    write(nativePath, [start]);
+    write("agent-stdio.log", [start, ...(hasAnswer ? [{ type: "assistant.message", id: "answer", data: { content: "  recovered answer\n" } }] : [])]);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "copilot" });
+    expect(events.filter(event => event.type === "session.start")).toHaveLength(1);
+    expect(events.filter(event => event.type === "session.init")).toHaveLength(1);
+    expect(events.find(event => event.type === "session.start").provenance.path).toBe(nativePath);
+    expect(events.filter(event => event.type === "assistant.message")).toEqual(
+      hasAnswer ? [{ type: "assistant.message", id: "answer", data: { content: "  recovered answer\n" }, provenance: { component: "agent", phase: "agent", path: "agent-stdio.log", index: 0 } }] : []
+    );
+    expect(events.some(event => event.type === "session.collection_warning" && event.data.code === "unrecognized_engine_log")).toBe(false);
+  });
+
+  it.each([undefined, 3, 4])("reconciles persisted malformed-source warnings with collector copies (line: %s)", line => {
+    const nativePath = "sandbox/agent/logs/copilot-session-state/partial/events.jsonl";
+    const start = { type: "session.start", id: "start", data: { sessionId: "partial" } };
+    const answer = { type: "assistant.message", id: "answer", data: { content: "valid adjacent text\n" } };
+    const persisted = [
+      { ...start, provenance: { path: nativePath, index: 0 } },
+      { ...answer, provenance: { path: nativePath, index: 1 } },
+      { type: "session.collection_warning", data: { path: nativePath, code: "malformed_jsonl", ...(line !== undefined ? { line } : {}) } },
+      { type: "session.collection_warning", data: { path: "unrelated.jsonl", code: "malformed_jsonl", line: 3 } },
+      { type: "session.collection_warning", data: { path: nativePath, code: "unrelated_problem", line: 3 } },
+    ];
+    write("agent-session.jsonl", persisted);
+    write(nativePath, `${JSON.stringify(start)}\n${JSON.stringify(answer)}\nINVALID_LINE_THREE\n`);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "copilot", warn: () => {} });
+    expect(events.filter(event => event.type === "assistant.message").map(event => event.data.content)).toEqual(["valid adjacent text\n"]);
+    expect(events.filter(event => event.type === "session.collection_warning")).toHaveLength(4);
+    expect(events.at(-1).data.warnings).toBe(line === 4 ? 4 : 3);
+    expect(events.at(-1).data.warnings).toBe(collectUnifiedSession({ rootDir: root, engine: "copilot", warn: () => {} }).events.at(-1).data.warnings);
+  });
+
+  it("preserves canonical native source groups without needing raw snapshots", () => {
+    const nativePath = id => `sandbox/agent/logs/copilot-session-state/${id}/events.jsonl`;
+    write(
+      "agent-session.jsonl",
+      ["first", "last"].flatMap((id, index) => [
+        { type: "session.init", timestamp: `2026-10-02T00:00:0${index}Z`, data: { sourceEngine: "copilot", sessionId: id }, provenance: { path: nativePath(id), index: 0 } },
+        { type: "assistant.message", data: { content: id }, provenance: { path: nativePath(id), index: 1 } },
+        { type: "session.result", data: { usage: { inputTokens: index + 1 } }, provenance: { path: nativePath(id), index: 2 } },
+      ])
+    );
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const messages = events.filter(event => event.type === "assistant.message");
+    expect(messages.map(event => event.provenance.path)).toEqual([nativePath("first"), nativePath("last")]);
+    expect(messages.every(event => event.provenance.native.persistedPath === "agent-session.jsonl")).toBe(true);
+    expect(events.filter(event => event.type === "session.result").map(event => event.data.usage.inputTokens)).toEqual([1, 2]);
+    expect(events.at(-1).data.sources.filter(source => source.component === "agent")).toHaveLength(2);
+  });
+
+  it("normalizes genuine Copilot task summaries per canonical source before compaction", () => {
+    const summary = "Genuine final answer\n\nSecond paragraph.";
+    const canonical = ["first", "last"].flatMap((id, attempt) =>
+      [
+        { type: "session.init", data: { sourceEngine: "copilot", sessionId: id } },
+        { type: "assistant.message", data: { content: "" } },
+        ...(attempt ? [{ type: "assistant.message", data: { content: summary } }] : []),
+        { type: "vendor.unknown_complete", data: { summary: "unknown extension must not become an answer" } },
+        { type: "tool.execution_complete", data: { output: "tool output must not become an answer" } },
+        { type: "session.task_complete", id: `${id}-complete`, data: { summary, sourceDetail: "preserve original" } },
+      ].map((event, index) => ({ ...event, provenance: { component: "agent", phase: "agent", path: `sandbox/agent/logs/copilot-session-state/${id}/events.jsonl`, index } }))
+    );
+    write("agent-session.jsonl", canonical);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const answers = events.filter(event => event.type === "assistant.message" && event.data.content);
+    expect(answers.map(event => event.data.content)).toEqual([summary, summary]);
+    expect(new Set(answers.map(event => event.provenance.path)).size).toBe(2);
+    expect(events.filter(event => event.type === "session.task_complete").map(event => event.id)).toEqual(["first-complete", "last-complete"]);
+    const markdown = require("./session_cli.cjs").sessionCLI(["markdown", write("usage/aw_session.jsonl", events)]);
+    expect(markdown).toContain("Genuine final answer");
+    expect(markdown).toContain("Second paragraph.");
+    expect(markdown).not.toContain("unknown extension must not become an answer");
+  });
+
+  it("projects historical canonical Copilot task summaries without native files or indexed provenance", () => {
+    const summary = "Observed historical final answer\n\nSecond paragraph.";
+    write("aw_info.json", { engine_id: "copilot" });
+    write("agent-session.jsonl", [
+      { type: "session.init", data: { sessionId: "historical", sourceEngine: "copilot" } },
+      { type: "assistant.message", data: { content: "" } },
+      { type: "session.task_complete", id: "complete", timestamp: "2026-10-02T00:00:01Z", data: { summary, sourceDetail: "observed metadata" } },
+    ]);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const answers = events.filter(event => event.type === "assistant.message" && event.data.content);
+    expect(answers.map(event => event.data.content)).toEqual([summary]);
+    expect(answers[0].id).toBe("complete");
+    expect(answers[0].provenance.path).toBe("agent-session.jsonl");
+    expect(events.find(event => event.type === "session.task_complete").data).not.toHaveProperty("sourceDetail");
+    expect(events.find(event => event.type === "session.task_complete").data).not.toHaveProperty("summary");
+    const markdown = require("./session_cli.cjs").sessionCLI(["markdown", write("usage/aw_session.jsonl", events)]);
+    expect(markdown).toContain("Observed historical final answer");
+    expect(markdown).toContain("Second paragraph.");
+  });
+
+  it("does not reproject canonical Copilot initialization after native provenance indexing", () => {
+    const native = [{ type: "session.start", id: "start", timestamp: "2026-10-02T00:00:00Z", data: { sessionId: "session", startTime: "2026-10-02T00:00:00Z" } }];
+    const canonical = require("./copilot_session.cjs")
+      .normalizeCopilotSession(native)
+      .map((event, index) => ({ ...event, provenance: { component: "agent", phase: "agent", path: "sandbox/agent/logs/copilot-session-state/session/events.jsonl", index } }));
+    write("agent-session.jsonl", canonical);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.provenance.component === "agent")).toHaveLength(canonical.length);
+    expect(events.filter(event => event.type === "session.init")).toHaveLength(1);
+  });
+
+  it("keeps identical tool call IDs and canonical indices isolated across reconstructed retry sources", () => {
+    const nativePath = id => `sandbox/agent/logs/copilot-session-state/${id}/events.jsonl`;
+    const canonical = ["first", "last"].flatMap((id, attempt) =>
+      [
+        { type: "session.init", timestamp: `2026-10-02T00:00:0${attempt}Z`, data: { sourceEngine: "copilot", sessionId: id } },
+        { type: "tool.execution_start", data: { toolCallId: "call", toolName: `${id}_tool`, input: { scope: id } } },
+        { type: "tool.execution_complete", data: { toolCallId: "call", success: true, output: `${id} output` } },
+      ].map((event, index) => ({ ...event, provenance: { component: "agent", phase: "agent", path: nativePath(id), index: 20 + attempt * 10 + index } }))
+    );
+    write("agent-session.jsonl", canonical);
+    for (const id of ["first", "last"]) {
+      write(nativePath(id), [
+        { type: "session.start", data: { sessionId: id } },
+        { type: "tool.execution_start", data: { toolCallId: "call", toolName: "raw duplicate" } },
+        { type: "tool.execution_complete", data: { toolCallId: "call", success: true, output: "raw duplicate output" } },
+      ]);
+    }
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const groups = require("./unified_session_render.cjs").scopedAgentSessions(events);
+    expect(groups).toHaveLength(2);
+    for (const [attempt, id] of ["first", "last"].entries()) {
+      const source = events.filter(event => event.provenance.component === "agent" && event.provenance.path === nativePath(id));
+      expect(source.map(event => event.provenance.index)).toEqual([20 + attempt * 10, 21 + attempt * 10, 22 + attempt * 10]);
+      expect(source.every(event => event.provenance.native.index === event.provenance.index)).toBe(true);
+      expect(groups[attempt].label).toBe(`agent/${nativePath(id)}`);
+      expect(groups[attempt].events.filter(event => event.type === "tool.execution_start").map(event => event.data)).toEqual([{ toolCallId: "call", toolName: `${id}_tool`, input: { scope: id } }]);
+      expect(groups[attempt].events.filter(event => event.type === "tool.execution_complete").map(event => event.data.output)).toEqual([`${id} output`]);
+    }
+    const output = write("usage/aw_session.jsonl", events);
+    const markdown = require("./session_cli.cjs").sessionCLI(["markdown", output]);
+    expect(markdown).toContain("first output");
+    expect(markdown).toContain("last output");
+    expect(markdown).not.toContain("raw duplicate output");
+  });
+
+  it.each([false, true])("recovers only missing Copilot session IDs, preferring the fullest native copy (native provenance: %j)", nativeProvenance => {
+    const nativePath = id => `sandbox/agent/logs/copilot-session-state/${id}/events.jsonl`;
+    const firstStart = { type: "session.start", timestamp: "2026-10-02T00:00:00Z", data: { sourceEngine: "copilot", sessionId: "first", startTime: "2026-10-02T00:00:00Z" } };
+    const lastStart = { type: "session.init", timestamp: "2026-10-02T00:00:01Z", data: { sourceEngine: "copilot", sessionId: "last", startTime: "2026-10-02T00:00:01Z" } };
+    const canonical = [lastStart, { type: "assistant.message", data: { content: "authoritative final answer" } }, { type: "session.result", data: { usage: { inputTokens: 10 }, numTurns: 1 } }];
+    write("agent-session.jsonl", nativeProvenance ? canonical.map((event, index) => ({ ...event, provenance: { path: nativePath("last"), index } })) : canonical);
+    write(nativePath("first"), [
+      firstStart,
+      { type: "assistant.message", data: { content: "recovered earlier answer" } },
+      { type: "tool.execution_start", data: { toolCallId: "first-tool", toolName: "read_file" } },
+      { type: "tool.execution_complete", data: { toolCallId: "first-tool", success: true, output: "observed output" } },
+      { type: "session.error", data: { code: 502, message: "earlier retry failure" } },
+    ]);
+    write(nativePath("short-copy"), [firstStart, { type: "assistant.message", data: { content: "do not select the shorter copy" } }]);
+    write(nativePath("last"), [
+      { ...lastStart, type: "session.start" },
+      { type: "assistant.message", data: { content: "do not override canonical" } },
+      { type: "tool.execution_start", data: { toolCallId: "extra-raw-tool", toolName: "ignored" } },
+    ]);
+    write("agent_execution_exit_code.txt", "0\n");
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.type === "assistant.message").map(event => event.data.content)).toEqual(["recovered earlier answer", "authoritative final answer"]);
+    expect(events.filter(event => event.type === "tool.execution_start")).toHaveLength(1);
+    expect(events.filter(event => event.type === "tool.execution_complete")).toHaveLength(1);
+    const execution = events.find(event => event.type === "agent.execution");
+    expect(execution.data).toEqual({ categories: [], errorCodes: [], errorTypes: [], exitCode: 0 });
+    expect(execution.provenance.path).toBe(nativePath("last"));
+    expect(events.filter(event => event.type === "session.result" && event.provenance.path === nativePath("last")).map(event => event.data.usage)).toEqual([{ inputTokens: 10 }]);
+    expect(
+      events
+        .at(-1)
+        .data.sources.filter(source => source.component === "agent")
+        .map(source => source.path)
+    ).toEqual([nativePath("first"), nativePath("last")]);
+  });
+
+  it.each([false, true])("retains current Codex accounting through conclusion collection (canonical present: %j)", canonicalPresent => {
+    write("agent-stdio.log", codexNoTools);
+    if (canonicalPresent) write("agent-session.jsonl", parseEngineSession(codexNoTools, "codex"));
+    writeUnifiedSession({ rootDir: root, engine: "codex" });
+    const published = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8").trimEnd().split("\n").map(JSON.parse);
+    const agent = published.filter(event => event.provenance.component === "agent");
+    expect(agent.map(event => event.type)).toEqual(["session.init", "session.result", "turn.started", "assistant.message", "assistant.message", "session.result"]);
+    expect(agent[1].data).toEqual({ errors: ["Model metadata unavailable; using fallback metadata."] });
+    expect(agent.at(-1).data).toEqual({
+      status: "completed",
+      sourceType: "turn.completed",
+      numTurns: 1,
+      usage: { inputTokens: 16847, outputTokens: 167, cacheReadInputTokens: 8576, cacheCreationInputTokens: 0, reasoningOutputTokens: 0 },
+    });
+    expect(agent.at(-1)).not.toHaveProperty("usage");
+    expect(agent.every(event => event.provenance.path === (canonicalPresent ? "agent-session.jsonl" : "agent-stdio.log"))).toBe(true);
+    expect(published.some(event => event.type === "session.collection_warning")).toBe(false);
+  });
+
+  it("retains a structured Codex transport-wedge execution event in the unified session", () => {
+    const execution = { type: "agent.execution", data: { categories: ["transport_wedge"], errorCodes: [], errorTypes: [] } };
+    write("agent-stdio.log", [JSON.stringify({ type: "thread.started", thread_id: "thread" }), JSON.stringify(execution)].join("\n"));
+    const events = writeUnifiedSession({ rootDir: root, engine: "codex" });
+    expect(events.filter(event => event.type === "agent.execution")).toMatchObject([{ data: execution.data, provenance: { component: "execution", phase: "agent", path: "agent-stdio.log" } }]);
+  });
+
+  it("preserves model-routing records as dedicated unified-session events", () => {
+    const record = {
+      _schema: "model-routing/v0.28.37",
+      timestamp: "2026-10-07T18:20:00Z",
+      event: "model_routing",
+      stage: "selection",
+      selected_model: "gpt-5.6-luna",
+      selected_effort: "high",
+      router: { name: "gh-aw-router", version: "0.1.3" },
+    };
+    write("sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl", [record]);
+    const event = collectUnifiedSession({ rootDir: root }).events.find(item => item.type === "firewall.model_routing");
+    expect(event.data).toMatchObject({
+      schema: "model-routing/v0.28.37",
+      stage: "selection",
+      selectedModel: "gpt-5.6-luna",
+      selectedEffort: "high",
+      router: { name: "gh-aw-router", version: "0.1.3" },
+    });
+    expect(event.provenance).toMatchObject({
+      component: "firewall",
+      path: "sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl",
+    });
+  });
+
+  it.each(["", "{bad\n", '{"type":"result","usage":{}}\n'])("falls back from an unusable canonical session (%j) to native events", content => {
+    const nativePath = "sandbox/agent/logs/copilot-session-state/uuid/events.jsonl";
+    write("agent-session.jsonl", content);
+    write(nativePath, [{ type: "assistant.message", data: { content: "recovered" } }]);
+    write("agent-stdio.log", "not a session");
+    const { events } = collectUnifiedSession({ rootDir: root, warn: vi.fn() });
+    expect(events.filter(event => event.provenance.component === "agent")).toEqual([expect.objectContaining({ type: "assistant.message", data: { content: "recovered" }, provenance: expect.objectContaining({ path: nativePath }) })]);
+    expect(events.at(-1).data.sources).toContainEqual(expect.objectContaining({ path: "agent-session.jsonl", events: 0 }));
+  });
+
+  it.each([false, true])("falls back to raw logs when canonical and native events are unusable (native present: %j)", nativePresent => {
+    write("agent-session.jsonl", "");
+    if (nativePresent) write("sandbox/agent/logs/copilot-session-state/uuid/events.jsonl", "{bad\n");
+    write("agent-stdio.log", JSON.stringify([{ type: "assistant.message", data: { content: "raw fallback" } }]));
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "custom", warn: vi.fn() });
+    expect(events.filter(event => event.provenance.component === "agent")).toEqual([expect.objectContaining({ data: { content: "raw fallback" }, provenance: expect.objectContaining({ path: "agent-stdio.log" }) })]);
+  });
+
+  it.each([
+    ["experiments/state.jsonl", "usage/experiment/state.jsonl"],
+    ["experiments/state.json", "usage/experiment/state.json"],
+    ["experiments/assignments.json", "usage/experiment/assignments.json"],
+    ["agent/graders/grader_manifest.json", "usage/graders/grader_manifest.json"],
+    ["agent/graders/grader_results.json", "usage/graders/grader_results.json"],
+    ["evals/evals.jsonl", "usage/evals.jsonl"],
+    ["agent_usage.jsonl", "usage/agent_usage.jsonl"],
+    ["threat-detection/detection_usage.jsonl", "usage/detection_usage.jsonl"],
+    ["detection_usage.jsonl", "usage/detection_usage.jsonl"],
+    ["evals/evals_token_usage.jsonl", "usage/evals/token_usage.jsonl"],
+    ["agent_execution.json", "usage/agent/execution.json"],
+    ["threat-detection/execution.json", "usage/detection/execution.json"],
+    ["evals/evals/execution.json", "usage/evals/execution.json"],
+    ["evals/execution.json", "usage/evals/execution.json"],
+  ])("prefers original provenance from %s and retains the %s mirror fallback", (original, mirror) => {
+    const observation = { value: "source", id: "source", type: "source", status: "source", model: "source", assignments: { experiment: "source" }, outcome: "source", conclusion: "source", run_id: "source" };
+    const record = file => (file.endsWith(".json") ? observation : [observation]);
+    const source = write(original, record(original));
+    write(mirror, record(mirror));
+    const { events } = collectUnifiedSession({ rootDir: root });
+    const observed = events.filter(event => event.provenance.path === original || event.provenance.path === mirror);
+    expect(observed).toHaveLength(1);
+    expect(observed[0].provenance.path).toBe(original);
+    fs.unlinkSync(source);
+    const fallback = collectUnifiedSession({ rootDir: root }).events.filter(event => event.provenance.path === original || event.provenance.path === mirror);
+    expect(fallback).toHaveLength(1);
+    expect(fallback[0].provenance.path).toBe(mirror);
+  });
+
+  it.each(["structured", "inline"])("collects the sanitized %s detection verdict with its job outcome and categorical reason", source => {
+    const verdict = { prompt_injection: true, secret_leak: false, malicious_patch: true, reasons: ["PRIVATE_DETECTOR_REASON"] };
+    if (source === "structured") write("threat-detection/detection_result.json", verdict);
+    else write("threat-detection/detection.log", `PRIVATE_DETECTOR_TRANSCRIPT\nTHREAT_DETECTION_RESULT:${JSON.stringify(verdict)}\n`);
+    process.env.GH_AW_DETECTION_JOB_RESULT = "success";
+    process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+    process.env.GH_AW_DETECTION_REASON = "threat_detected";
+    writeDetectionUsageResult(path.join(root, "threat-detection"), path.join(root, "usage/detection/detection_result.json"));
+    const events = writeUnifiedSession({ rootDir: root });
+    expect(events.filter(event => event.type === "detection.result")).toEqual([
+      {
+        type: "detection.result",
+        data: { jobResult: "success", conclusion: "warning", reason: "threat_detected", promptInjection: true, secretLeak: false, maliciousPatch: true },
+        provenance: { component: "detection", phase: "detection", path: "usage/detection/detection_result.json", index: 0 },
+      },
+    ]);
+    expect(fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8")).not.toContain("PRIVATE_DETECTOR_");
+    expect(writeUnifiedSession({ rootDir: root })).toEqual(events);
+  });
+
+  it.each([
+    ["success", "success", "", { prompt_injection: false, secret_leak: false, malicious_patch: false }],
+    ["failure", "failure", "agent_failure", undefined],
+    ["success", "warning", "parse_error", undefined],
+    ["cancelled", "", "", undefined],
+    ["skipped", "skipped", "detection_skipped", undefined],
+  ])("preserves detection status %s/%s without inventing absent verdict flags", (job, conclusion, reason, verdict) => {
+    process.env.GH_AW_DETECTION_JOB_RESULT = job;
+    process.env.GH_AW_DETECTION_CONCLUSION = conclusion;
+    process.env.GH_AW_DETECTION_REASON = reason;
+    if (verdict) write("threat-detection/detection_result.json", verdict);
+    if (job === "skipped") write("threat-detection/detection_result.json", { prompt_injection: true, secret_leak: true, malicious_patch: true });
+    writeDetectionUsageResult(path.join(root, "threat-detection"), path.join(root, "usage/detection/detection_result.json"));
+    const result = collectUnifiedSession({ rootDir: root }).events.filter(event => event.type === "detection.result");
+    expect(result).toHaveLength(1);
+    expect(result[0].data).toEqual({ jobResult: job, conclusion, reason, ...(verdict ? { promptInjection: false, secretLeak: false, maliciousPatch: false } : {}) });
+  });
+
+  it("falls back to the raw structured verdict when no conclusion result is available", () => {
+    write("threat-detection/detection_result.json", { prompt_injection: false, secret_leak: true, malicious_patch: false, reason: "PRIVATE_RAW_REASON", reasons: ["PRIVATE_DETECTOR_REASON"] });
+    const results = collectUnifiedSession({ rootDir: root }).events.filter(event => event.type === "detection.result");
+    expect(results).toEqual([
+      {
+        type: "detection.result",
+        data: { promptInjection: false, secretLeak: true, maliciousPatch: false },
+        provenance: { component: "detection", phase: "detection", path: "threat-detection/detection_result.json", index: 0 },
+      },
+    ]);
+    expect(JSON.stringify(results)).not.toContain("PRIVATE_RAW_REASON");
+  });
+
+  it("recovers adjacent valid records, records malformed/partial coverage and skips symlinks", () => {
+    const warn = vi.fn();
+    write("agent-session.jsonl", '{"type":"assistant.message","data":{"content":"first"}}\n{bad\nnull\n{"type":"vendor.after","data":{}}\n');
+    write("safe-output-errors.json", "{truncated");
+    const secret = write("outside.jsonl", [{ type: "assistant.message", data: { content: "must not follow" } }]);
+    fs.mkdirSync(path.join(root, "mcp-logs"));
+    fs.symlinkSync(secret, path.join(root, "mcp-logs", "unsafe.jsonl"));
+    fs.symlinkSync(path.join(root, "mcp-logs"), path.join(root, "experiments"));
+    const { events } = collectUnifiedSession({ rootDir: root, warn });
+    expect(events.filter(event => event.provenance.component === "agent")).toHaveLength(2);
+    expect(events.filter(event => event.type === "session.collection_warning").map(event => event.data.code)).toEqual(["malformed_jsonl", "non_object_record", "symlink_not_read", "malformed_json"]);
+    expect(warn).toHaveBeenCalled();
+    expect(JSON.stringify(events)).not.toContain("must not follow");
+  });
+
+  it("reports absent components for an empty run without a fake agent result", () => {
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ type: "session.format", data: { version: 1 } });
+    expect(events[0].provenance).not.toHaveProperty("timestampMs");
+    expect(events[1]).toMatchObject({ type: "session.collection", data: { absentComponents: ["agent", "mcp", "firewall", "safe_output", "experiment", "grader", "eval", "workflow"], warnings: 0, untimedEvents: 0 } });
+  });
+
+  it("pins only the collector file-format header, preserving a native session.format extension", () => {
+    write("agent-session.jsonl", [
+      { type: "session.format", timestamp: "2026-10-02T00:00:02Z", data: { version: "native-engine-format" } },
+      { type: "assistant.message", timestamp: "2026-10-02T00:00:01Z", data: { content: "first timed event" } },
+    ]);
+    const events = writeUnifiedSession({ rootDir: root });
+    expect(events.map(event => event.type)).toEqual(["session.format", "assistant.message", "session.format", "session.collection"]);
+    expect(events[0].data.version).toBe(1);
+    expect(events[2]).toMatchObject({ data: { version: "native-engine-format" }, provenance: { component: "agent", index: 0 } });
+  });
+
+  it("fails explicitly on read errors and removes a stale output rather than uploading it", () => {
+    const source = write("agent-session.jsonl", [{ type: "assistant.message", data: { content: "current" } }]);
+    const output = write("usage/aw_session.jsonl", "old session");
+    const originalRead = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
+      if (file === source) throw new Error("fixture read denied");
+      return originalRead(file, ...args);
+    });
+    expect(() => writeUnifiedSession({ rootDir: root })).toThrow("fixture read denied");
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it("retains unfamiliar MCP/firewall messages and does not confuse prototypes with event kinds", () => {
+    for (const component of ["mcp", "firewall"]) {
+      const raw = { timestamp: "invalid", event: "__proto__", future: [false, null, 0] };
+      const event = normalizeRuntimeEvent(component, raw);
+      expect(event).toMatchObject({ type: `${component}.event`, data: raw, timestamp: "invalid" });
+      expect(raw.future).toEqual([false, null, 0]);
+    }
+  });
+
+  it("redacts decoded secrets and mask values in all payloads, including IDs, before persistence", () => {
+    const secret = 'secret"with\\escaped\ncharacters';
+    const token = "ghp_" + "a".repeat(36);
+    process.env.GH_AW_SECRET_NAMES = "SESSION_SECRET";
+    process.env.SECRET_SESSION_SECRET = secret;
+    const events = [{ type: "tool.execution_complete", id: secret, data: { toolCallId: token, output: { nested: secret, mask: "opaque-mask" }, success: false } }];
+    const original = structuredClone(events);
+    const content = serializeSessionArtifact(events, ["opaque-mask"]);
+    expect(content).not.toContain(token);
+    const event = JSON.parse(content);
+    expect(event.id).toBe("***REDACTED***");
+    expect(event.data.toolCallId).toBe("***REDACTED***");
+    expect(event.data.output).toEqual({ nested: "***REDACTED***", mask: "***" });
+    expect(events).toEqual(original);
+    write("agent-session.jsonl", [{ type: "assistant.message", data: { content: "opaque-mask" } }]);
+    write("agent-stdio.log", "::add-mask::opaque-mask\n");
+    writeUnifiedSession({ rootDir: root });
+    expect(fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8")).not.toContain("opaque-mask");
+  });
+
+  it("uses a standardized error code for invalid session data", () => {
+    expect(() => serializeSessionArtifact({})).toThrow("ERR_VALIDATION: Expected a session event array");
+  });
+
+  it("writes atomically and cleans up failed outputs without following a temporary symlink", () => {
+    const output = write("usage/aw_session.jsonl", "old");
+    const target = write("outside.jsonl", "unchanged");
+    fs.symlinkSync(target, `${output}.tmp`);
+    expect(() => writeSessionArtifact(output, [{ type: "vendor.event", data: {} }])).toThrow("ERR_SYSTEM: Failed to write session artifact");
+    expect(fs.readFileSync(target, "utf8")).toBe("unchanged");
+    expect(fs.existsSync(output)).toBe(false);
+    expect(fs.existsSync(`${output}.tmp`)).toBe(false);
+  });
+
+  it.each([
+    ["claude", () => JSON.stringify(claudeFixtures.success)],
+    [
+      "copilot",
+      () =>
+        JSON.stringify([
+          { type: "session.start", timestamp: "2026-10-02T00:00:01Z", data: { sessionId: "copilot" } },
+          { type: "assistant.message", data: { content: "done" } },
+        ]),
+    ],
+    ["codex", () => fs.readFileSync(path.join(import.meta.dirname, "test_data/codex_ci_smoke.jsonl"), "utf8")],
+    [
+      "gemini",
+      () =>
+        JSON.stringify([
+          { type: "init", model: "gemini-test" },
+          { type: "assistant", message: "done" },
+          { type: "result", stats: { input_tokens: 10, output_tokens: 2 } },
+        ]),
+    ],
+    ["pi", () => piSuccess.map(entry => JSON.stringify(entry)).join("\n")],
+    [
+      "custom",
+      () =>
+        JSON.stringify([
+          { type: "assistant.message", data: { content: "custom done" } },
+          { type: "vendor.custom", data: { score: 0 } },
+        ]),
+    ],
+  ])("normalizes and persists a %s workflow session using its existing engine adapter", (engine, fixture) => {
+    const content = fixture();
+    const expected = parseEngineSession(content, engine);
+    expect(expected.length).toBeGreaterThan(0);
+    write("aw_info.json", { engine_id: engine });
+    write(engine === "pi" ? "pi-streaming.jsonl" : "agent-stdio.log", content);
+    write("mcp-logs/gateway.jsonl", [{ timestamp: "2026-10-02T00:00:02Z", event: "tool_call", tool_name: "lookup" }]);
+    const events = writeUnifiedSession({ rootDir: root });
+    const actual = events
+      .filter(event => event.provenance.component === "agent")
+      .sort((a, b) => a.provenance.index - b.provenance.index)
+      .map(({ provenance, ...event }) => event);
+    expect(actual).toEqual(JSON.parse(JSON.stringify(expected.filter(event => event.type !== "agent.execution").map(normalizeUnifiedSessionEvent))));
+    expect(events.filter(event => event.type === "agent.execution").map(event => event.data)).toEqual(expected.filter(event => event.type === "agent.execution").map(event => event.data));
+    expect(events.some(event => event.type === "mcp.tool_call")).toBe(true);
+    expect(events.every(event => event.type.includes(".") && event.data && typeof event.data === "object")).toBe(true);
+  });
+});

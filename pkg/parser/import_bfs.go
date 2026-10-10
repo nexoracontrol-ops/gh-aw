@@ -232,7 +232,7 @@ func enqueueImportPath(state *importBFSState, importPath, fullPath, sectionName,
 
 func processImportQueue(baseDir string, cache *ImportCache, workflowFilePath string, yamlContent string, state *importBFSState) error {
 	for len(state.queue) > 0 {
-		item := state.queue[0]
+		item := state.queue[0] //nolint:uncheckedsliceindex // len(state.queue) > 0 guards this FIFO pop.
 		state.queue = state.queue[1:]
 		if err := processQueueItem(item, baseDir, cache, workflowFilePath, yamlContent, state); err != nil {
 			return err
@@ -268,6 +268,20 @@ func handleAgentImportItem(item importQueueItem, state *importBFSState) (bool, e
 		parserLog.Printf("Multiple agent files found: %s and %s", state.acc.agentFile, item.importPath)
 		return true, fmt.Errorf("multiple agent files found in imports: '%s' and '%s'. Only one agent file is allowed per workflow", state.acc.agentFile, item.importPath)
 	}
+	content, err := readFileFunc(item.fullPath)
+	if err != nil {
+		return true, fmt.Errorf("reading imported agent %q: %w", item.importPath, err)
+	}
+	if original, err := ExtractFrontmatterFromContent(string(content)); err == nil {
+		rawContent, _ := state.acc.applyImportDefaultsToContent(string(content), original.Frontmatter, item.inputs)
+		if parsed, err := ExtractFrontmatterFromContent(rawContent); err == nil {
+			if model, ok := parsed.Frontmatter["model"].(string); ok && strings.TrimSpace(model) != "" {
+				state.acc.subAgentModels = append(state.acc.subAgentModels, SubAgentModel{
+					Name: filepath.Base(item.fullPath), Model: strings.TrimSpace(model),
+				})
+			}
+		}
+	}
 	importRelPath := assignAgentFilePath(state.acc, fullPathSlash, item.importPath, item.fullPath)
 	if len(item.inputs) == 0 {
 		state.acc.importPaths = append(state.acc.importPaths, importRelPath)
@@ -302,10 +316,11 @@ func handleYAMLWorkflowImportItem(item importQueueItem, state *importBFSState) (
 		return false, nil
 	}
 	parserLog.Printf("Detected YAML workflow file: %s", item.fullPath)
-	jobsOrStepsData, servicesJSON, err := processYAMLWorkflowImport(item.fullPath)
+	jobsOrStepsData, servicesJSON, sourceVersions, err := processYAMLWorkflowImportWithSourceVersions(item.fullPath)
 	if err != nil {
 		return true, fmt.Errorf("failed to process YAML workflow '%s': %w", item.importPath, err)
 	}
+	state.acc.addActionPinSourceVersions(sourceVersions)
 	appendYAMLImportJobsOrSteps(state.acc, item.importPath, item.fullPath, jobsOrStepsData)
 	appendYAMLImportServices(state.acc, item.importPath, servicesJSON)
 	return true, nil
@@ -367,9 +382,6 @@ func extractImportFrontmatterForNested(content []byte, item importQueueItem) (*F
 		return result, err
 	}
 	inputsWithDefaults := applyImportSchemaDefaultsFromFrontmatter(result.Frontmatter, item.inputs)
-	if len(inputsWithDefaults) == 0 {
-		return result, nil
-	}
 	origContent := string(content)
 	substituted := substituteImportInputsInContent(origContent, inputsWithDefaults)
 	if substituted == origContent {

@@ -282,7 +282,7 @@ jobs:
           cache-from: type=gha
 
       - name: Upload release binaries
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -313,7 +313,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -618,7 +618,7 @@ jobs:
           persist-credentials: true
 
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -714,14 +714,14 @@ jobs:
         run: go mod download
 
       - name: Generate SBOM (SPDX format)
-        uses: anchore/sbom-action@v0.24.2
+        uses: anchore/sbom-action@v0.24.3
         with:
           artifact-name: sbom.spdx.json
           output-file: sbom.spdx.json
           format: spdx-json
 
       - name: Generate SBOM (CycloneDX format)
-        uses: anchore/sbom-action@v0.24.2
+        uses: anchore/sbom-action@v0.24.3
         with:
           artifact-name: sbom.cdx.json
           output-file: sbom.cdx.json
@@ -737,7 +737,7 @@ jobs:
           echo "✓ No secrets detected in SBOM files"
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sbom-artifacts
           path: |

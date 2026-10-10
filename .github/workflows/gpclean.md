@@ -58,7 +58,7 @@ experiments:
 engine:
   id: codex
   model-provider: openai
-model: openai/gpt-5-codex
+model: openai/gpt-6.1-sol
 strict: false
 
 imports:
@@ -99,9 +99,6 @@ evals:
   - id: tool_verbosity_goal_met
     question: Does the agent output show that the objective for experiment tool_verbosity was successfully completed?
 
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 {{#if experiments.tool_verbosity == 'minimal_toolset' }}

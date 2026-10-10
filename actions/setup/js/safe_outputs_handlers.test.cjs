@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -15,6 +15,8 @@ import {
 } from "./intent_probe.cjs";
 
 const LARGE_CONTENT_BODY = "A".repeat(70000);
+const testScratchRoot = path.resolve(`.safe-outputs-handlers-${crypto.randomUUID()}`);
+const originalGitCeiling = process.env.GIT_CEILING_DIRECTORIES;
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
@@ -47,6 +49,10 @@ describe("safe_outputs_handlers", () => {
   let handlers;
   let testWorkspaceDir;
 
+  afterAll(() => {
+    fs.rmSync(testScratchRoot, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
 
@@ -58,8 +64,9 @@ describe("safe_outputs_handlers", () => {
 
     // Create temporary workspace directory
     const testId = Math.random().toString(36).substring(7);
-    testWorkspaceDir = `/tmp/test-handlers-workspace-${testId}`;
+    testWorkspaceDir = path.join(testScratchRoot, `test-handlers-workspace-${testId}`);
     fs.mkdirSync(testWorkspaceDir, { recursive: true });
+    process.env.GIT_CEILING_DIRECTORIES = fs.realpathSync(testScratchRoot);
 
     // Set environment variables
     process.env.GITHUB_WORKSPACE = testWorkspaceDir;
@@ -81,6 +88,51 @@ describe("safe_outputs_handlers", () => {
     expect(mockAppendSafeOutput.mock.calls[0][0].temporary_id).toMatch(/^#aw_/);
   });
 
+  it("converts built-in map calls into ledger_append entries", () => {
+    const configured = createHandlers(mockServer, mockAppendSafeOutput, {
+      ledger_append: {
+        ledgers: [
+          { name: "cache", type: "map" },
+          { name: "other", type: "map" },
+        ],
+      },
+    });
+
+    expect(configured.ledgerBuiltinHandler("map", "put")({ key: "a", value: { status: "ready" } }).isError).toBe(true);
+    expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "queue", key: "a", value: 1 }).isError).toBe(true);
+    expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "cache", key: "a", value: 1, operation: "delete" }).isError).toBe(true);
+    expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "cache", key: "a", value: { status: "ready" }, temp_id: "entry" }).isError).not.toBe(true);
+    expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "other", key: "b", value: 2 }).isError).not.toBe(true);
+    expect(mockAppendSafeOutput.mock.calls.map(([entry]) => entry)).toEqual([
+      { type: "ledger_append", ledger: "cache", operation: "put", key: "a", value: { status: "ready" }, temp_id: "entry" },
+      { type: "ledger_append", ledger: "other", operation: "put", key: "b", value: 2 },
+    ]);
+  });
+
+  it("routes notes tools through ledger_append without exposing operation envelopes", () => {
+    const configured = createHandlers(mockServer, mockAppendSafeOutput, {
+      ledger_append: {
+        ledgers: [
+          { name: "knowledge", type: "notes" },
+          { name: "other", type: "notes" },
+          { name: "history", type: "log" },
+        ],
+      },
+    });
+    const note = { subject: "authentication", note: "Tokens expire", reason: "Documented", citations: [{ type: "repository", path: "README.md" }] };
+    expect(configured.ledgerBuiltinHandler("notes", "note")({ ...note }).isError).toBe(true);
+    expect(configured.ledgerBuiltinHandler("notes", "note")({ ledger: "knowledge", ...note, operation: "vote" }).isError).toBe(true);
+    expect(configured.ledgerBuiltinHandler("notes", "note")({ ledger: "knowledge", temp_id: "first", ...note }).isError).not.toBe(true);
+    expect(configured.ledgerBuiltinHandler("notes", "vote")({ ledger: "knowledge", note_id: "#first", vote: "up" }).isError).not.toBe(true);
+    expect(configured.ledgerAgentAppendHandler({ ledger: "knowledge", operation: "note", ...note }).isError).toBe(true);
+    expect(configured.ledgerAgentAppendHandler({ ledger: "history", operation: "append", value: "ok" }).isError).not.toBe(true);
+    expect(mockAppendSafeOutput.mock.calls.map(([entry]) => entry)).toEqual([
+      { type: "ledger_append", ledger: "knowledge", temp_id: "first", operation: "note", ...note },
+      { type: "ledger_append", ledger: "knowledge", operation: "vote", note_id: "#first", vote: "up" },
+      { type: "ledger_append", ledger: "history", operation: "append", value: "ok" },
+    ]);
+  });
+
   afterEach(() => {
     // Clean up test files
     try {
@@ -93,6 +145,8 @@ describe("safe_outputs_handlers", () => {
 
     // Clear environment variables
     delete process.env.GITHUB_WORKSPACE;
+    if (originalGitCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = originalGitCeiling;
     delete process.env.GITHUB_SERVER_URL;
     delete process.env.GITHUB_REPOSITORY;
     delete process.env.GH_AW_WORKFLOW_ID;
@@ -289,7 +343,7 @@ describe("safe_outputs_handlers", () => {
 
     beforeEach(() => {
       const testId = Math.random().toString(36).substring(7);
-      testRunnerTemp = `/tmp/test-runner-temp-${testId}`;
+      testRunnerTemp = path.join(testScratchRoot, `test-runner-temp-${testId}`);
       process.env.RUNNER_TEMP = testRunnerTemp;
     });
 
@@ -412,9 +466,17 @@ describe("safe_outputs_handlers", () => {
     it("should allow files in /tmp directory", () => {
       process.env.GH_AW_ASSETS_BRANCH = "test-branch";
 
-      // Create test file in /tmp
       const testFile = `/tmp/test-upload-${Date.now()}.png`;
-      fs.writeFileSync(testFile, "test content");
+      const localFile = path.join(testWorkspaceDir, "test-upload.png");
+      fs.writeFileSync(localFile, "test content");
+      const originalExistsSync = fs.existsSync;
+      const originalStatSync = fs.statSync;
+      const originalReadFileSync = fs.readFileSync;
+      const originalCopyFileSync = fs.copyFileSync;
+      const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(filePath => filePath === testFile || originalExistsSync(filePath));
+      const statSpy = vi.spyOn(fs, "statSync").mockImplementation((filePath, options) => originalStatSync(filePath === testFile ? localFile : filePath, options));
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((filePath, options) => originalReadFileSync(filePath === testFile ? localFile : filePath, options));
+      const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination, flags) => originalCopyFileSync(source === testFile ? localFile : source, destination, flags));
 
       try {
         const args = { path: testFile };
@@ -423,10 +485,10 @@ describe("safe_outputs_handlers", () => {
         expect(mockAppendSafeOutput).toHaveBeenCalled();
         expect(result.content[0].type).toBe("text");
       } finally {
-        // Clean up
-        if (fs.existsSync(testFile)) {
-          fs.unlinkSync(testFile);
-        }
+        existsSpy.mockRestore();
+        statSpy.mockRestore();
+        readSpy.mockRestore();
+        copySpy.mockRestore();
       }
     });
 
@@ -511,7 +573,7 @@ describe("safe_outputs_handlers", () => {
 
     beforeEach(() => {
       const testId = Math.random().toString(36).substring(7);
-      testStagingDir = `/tmp/test-staging-${testId}`;
+      testStagingDir = path.join(testScratchRoot, `test-staging-${testId}`);
       process.env.RUNNER_TEMP = testStagingDir;
     });
 
@@ -557,7 +619,7 @@ describe("safe_outputs_handlers", () => {
     });
 
     it("should throw when absolute-path file does not exist", () => {
-      expect(() => handlers.uploadArtifactHandler({ path: "/tmp/nonexistent-file.png" })).toThrow(expect.objectContaining({ message: expect.stringContaining("file not found") }));
+      expect(() => handlers.uploadArtifactHandler({ path: path.join(testWorkspaceDir, "nonexistent-file.png") })).toThrow(expect.objectContaining({ message: expect.stringContaining("file not found") }));
     });
 
     it("should throw when path is a symlink", () => {
@@ -702,7 +764,7 @@ describe("safe_outputs_handlers", () => {
     });
 
     it("should reject absolute path outside GITHUB_WORKSPACE and staging directory", () => {
-      const outsideDir = "/tmp/gh-aw-outside-handler-" + Math.random().toString(36).substring(7);
+      const outsideDir = path.join(testScratchRoot, "gh-aw-outside-handler-" + Math.random().toString(36).substring(7));
       try {
         fs.mkdirSync(outsideDir, { recursive: true });
         const outsideFile = path.join(outsideDir, "secret.json");
@@ -743,7 +805,9 @@ describe("safe_outputs_handlers", () => {
       })();
       if (!stat || stat.isSymbolicLink()) return;
 
-      expect(() => handlers.uploadArtifactHandler({ path: "/etc/hosts" })).toThrow(expect.objectContaining({ message: expect.stringContaining("system directory") }));
+      const canonicalPath = fs.realpathSync("/etc/hosts");
+      const rejectionReason = canonicalPath.startsWith("/etc/") ? "system directory" : "outside allowed source roots";
+      expect(() => handlers.uploadArtifactHandler({ path: "/etc/hosts" })).toThrow(expect.objectContaining({ code: -32602, message: expect.stringContaining(rejectionReason) }));
     });
 
     it("should set restrictive permissions (0o600) on staged files", () => {
@@ -764,7 +828,7 @@ describe("safe_outputs_handlers", () => {
 
     beforeEach(() => {
       const testId = Math.random().toString(36).substring(7);
-      testStagingDir = `/tmp/test-staging-${testId}`;
+      testStagingDir = path.join(testScratchRoot, `test-staging-${testId}`);
       process.env.RUNNER_TEMP = testStagingDir;
     });
 
@@ -798,7 +862,7 @@ describe("safe_outputs_handlers", () => {
     });
 
     it("should throw when absolute-path file does not exist", () => {
-      expect(() => handlers.uploadCodeCoverageHandler({ file: "/tmp/nonexistent-cobertura.xml", language: "Go", label: "l" })).toThrow(expect.objectContaining({ message: expect.stringContaining("file not found") }));
+      expect(() => handlers.uploadCodeCoverageHandler({ file: path.join(testWorkspaceDir, "nonexistent-cobertura.xml"), language: "Go", label: "l" })).toThrow(expect.objectContaining({ message: expect.stringContaining("file not found") }));
     });
 
     it("should throw when path is a symlink", () => {
@@ -861,7 +925,7 @@ describe("safe_outputs_handlers", () => {
     });
 
     it("should reject absolute path outside GITHUB_WORKSPACE and staging directory", () => {
-      const outsideDir = "/tmp/gh-aw-outside-coverage-" + Math.random().toString(36).substring(7);
+      const outsideDir = path.join(testScratchRoot, "gh-aw-outside-coverage-" + Math.random().toString(36).substring(7));
       try {
         fs.mkdirSync(outsideDir, { recursive: true });
         const outsideFile = path.join(outsideDir, "secret.xml");
@@ -1879,8 +1943,8 @@ describe("safe_outputs_handlers", () => {
       const responseData = JSON.parse(result.content[0].text);
       expect(responseData.result).toBe("error");
       expect(responseData.error).toContain("Repository 'test-owner/test-repo' not found in workspace");
-      expect(responseData.error).toContain("actions/checkout");
-      expect(responseData.error).toContain("'path' input");
+      expect(responseData.error).toContain("checkout:");
+      expect(responseData.error).toContain("steps:");
     });
 
     it("should return error when configured target-repo checkout is not found and entry.repo is not set", async () => {
@@ -1897,8 +1961,8 @@ describe("safe_outputs_handlers", () => {
       const responseData = JSON.parse(result.content[0].text);
       expect(responseData.result).toBe("error");
       expect(responseData.error).toContain("Repository 'test-owner/test-repo' not found in workspace");
-      expect(responseData.error).toContain("actions/checkout");
-      expect(responseData.error).toContain("'path' input");
+      expect(responseData.error).toContain("checkout:");
+      expect(responseData.error).toContain("steps:");
     });
 
     it("should use patch_workspace_path when target repo resolves from GH_AW_TARGET_REPO_SLUG", async () => {
@@ -2474,11 +2538,9 @@ describe("safe_outputs_handlers", () => {
       }
     });
 
-    describe("full-branch allowed_files check", () => {
+    describe("incremental allowed_files check", () => {
       /**
-       * Creates a git repo whose history contains a file that violates `allowed_files`
-       * (a .js file when only .md is allowed).  Sets up `origin/main` as the tracking ref
-       * so `execGitSync` can compute the range `origin/main..<branch>`.
+       * Creates a PR branch with an author-owned .js file and an agent-owned .md file.
        */
       function createRepoWithDisallowedHistoryFile() {
         const repoDir = path.join(testWorkspaceDir, "allowed-files-repo");
@@ -2506,15 +2568,21 @@ describe("safe_outputs_handlers", () => {
         fs.writeFileSync(path.join(repoDir, "script.js"), "console.log('hi');\n");
         execSync("git add script.js", { cwd: repoDir, stdio: "pipe" });
         execSync("git commit -m 'add script'", { cwd: repoDir, stdio: "pipe" });
+        const prHeadSha = execSync("git rev-parse HEAD", { cwd: repoDir, stdio: "pipe" }).toString().trim();
 
-        // Set up origin/main tracking ref
+        fs.writeFileSync(path.join(repoDir, "agent.md"), "agent change\n");
+        execSync("git add agent.md", { cwd: repoDir, stdio: "pipe" });
+        execSync("git commit -m 'agent change'", { cwd: repoDir, stdio: "pipe" });
+
+        // Set up tracking refs at the original PR head.
         execSync("git remote add origin https://github.com/test-owner/test-repo.git", { cwd: repoDir, stdio: "pipe" });
         execSync(`git update-ref refs/remotes/origin/main ${mainSha}`, { cwd: repoDir, stdio: "pipe" });
+        execSync(`git update-ref refs/remotes/origin/feature/work ${prHeadSha}`, { cwd: repoDir, stdio: "pipe" });
 
         return { repoDir };
       }
 
-      it("returns isError when branch history contains a file outside allowed_files", async () => {
+      it("does not reject author-owned files outside allowed_files", async () => {
         let repoDir;
         try {
           ({ repoDir } = createRepoWithDisallowedHistoryFile());
@@ -2534,13 +2602,36 @@ describe("safe_outputs_handlers", () => {
         try {
           const result = await localHandlers.pushToPullRequestBranchHandler({ branch: "feature/work" });
 
+          expect(mockServer.debug).toHaveBeenCalledWith(expect.stringContaining("Generating incremental patch for push_to_pull_request_branch"));
+          if (result.isError) {
+            const data = JSON.parse(result.content[0].text);
+            expect(data.error).not.toContain("allowed-files configuration");
+            expect(data.disallowed_files).toBeUndefined();
+          }
+        } finally {
+          delete process.env.GITHUB_BASE_REF;
+          process.env.GITHUB_WORKSPACE = testWorkspaceDir;
+        }
+      });
+
+      it("rejects disallowed files introduced after the existing PR head", async () => {
+        const { repoDir } = createRepoWithDisallowedHistoryFile();
+        fs.writeFileSync(path.join(repoDir, "agent.js"), "console.log('agent');\n");
+        execSync("git add agent.js", { cwd: repoDir, stdio: "pipe" });
+        execSync("git commit -m 'agent script'", { cwd: repoDir, stdio: "pipe" });
+        execSync("git rm agent.js", { cwd: repoDir, stdio: "pipe" });
+        execSync("git commit -m 'revert agent script'", { cwd: repoDir, stdio: "pipe" });
+
+        process.env.GITHUB_BASE_REF = "main";
+        process.env.GITHUB_WORKSPACE = repoDir;
+        const localHandlers = createHandlers(mockServer, mockAppendSafeOutput, {
+          push_to_pull_request_branch: { allowed_files: ["*.md"] },
+        });
+        try {
+          const result = await localHandlers.pushToPullRequestBranchHandler({ branch: "feature/work" });
           expect(result.isError).toBe(true);
           const data = JSON.parse(result.content[0].text);
-          expect(data.result).toBe("error");
-          expect(data.error).toContain("allowed-files");
-          expect(data.disallowed_files).toBeDefined();
-          expect(data.disallowed_files).toContain("script.js");
-          // Safe output must NOT have been recorded for a disallowed branch
+          expect(data.disallowed_files).toEqual(["agent.js"]);
           expect(mockAppendSafeOutput).not.toHaveBeenCalled();
         } finally {
           delete process.env.GITHUB_BASE_REF;
@@ -2548,7 +2639,34 @@ describe("safe_outputs_handlers", () => {
         }
       });
 
-      it("does not block when all branch history files are within allowed_files", async () => {
+      it("does not reject disallowed files merged from the updated base branch", async () => {
+        const { repoDir } = createRepoWithDisallowedHistoryFile();
+        execSync("git checkout main", { cwd: repoDir, stdio: "pipe" });
+        fs.writeFileSync(path.join(repoDir, "upstream.js"), "console.log('upstream');\n");
+        execSync("git add upstream.js", { cwd: repoDir, stdio: "pipe" });
+        execSync("git commit -m 'update base branch'", { cwd: repoDir, stdio: "pipe" });
+        execSync("git checkout feature/work", { cwd: repoDir, stdio: "pipe" });
+        execSync("git merge --no-ff main -m 'merge updated base'", { cwd: repoDir, stdio: "pipe" });
+
+        process.env.GITHUB_BASE_REF = "main";
+        process.env.GITHUB_WORKSPACE = repoDir;
+        const localHandlers = createHandlers(mockServer, mockAppendSafeOutput, {
+          push_to_pull_request_branch: { allowed_files: ["*.md"] },
+        });
+        try {
+          const result = await localHandlers.pushToPullRequestBranchHandler({ branch: "feature/work" });
+          if (result.isError) {
+            const data = JSON.parse(result.content[0].text);
+            expect(data.error).not.toContain("allowed-files configuration");
+            expect(data.disallowed_files).toBeUndefined();
+          }
+        } finally {
+          delete process.env.GITHUB_BASE_REF;
+          process.env.GITHUB_WORKSPACE = testWorkspaceDir;
+        }
+      });
+
+      it("does not block when agent files are within allowed_files", async () => {
         const repoDir = path.join(testWorkspaceDir, "allowed-files-ok-repo");
         fs.mkdirSync(repoDir, { recursive: true });
         try {
@@ -2607,7 +2725,10 @@ describe("safe_outputs_handlers", () => {
 
         process.env.GITHUB_BASE_REF = "main";
         process.env.GITHUB_WORKSPACE = repoDir;
-        // excluded_files exempts .js files, so script.js should not trigger the error
+        fs.writeFileSync(path.join(repoDir, "agent.js"), "console.log('agent');\n");
+        execSync("git add agent.js", { cwd: repoDir, stdio: "pipe" });
+        execSync("git commit -m 'agent script'", { cwd: repoDir, stdio: "pipe" });
+        // excluded_files exempts the agent's .js file.
         const localHandlers = createHandlers(mockServer, mockAppendSafeOutput, {
           push_to_pull_request_branch: {
             allowed_files: ["*.md"],
@@ -2630,7 +2751,7 @@ describe("safe_outputs_handlers", () => {
         }
       });
 
-      it("is non-fatal when origin/baseBranch is not available (continues without blocking)", async () => {
+      it("is non-fatal when the remote PR head is not available (continues without blocking)", async () => {
         const repoDir = path.join(testWorkspaceDir, "no-origin-repo");
         fs.mkdirSync(repoDir, { recursive: true });
         try {
@@ -2643,11 +2764,11 @@ describe("safe_outputs_handlers", () => {
           execSync("git commit -m 'base'", { cwd: repoDir, stdio: "pipe" });
 
           execSync("git checkout -b feature/work", { cwd: repoDir, stdio: "pipe" });
-          // Add a disallowed file — but since origin/main is absent the check must be skipped
+          // Add a disallowed file — but since the remote PR head is absent the check must be skipped
           fs.writeFileSync(path.join(repoDir, "script.js"), "// disallowed\n");
           execSync("git add script.js", { cwd: repoDir, stdio: "pipe" });
           execSync("git commit -m 'disallowed file'", { cwd: repoDir, stdio: "pipe" });
-          // No remote / no origin/main tracking ref
+          // No remote / no remote PR head tracking ref
         } catch {
           return;
         }
@@ -2979,7 +3100,7 @@ describe("safe_outputs_handlers", () => {
       }
     });
 
-    it("should write entry when explicit item_number bypasses context check in non-issue/PR event", () => {
+    it("should reject explicit item_number when triggering context cannot be resolved", () => {
       const savedContext = global.context;
       global.context = { ...global.context, eventName: "push", payload: {} };
       try {
@@ -2987,10 +3108,11 @@ describe("safe_outputs_handlers", () => {
           body: "A real comment body that is substantive enough",
           item_number: 42,
         });
-        expect(result.isError).toBeUndefined();
+        expect(result.isError).toBe(true);
         const responseData = JSON.parse(result.content[0].text);
-        expect(responseData.result).toBe("success");
-        expect(mockAppendSafeOutput).toHaveBeenCalledWith(expect.objectContaining({ type: "add_comment", item_number: 42 }));
+        expect(responseData.result).toBe("error");
+        expect(responseData.error).toContain('safe-outputs.add-comment.target to "*"');
+        expect(mockAppendSafeOutput).not.toHaveBeenCalled();
       } finally {
         global.context = savedContext;
       }
@@ -3204,7 +3326,7 @@ describe("safe_outputs_handlers", () => {
 
     beforeEach(() => {
       const testId = Math.random().toString(36).substring(7);
-      memoryDir = `/tmp/test-repo-memory-${testId}`;
+      memoryDir = path.join(testScratchRoot, `test-repo-memory-${testId}`);
     });
 
     afterEach(() => {
@@ -3302,10 +3424,7 @@ describe("safe_outputs_handlers", () => {
       expect(data.error).toContain("3 files");
     });
 
-    it("should ignore ineligible files (disallowed extension) instead of hard-failing on file count", () => {
-      // Regression: the preflight must apply the same allowed-extensions/file-glob
-      // filtering as the agent-side filter step and the push job, so an ineligible
-      // file left in the memory directory does not cause a hard preflight failure.
+    it("should preserve ineligible files (disallowed extension) while excluding them from validation", () => {
       const h = makeHandlersWithMemory({ max_file_count: 1, allowed_extensions: [".json"] });
       fs.mkdirSync(memoryDir, { recursive: true });
       initGitRepo(memoryDir);
@@ -3315,11 +3434,12 @@ describe("safe_outputs_handlers", () => {
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
       expect(data.result).toBe("success");
-      expect(fs.existsSync(path.join(memoryDir, "notes.json.new"))).toBe(false);
+      expect(data.storage_validation.files).toBe(1);
+      expect(fs.existsSync(path.join(memoryDir, "notes.json.new"))).toBe(true);
       expect(fs.existsSync(path.join(memoryDir, "notes.json"))).toBe(true);
     });
 
-    it("should ignore files not matching file_glob before counting/staging", () => {
+    it("should preserve files not matching file_glob while excluding them from validation", () => {
       const h = makeHandlersWithMemory({ max_file_count: 1, file_glob: "*.json" });
       fs.mkdirSync(memoryDir, { recursive: true });
       initGitRepo(memoryDir);
@@ -3329,8 +3449,122 @@ describe("safe_outputs_handlers", () => {
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
       expect(data.result).toBe("success");
-      expect(fs.existsSync(path.join(memoryDir, "notes.md"))).toBe(false);
+      expect(data.storage_validation.files).toBe(1);
+      expect(fs.existsSync(path.join(memoryDir, "notes.md"))).toBe(true);
       expect(fs.existsSync(path.join(memoryDir, "notes.json"))).toBe(true);
+    });
+
+    it("should preserve all files in the memory directory during validation", () => {
+      const h = makeHandlersWithMemory({ allowed_extensions: [".md"], file_glob: "deep-report/*.md", max_file_count: 10 });
+      fs.mkdirSync(memoryDir, { recursive: true });
+      initGitRepo(memoryDir);
+
+      const paths = [...Array.from({ length: 6 }, (_, index) => `deep-report/file-${index}.md`), "memory/deep-report/legacy.md", "memory/default/legacy.md"];
+      for (const relativePath of paths) {
+        const fullPath = path.join(memoryDir, relativePath);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, `${relativePath}\n`);
+      }
+
+      const result = h.pushRepoMemoryHandler({ memory_id: "default" });
+      const data = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBeUndefined();
+      expect(data.result).toBe("success");
+      expect(data.storage_validation.files).toBe(6);
+      for (const relativePath of paths) {
+        expect(fs.readFileSync(path.join(memoryDir, relativePath), "utf8")).toBe(`${relativePath}\n`);
+      }
+    });
+
+    it.each(["canonical", "aliased"])("should format and custom-validate only eligible JSON files (%s temporary root)", temporaryRoot => {
+      const legacyJson = JSON.stringify(Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`k${index}`, "x"])));
+      const maxFileSize = Buffer.byteLength(legacyJson, "utf8") + 1;
+      expect(Buffer.byteLength(`${JSON.stringify(JSON.parse(legacyJson), null, 2)}\n`, "utf8")).toBeGreaterThan(maxFileSize);
+      const malformedJson = "{invalid";
+      const h = makeHandlersWithMemory({
+        file_glob: "state.json",
+        format_json: true,
+        max_file_size: maxFileSize,
+        max_file_count: 1,
+        validation: {
+          script: `
+            const jsonFiles = fs.readdirSync(memoryRoot).filter(file => file.endsWith(".json"));
+            if (jsonFiles.length !== 1 || jsonFiles[0] !== "state.json") throw new Error("unexpected JSON files in validation view");
+            if (fs.realpathSync(memoryRoot) !== process.cwd()) throw new Error("validation working directory does not match memory root");
+            JSON.parse(fs.readFileSync("state.json", "utf8"));
+          `,
+          timeout: 5,
+        },
+      });
+      fs.mkdirSync(memoryDir, { recursive: true });
+      initGitRepo(memoryDir);
+      fs.writeFileSync(path.join(memoryDir, "state.json"), '{"ok":true}');
+      fs.writeFileSync(path.join(memoryDir, "legacy.json"), legacyJson);
+      fs.writeFileSync(path.join(memoryDir, "malformed.json"), malformedJson);
+
+      const validationTemp = path.join(testWorkspaceDir, "validation-tmp");
+      fs.mkdirSync(validationTemp);
+      const canonicalTemp = fs.realpathSync(validationTemp);
+      const aliasTemp = path.join(testWorkspaceDir, "validation-tmp-alias");
+      if (temporaryRoot === "aliased") fs.symlinkSync(canonicalTemp, aliasTemp, "junction");
+      const previousTemp = process.env.TMPDIR;
+      process.env.TMPDIR = temporaryRoot === "aliased" ? aliasTemp : canonicalTemp;
+      try {
+        const result = h.pushRepoMemoryHandler({ memory_id: "default" });
+        const data = JSON.parse(result.content[0].text);
+
+        expect(result.isError, data.custom_validation?.stderr || data.error).toBeUndefined();
+        expect(data.result).toBe("success");
+        expect(data.storage_validation.files).toBe(1);
+        expect(data.custom_validation.result).toBe("success");
+        expect(fs.readFileSync(path.join(memoryDir, "state.json"), "utf8")).toBe('{\n  "ok": true\n}\n');
+        expect(fs.readFileSync(path.join(memoryDir, "legacy.json"), "utf8")).toBe(legacyJson);
+        expect(fs.readFileSync(path.join(memoryDir, "malformed.json"), "utf8")).toBe(malformedJson);
+      } finally {
+        if (previousTemp === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previousTemp;
+      }
+    });
+
+    it("should keep custom validation read-only when using the filtered view", () => {
+      const originalState = '{"ok":true}';
+      const h = makeHandlersWithMemory({
+        file_glob: "state.json",
+        validation: {
+          script: `fs.writeFileSync(path.join(memoryRoot, "state.json"), '{"ok":false}');`,
+          timeout: 5,
+        },
+      });
+      fs.mkdirSync(memoryDir, { recursive: true });
+      initGitRepo(memoryDir);
+      fs.writeFileSync(path.join(memoryDir, "state.json"), originalState);
+
+      const result = h.pushRepoMemoryHandler({ memory_id: "default" });
+      const data = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBe(true);
+      expect(data.custom_validation.stderr).toContain("must not modify memory files");
+      expect(fs.readFileSync(path.join(memoryDir, "state.json"), "utf8")).toBe(originalState);
+    });
+
+    it("should measure only eligible staged files without changing excluded index entries", () => {
+      const h = makeHandlersWithMemory({ file_glob: "state.json", max_file_size: 1024, max_file_count: 1, max_patch_size: 10 });
+      fs.mkdirSync(memoryDir, { recursive: true });
+      initGitRepo(memoryDir);
+      fs.writeFileSync(path.join(memoryDir, "state.json"), "{}");
+      fs.writeFileSync(path.join(memoryDir, "legacy.json"), "x".repeat(1000));
+      execSync("git add legacy.json", { cwd: memoryDir, stdio: "pipe" });
+      const stagedLegacyBefore = execSync("git show :legacy.json", { cwd: memoryDir, encoding: "utf8" });
+
+      const result = h.pushRepoMemoryHandler({ memory_id: "default" });
+      const data = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBeUndefined();
+      expect(data.result).toBe("success");
+      expect(data.storage_validation.patch_size_bytes).toBeLessThanOrEqual(12);
+      expect(execSync("git show :legacy.json", { cwd: memoryDir, encoding: "utf8" })).toBe(stagedLegacyBefore);
+      expect(execSync("git diff --cached --name-only", { cwd: memoryDir, encoding: "utf8" }).trim().split("\n")).toEqual(["legacy.json", "state.json"]);
     });
 
     it("should pass when total folder size is large but staged diff is tiny", () => {
@@ -4040,7 +4274,21 @@ describe("safe_outputs_handlers", () => {
     });
   });
 
-  describe("jiraUpdateIssueHandler", () => {
+  describe("Jira handlers", () => {
+    it("assigns a temporary ID when recording issue creation", () => {
+      const result = handlers.jiraCreateIssueHandler({ project_key: "ENG", issue_type: "Task", summary: "Smoke test" });
+      const response = JSON.parse(result.content[0].text);
+
+      expect(response).toMatchObject({ result: "success", temporary_id: expect.stringMatching(/^#aw_[A-Za-z0-9]{8}$/) });
+      expect(result.structuredContent).toEqual(response);
+      expect(mockAppendSafeOutput).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "jira_create_issue",
+          temporary_id: response.temporary_id,
+        })
+      );
+    });
+
     it.each([{}, { summary: "" }, { description: "   " }])("rejects updates without a non-empty field", args => {
       const result = handlers.jiraUpdateIssueHandler(args);
       expect(result.isError).toBe(true);
@@ -4060,6 +4308,34 @@ describe("safe_outputs_handlers", () => {
   });
 
   describe("updateIssueHandler", () => {
+    it.each([undefined, null, {}, { issue_number: 42 }, { operation: "append" }, { secrecy: "public", integrity: "high" }, { status: "" }, { labels: " " }, { milestone: " \t\n" }])(
+      "should reject calls without update fields before recording an output: %j",
+      args => {
+        const wildcardHandlers = createHandlers(mockServer, mockAppendSafeOutput, {
+          "update-issue": { target: "*" },
+        });
+        expect(() => wildcardHandlers.updateIssueHandler(args)).toThrow(
+          expect.objectContaining({
+            code: -32602,
+            message: expect.stringContaining("update_issue requires at least one of"),
+          })
+        );
+        expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each([{ status: "open" }, { title: "Updated title" }, { body: "Updated body" }, { body: "" }, { labels: [] }, { assignees: [] }, { milestone: 1 }, { milestone: null }])(
+      "should accept each update field independently, including explicit clears: %j",
+      update => {
+        const wildcardHandlers = createHandlers(mockServer, mockAppendSafeOutput, {
+          "update-issue": { target: "*" },
+        });
+        const result = wildcardHandlers.updateIssueHandler({ issue_number: 42, ...update });
+        expect(result.isError).toBeUndefined();
+        expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "update_issue", issue_number: 42, ...update });
+      }
+    );
+
     it("should return intent error when target is triggering (default) and not in issue context", () => {
       // global.context has eventName: "push" (not an issue context)
       const result = handlers.updateIssueHandler({ body: "Updated body" });
@@ -4694,6 +4970,23 @@ describe("per-type max enforcement (MCE4 dual enforcement)", () => {
     );
     // No additional append after limit
     expect(mockAppendSafeOutput).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not record or count probing noop calls against the configured max", () => {
+    const h = createHandlers(mockServer, mockAppendSafeOutput, {
+      noop: { max: 1 },
+    });
+
+    // A probing call such as {"message": "test"} is ignored entirely, so it must neither
+    // be recorded nor consume the budget reserved for the real completion signal.
+    expect(h.defaultHandler("noop")({ message: "test" })).not.toHaveProperty("isError");
+    expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+
+    expect(h.defaultHandler("noop")({ message: "Analysis complete - no issues found" })).not.toHaveProperty("isError");
+    expect(mockAppendSafeOutput).toHaveBeenCalledTimes(1);
+
+    expect(() => h.defaultHandler("noop")({ message: "Second real noop" })).toThrow(expect.objectContaining({ code: -32602, message: expect.stringContaining("E002") }));
+    expect(mockAppendSafeOutput).toHaveBeenCalledTimes(1);
   });
 
   it("rejects immediately when max is 0 and config uses hyphen-keyed type (key normalisation)", () => {

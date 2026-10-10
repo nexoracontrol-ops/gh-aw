@@ -19,14 +19,39 @@ import (
 func renderAuditReport(ctx context.Context, processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData, opts AuditOptions) error {
 	runID := processedRun.Run.DatabaseID
 	runOutputDir := opts.OutputDir
+	auditLog.Printf("Rendering audit report for run %d (noBaseline=%t, group=%t)", runID, opts.NoBaseline, opts.Group)
 	processedRun.Run.SafeItemsCount = len(resolveCreatedItems(runOutputDir, processedRun.SafeOutputs))
 	auditData, ok := loadCachedAuditData(runOutputDir, processedRun.Run, auditCacheSourceFull)
-	if !ok {
+	if ok {
+		// A cached entry always carries the default (baseline) comparison, so drop it
+		// when the caller opted out of baseline comparison.
+		if opts.NoBaseline {
+			auditData.Comparison = noBaselineComparison()
+		}
+	} else {
 		auditData = buildRenderedAuditDataFromCache(ctx, processedRun, metrics, mcpToolUsage, runOutputDir, opts)
 		auditData.CacheSource = auditCacheSourceFull
+		auditData.SchemaVersion = auditSchemaVersion
+		// Never persist an opt-out result: it would be reused as the full cache entry
+		// by a later default audit and suppress its baseline comparison.
+		if !opts.NoBaseline {
+			if err := writeAuditData(runOutputDir, auditData); err != nil {
+				return err
+			}
+		}
+	}
+	if auditData.Ledger == nil {
+		auditData.Ledger = processedRun.Ledger
+	}
+	// NoBaseline runs avoid writing audit-cache changes, including queue backfills.
+	if mergeWorkQueueReport(&auditData.WorkQueue, processedRun.WorkQueue) && !opts.NoBaseline {
 		if err := writeAuditData(runOutputDir, auditData); err != nil {
 			return err
 		}
+	}
+	if opts.Group {
+		parseAuditLogsIfRequested(runID, runOutputDir, opts)
+		return nil
 	}
 	if err := renderAuditOutput(auditData, runOutputDir, opts.JSONOutput, opts.Verbose); err != nil {
 		return err
@@ -43,20 +68,34 @@ func buildRenderedAuditDataFromCache(ctx context.Context, processedRun Processed
 	if !ok {
 		return buildRenderedAuditData(ctx, processedRun, metrics, mcpToolUsage, runOutputDir, opts)
 	}
+	if auditData.Ledger == nil {
+		auditData.Ledger = processedRun.Ledger
+	}
+	mergeWorkQueueReport(&auditData.WorkQueue, processedRun.WorkQueue)
 	createdItems := resolveCreatedItems(runOutputDir, processedRun.SafeOutputs)
 	addAuditOutcomeSummary(ctx, &auditData, createdItems)
-	currentSnapshot := buildAuditComparisonSnapshot(processedRun, createdItems)
-	auditData.Comparison = buildAuditComparisonForRun(ctx, processedRun, currentSnapshot, runOutputDir, opts.Owner, opts.Repo, opts.Hostname, opts.Verbose)
+	auditData.Comparison = buildRenderedAuditComparison(ctx, processedRun, createdItems, runOutputDir, opts)
 	return auditData
 }
 
 func buildRenderedAuditData(ctx context.Context, processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData, runOutputDir string, opts AuditOptions) AuditData {
 	currentCreatedItems := resolveCreatedItems(runOutputDir, processedRun.SafeOutputs)
-	currentSnapshot := buildAuditComparisonSnapshot(processedRun, currentCreatedItems)
-	comparison := buildAuditComparisonForRun(ctx, processedRun, currentSnapshot, runOutputDir, opts.Owner, opts.Repo, opts.Hostname, opts.Verbose)
 	auditData := buildAuditData(ctx, processedRun, metrics, mcpToolUsage)
-	auditData.Comparison = comparison
+	auditData.Comparison = buildRenderedAuditComparison(ctx, processedRun, currentCreatedItems, runOutputDir, opts)
 	return auditData
+}
+
+func buildRenderedAuditComparison(ctx context.Context, processedRun ProcessedRun, createdItems []CreatedItemReport, runOutputDir string, opts AuditOptions) *AuditComparisonData {
+	if opts.NoBaseline {
+		return noBaselineComparison()
+	}
+	currentSnapshot := buildAuditComparisonSnapshot(processedRun, createdItems)
+	return buildAuditComparisonForRun(ctx, processedRun, currentSnapshot, runOutputDir, opts.Owner, opts.Repo, opts.Hostname, opts.Verbose)
+}
+
+// noBaselineComparison is the comparison payload used when baseline discovery is disabled.
+func noBaselineComparison() *AuditComparisonData {
+	return &AuditComparisonData{BaselineFound: false}
 }
 
 func renderAuditOutput(auditData AuditData, runOutputDir string, jsonOutput, verbose bool) error {
@@ -101,20 +140,25 @@ func parseAuditLogsIfRequested(runID int64, runOutputDir string, opts AuditOptio
 	if !opts.Parse {
 		return
 	}
+	auditLog.Printf("Parsing agent and firewall logs for run %d", runID)
 	parseAgentLogIfRequested(runID, runOutputDir, opts.Verbose)
 	parseFirewallLogsIfRequested(runID, runOutputDir, opts.Verbose)
 }
 
 func parseAgentLogIfRequested(runID int64, runOutputDir string, verbose bool) {
-	awInfoPath := filepath.Join(runOutputDir, "aw_info.json")
-	engine := extractEngineFromAwInfo(awInfoPath, verbose)
-	if engine == nil {
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No engine detected (aw_info.json missing or invalid); skipping agent log rendering"))
+	rendered, err := parsePersistedAgentLog(runOutputDir)
+	if !rendered && err == nil {
+		awInfoPath := filepath.Join(runOutputDir, "aw_info.json")
+		engine := extractEngineFromAwInfo(awInfoPath, verbose)
+		if engine == nil {
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("No engine detected (aw_info.json missing or invalid); skipping agent log rendering"))
+			}
+			return
 		}
-		return
+		err = parseAgentLog(runOutputDir, engine, verbose)
 	}
-	if err := parseAgentLog(runOutputDir, engine, verbose); err != nil {
+	if err != nil {
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to parse agent log for run %d: %v", runID, err)))
 		}
@@ -122,7 +166,7 @@ func parseAgentLogIfRequested(runID int64, runOutputDir string, verbose bool) {
 	}
 	logMdPath := filepath.Join(runOutputDir, "log.md")
 	if fileutil.FileExists(logMdPath) {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed log for run %d → %s", runID, logMdPath)))
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Parsed log for run %d → %s", runID, logMdPath)))
 	}
 }
 
@@ -135,7 +179,7 @@ func parseFirewallLogsIfRequested(runID int64, runOutputDir string, verbose bool
 	}
 	firewallMdPath := filepath.Join(runOutputDir, "firewall.md")
 	if fileutil.FileExists(firewallMdPath) {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed firewall logs for run %d → %s", runID, firewallMdPath)))
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Parsed firewall logs for run %d → %s", runID, firewallMdPath)))
 	}
 }
 
@@ -143,6 +187,7 @@ func renderAuditCompletion(runOutputDir string, jsonOutput bool) {
 	if jsonOutput {
 		return
 	}
+	auditLog.Printf("Audit complete for %s", runOutputDir)
 	absOutputDir, _ := filepath.Abs(runOutputDir)
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Audit complete. Logs saved to "+absOutputDir))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Tip: use --artifacts to select specific artifact sets (agent, firewall, mcp, activation, detection, etc.)"))

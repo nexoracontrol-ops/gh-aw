@@ -24,6 +24,15 @@ func applyDefaultMaxAICreditsEnvToMap(env map[string]string, workflowData *Workf
 	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxAICredits != 0 {
 		return
 	}
+	if workflowData != nil && workflowData.DryRun {
+		if value, ok := workflowData.RawFrontmatter["max-ai-credits"].(string); ok && isExpression(value) {
+			if env[awfMaxAICreditsVarName] != value {
+				compilerDevelopmentLog.Printf("Dry-run mutation: set %s from max-ai-credits", awfMaxAICreditsVarName)
+			}
+			env[awfMaxAICreditsVarName] = value
+			return
+		}
+	}
 	if workflowData != nil && workflowData.IsEvalsRun {
 		env[awfMaxAICreditsVarName] = compilerenv.BuildDefaultEvalsMaxAICreditsExpression(strconv.FormatInt(constants.DefaultDetectionMaxAICredits, 10))
 		return
@@ -98,6 +107,9 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 	for _, name := range coreSecretVarNames {
 		addUnique(name)
 	}
+	for _, name := range fallbackProviderSecretNames(workflowData) {
+		addUnique(name)
+	}
 
 	// MCP gateway agent ID is always a secret when MCP servers are present.
 	if HasMCPServers(workflowData) {
@@ -124,7 +136,7 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 	if workflowData.MCPScripts != nil {
 		for _, toolConfig := range workflowData.MCPScripts.Tools {
 			for envName, envValue := range toolConfig.Env {
-				if strings.Contains(envValue, "${{ secrets.") || ContainsJobOutputExpr(envValue) {
+				if len(ExtractSecretsFromValue(envValue)) > 0 || ContainsJobOutputExpr(envValue) {
 					addUnique(envName)
 				}
 			}
@@ -134,7 +146,7 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 	// engine.env vars that contain a secret reference or a job-output expression.
 	if workflowData.EngineConfig != nil {
 		for varName, varValue := range workflowData.EngineConfig.Env {
-			if strings.Contains(varValue, "${{ secrets.") || ContainsJobOutputExpr(varValue) {
+			if len(ExtractSecretsFromValue(varValue)) > 0 || ContainsJobOutputExpr(varValue) {
 				addUnique(varName)
 			}
 		}
@@ -144,7 +156,7 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 	agentConfig := getAgentConfig(workflowData)
 	if agentConfig != nil {
 		for varName, varValue := range agentConfig.Env {
-			if strings.Contains(varValue, "${{ secrets.") || ContainsJobOutputExpr(varValue) {
+			if len(ExtractSecretsFromValue(varValue)) > 0 || ContainsJobOutputExpr(varValue) {
 				addUnique(varName)
 			}
 		}
@@ -166,6 +178,12 @@ func ComputeAWFExcludeEnvVarNames(workflowData *WorkflowData, coreSecretVarNames
 		addUnique(enclaveMCPGatewayEndpointEnv)
 		addUnique(enclaveMCPGatewayIdentityEnv)
 		addUnique(enclaveMCPReadinessTimeoutEnv)
+	}
+	if hasCloudHypervisorEnclaves(workflowData) {
+		addUnique("AWF_CLOUD_HYPERVISOR_ENCLAVE_SCRIPT_ROOTFS")
+		addUnique("AWF_CLOUD_HYPERVISOR_ENCLAVE_AGENT_ROOTFS")
+		addUnique("AWF_CLOUD_HYPERVISOR_ENCLAVE_MANIFEST")
+		addUnique("AWF_CLOUD_HYPERVISOR_ENCLAVE_MANIFEST_BUNDLE")
 	}
 	if enclaveGitHubIssuesEnabled(workflowData) {
 		addUnique(enclaveGitHubMCPAgentIDEnv)

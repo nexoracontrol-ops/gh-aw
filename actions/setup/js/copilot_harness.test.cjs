@@ -20,7 +20,6 @@ const {
   buildCopilotProxyAuthFailureDiagnostic,
   buildCopilotSDKChildEnv,
   envFlagEnabled,
-  buildPromptFileFallbackInstruction,
   countPermissionDeniedIssues,
   detectCopilotErrors,
   emitInfrastructureIncomplete,
@@ -50,12 +49,18 @@ const {
   generateCopilotConnectionToken,
   GEMINI_MODEL_NAME_PREFIX,
   isCAPIQuotaExceededError,
+  isCAPIServerError,
   isHTTP400ResponseError,
+  isToolCallIdSchemaError,
   isSDKSessionIdleTimeoutError,
   PROMPT_FILE_INLINE_THRESHOLD_BYTES,
-  resolvePromptFileArgs,
+  resolvePromptFileInput,
   resolveRetryConfig,
   shouldRetryFailedExecution,
+  shouldContinueCopilotSessionAfterFailure,
+  resolveAWFModelRoutingSelection,
+  applyCopilotRoutingSelection,
+  applyCopilotRoutingArgs,
   isCrashSignalExitCode,
   crashSignalNameForExitCode,
   writeCopilotOutputs,
@@ -128,6 +133,119 @@ function withTemporaryPromptTemplate(prefix, sourceTemplateDir, promptDirResolve
 }
 
 describe("copilot_harness.cjs", () => {
+  describe("AWF task-level model routing", () => {
+    const routingEnvKeys = ["GH_AW_MODEL_ROUTING", "GH_AW_COPILOT_ROUTING_EFFORT", "GH_AW_TMP_DIR", "COPILOT_MODEL", "COPILOT_PROVIDER_WIRE_API"];
+    const originalRoutingEnv = Object.fromEntries(routingEnvKeys.map(key => [key, process.env[key]]));
+
+    afterEach(() => {
+      for (const key of routingEnvKeys) {
+        if (originalRoutingEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = originalRoutingEnv[key];
+        }
+      }
+    });
+
+    it("requires a selected route when routing is enabled", () => {
+      expect(resolveAWFModelRoutingSelection({ routing: { status: "pending" } }, true).error).toContain("pending");
+      expect(resolveAWFModelRoutingSelection({ routing: { status: "failed", failure_code: "no_route" } }, true).error).toContain("no_route");
+    });
+
+    it("applies the selected model, endpoint and effort over existing values", () => {
+      process.env.COPILOT_MODEL = "configured-model";
+      process.env.COPILOT_PROVIDER_WIRE_API = "completions";
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-routing-outcome-"));
+      process.env.GH_AW_TMP_DIR = tmpDir;
+      process.env.GH_AW_MODEL_ROUTING = "1";
+      try {
+        const messages = [];
+        const result = resolveAWFModelRoutingSelection(
+          {
+            routing: {
+              status: "selected",
+              selection: {
+                provider: "copilot",
+                model: "github-copilot/gpt-5.4-mini",
+                wire_model: "gpt-5.4-mini",
+                effort: "xhigh",
+                endpoint: "/responses",
+                selected_endpoint: "/chat/completions",
+              },
+            },
+            endpoints: [{ provider: "copilot", configured: true, models: ["gpt-5.4-mini"] }],
+          },
+          true
+        );
+        expect(result.error).toBeNull();
+        applyCopilotRoutingSelection(result.selection, message => messages.push(message));
+        expect(process.env.COPILOT_MODEL).toBe("gpt-5.4-mini");
+        expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("responses");
+        expect(process.env.GH_AW_COPILOT_ROUTING_EFFORT).toBe("xhigh");
+        expect(messages[0]).toContain("inference routing: mode=awf-routed");
+        expect(JSON.parse(fs.readFileSync(path.join(tmpDir, "agent", "awf-routing-outcome.json"), "utf8"))).toMatchObject({
+          endpoint: "/responses",
+          selected_endpoint: "/responses",
+        });
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("removes compile-time model and effort flags when the route has no effort", () => {
+      const args = ["--model", "small", "--reasoning-effort=high", "--silent"];
+      expect(applyCopilotRoutingArgs(args, { wire_model: "claude-haiku-4.5", effort: null })).toEqual(["--silent", "--model", "claude-haiku-4.5"]);
+    });
+
+    it.each(["none", "max"])("accepts router-selected reasoning effort %s", effort => {
+      const result = resolveAWFModelRoutingSelection(
+        {
+          routing: {
+            status: "selected",
+            selection: { provider: "copilot", model: "github-copilot/gpt-6-astra", wire_model: "gpt-6-astra", effort: ` ${effort.toUpperCase()} `, endpoint: "/responses" },
+          },
+          endpoints: [{ provider: "copilot", configured: true, models: ["gpt-6-astra"] }],
+        },
+        true
+      );
+      expect(result.error).toBeNull();
+      expect(result.selection?.effort).toBe(effort);
+      const messages = [];
+      applyCopilotRoutingSelection(result.selection, message => messages.push(message));
+      expect(process.env.GH_AW_COPILOT_ROUTING_EFFORT).toBe(effort);
+      expect(messages[0]).toContain(`effort=${effort}`);
+      expect(applyCopilotRoutingArgs(["--model", "small", "--reasoning-effort", "high"], { wire_model: "gpt-6-astra", effort })).toEqual(["--model", "gpt-6-astra", "--reasoning-effort", effort]);
+    });
+
+    it("rejects unknown router-selected reasoning efforts", () => {
+      const result = resolveAWFModelRoutingSelection(
+        {
+          routing: {
+            status: "selected",
+            selection: { provider: "copilot", model: "github-copilot/gpt-6-astra", wire_model: "gpt-6-astra", effort: "extreme", endpoint: "/responses" },
+          },
+          endpoints: [{ provider: "copilot", configured: true, models: ["gpt-6-astra"] }],
+        },
+        true
+      );
+      expect(result.selection).toBeNull();
+      expect(result.error).toContain("unsupported reasoning effort extreme");
+    });
+
+    it("does not set a routing effort when the route has no effort", () => {
+      process.env.GH_AW_COPILOT_ROUTING_EFFORT = "high";
+      const messages = [];
+      applyCopilotRoutingSelection({ wire_model: "gpt-6-astra", effort: null, endpoint: "/responses" }, message => messages.push(message));
+      expect(process.env.GH_AW_COPILOT_ROUTING_EFFORT).toBeUndefined();
+      expect(messages[0]).toContain("effort=(unset)");
+    });
+
+    it("classifies routing exit 78 as terminal", () => {
+      expect(classifyCopilotFailure({ hasOutput: true, isModelRoutingFailure: true })).toBe("model_routing_failed");
+      expect(shouldRetryFailedExecution({ exitCode: 78, hasOutput: true, output: "router failed", attempt: 0, maxRetries: 3, isModelRoutingFailure: true })).toBe(false);
+    });
+  });
+
   // Test the core logic patterns used by the driver without importing the module
   // (importing the module would invoke main() which calls process.exit).
 
@@ -184,9 +302,37 @@ describe("copilot_harness.cjs", () => {
         expect(isCAPIQuotaExceededError(output)).toBe(true);
       });
 
-      it("matches the Copilot CLI's own retry-exhaustion message for 5xx statuses (503)", () => {
-        const output = "Failed to get response from the AI model; retried 5 times (total retry wait time: 300 seconds) Last error: 503 Service Unavailable";
-        expect(isCAPIQuotaExceededError(output)).toBe(true);
+      it("classifies retry-exhausted 503 as a retryable server error, even without agent output", () => {
+        const output = "Failed to get response from the AI model; retried 5 times (total retry wait time: 14.90 seconds) Last error: 503 Service Unavailable";
+        expect(isCAPIQuotaExceededError(output)).toBe(false);
+        expect(isCAPIServerError(output)).toBe(true);
+        expect(classifyCopilotFailure({ hasOutput: false, isQuotaExceeded: isCAPIQuotaExceededError(output), isCAPIServerError: isCAPIServerError(output) })).toBe("capi_server_error");
+        for (const hasOutput of [false, true]) {
+          expect(shouldRetryFailedExecution({ exitCode: 1, hasOutput, output, attempt: 0, maxRetries: 3 })).toBe(true);
+          expect(shouldRetryFailedExecution({ exitCode: 1, hasOutput, output, attempt: 3, maxRetries: 3 })).toBe(false);
+        }
+      });
+
+      it("restarts fresh for a no-output retry-exhausted CAPI 5xx and continues when output exists", () => {
+        const output = "Failed to get response from the AI model; retried 5 times Last error: 503 Service Unavailable";
+        const hasCAPIServerError = isCAPIServerError(output);
+
+        expect(
+          shouldContinueCopilotSessionAfterFailure({
+            copilotSDKMode: false,
+            continueDisabledPermanently: false,
+            hasOutput: false,
+            hasCAPIServerError,
+          })
+        ).toBe(false);
+        expect(
+          shouldContinueCopilotSessionAfterFailure({
+            copilotSDKMode: false,
+            continueDisabledPermanently: false,
+            hasOutput: true,
+            hasCAPIServerError,
+          })
+        ).toBe(true);
       });
 
       it("does not retry a zero-progress attempt that exhausted the CLI's own 429 retries", () => {
@@ -251,6 +397,7 @@ describe("copilot_harness.cjs", () => {
         providerType: "openai",
         providerWireApi: "completions",
         resolvedModel: "gpt-5.4",
+        routingEffort: "high",
         multiProviderJson,
       });
 
@@ -259,6 +406,7 @@ describe("copilot_harness.cjs", () => {
         COPILOT_CONNECTION_TOKEN: "token-123",
         GH_AW_COPILOT_SDK_MULTI_PROVIDER_JSON: multiProviderJson,
         COPILOT_MODEL: "gpt-5.4",
+        COPILOT_REASONING_EFFORT: "high",
         COPILOT_PROVIDER_BASE_URL: "http://api-proxy:10002",
         COPILOT_PROVIDER_TYPE: "openai",
         COPILOT_PROVIDER_WIRE_API: "completions",
@@ -667,6 +815,21 @@ describe("copilot_harness.cjs", () => {
 
       it("invocation_cap_exceeded outranks no_output when hasOutput is false", () => {
         expect(classifyCopilotFailure({ hasOutput: false, isInvocationCapExceeded: true })).toBe("invocation_cap_exceeded");
+      });
+
+      it("classifies an AWF API proxy guardrail rejection distinctly", () => {
+        expect(classifyCopilotFailure({ hasOutput: true, isAPIProxyGuardRejected: true })).toBe("api_proxy_guard_rejected");
+      });
+
+      it("api_proxy_guard_rejected outranks authentication_failed", () => {
+        // The Copilot CLI reports the proxy's guardrail HTTP 403 as a provider auth failure;
+        // the guardrail classification must win so the run is not reported as a credential problem.
+        expect(classifyCopilotFailure({ hasOutput: true, isAPIProxyGuardRejected: true, isAuthenticationFailed: true })).toBe("api_proxy_guard_rejected");
+      });
+
+      it("does not retry a failed attempt that hit an api-proxy guardrail", () => {
+        const output = "API Error: 403 Maximum consecutive cache misses exceeded (5 / 5).";
+        expect(shouldRetryFailedExecution({ exitCode: 1, hasOutput: true, output, attempt: 0, maxRetries: 3 })).toBe(false);
       });
 
       it("classifies trusted AI credits budget exhaustion distinctly", () => {
@@ -1533,6 +1696,26 @@ describe("copilot_harness.cjs", () => {
     });
   });
 
+  describe("isToolCallIdSchemaError", () => {
+    const schemaError = "400 Invalid 'input[61].id': 'ctc_call_WcucFu1zMaJJNQNn1Y6ioyx6'. Expected an ID that begins with 'fc'.";
+
+    it("matches the tool-call ID mismatch in Copilot output", () => {
+      expect(isToolCallIdSchemaError(`Progress made\n${schemaError}\nChanges +1 -0`)).toBe(true);
+      expect(isToolCallIdSchemaError(schemaError.replace("input[61]", "input[2]"))).toBe(true);
+    });
+
+    it("does not match unrelated validation errors or empty output", () => {
+      expect(isToolCallIdSchemaError("")).toBe(false);
+      expect(isToolCallIdSchemaError("400 Invalid 'input[61].id': 'fc_123'. Expected an ID that begins with 'fc'.")).toBe(false);
+      expect(isToolCallIdSchemaError("400 Invalid 'input[61].id': 'ctc_call_123'. Expected an ID that begins with 'xyz'.")).toBe(false);
+      expect(isToolCallIdSchemaError("CAPIError: 400 The requested model is not supported.")).toBe(false);
+    });
+
+    it("classifies the mismatch separately from partial execution", () => {
+      expect(classifyCopilotFailure({ hasOutput: true, isToolCallIdSchemaError: true })).toBe("tool_call_id_schema_error");
+    });
+  });
+
   describe("no-auth-info detection pattern", () => {
     const NO_AUTH_INFO_PATTERN = /No authentication information found/;
 
@@ -2251,22 +2434,79 @@ describe("copilot_harness.cjs", () => {
       const promptFile = path.join(os.tmpdir(), `copilot-driver-small-${Date.now()}.txt`);
       fs.writeFileSync(promptFile, "small prompt body", "utf8");
 
-      const resolved = resolvePromptFileArgs(["--add-dir", "/tmp", "--prompt-file", promptFile, "--allow-all-tools"]);
-      expect(resolved).toEqual(["--add-dir", "/tmp", "-p", "small prompt body", "--allow-all-tools"]);
+      const resolved = resolvePromptFileInput(["--add-dir", "/tmp", "--prompt-file", promptFile, "--allow-all-tools"]);
+      expect(resolved.args).toEqual(["--add-dir", "/tmp", "-p", "small prompt body", "--allow-all-tools"]);
+      expect(resolved.stdin).toBeUndefined();
     });
 
-    it("uses compact fallback prompt when prompt file is larger than 100KB", () => {
+    it("streams the complete prompt through stdin when the prompt file is larger than 100KB", () => {
       const promptFile = path.join(os.tmpdir(), `copilot-driver-large-${Date.now()}.txt`);
-      fs.writeFileSync(promptFile, "x".repeat(PROMPT_FILE_INLINE_THRESHOLD_BYTES + 1), "utf8");
+      const prompt = Buffer.concat([Buffer.from("prompt\n", "utf8"), Buffer.alloc(PROMPT_FILE_INLINE_THRESHOLD_BYTES, 0x78)]);
+      fs.writeFileSync(promptFile, prompt);
 
-      const resolved = resolvePromptFileArgs(["--prompt-file", promptFile, "--allow-all-tools"]);
-      expect(resolved).toEqual(["-p", buildPromptFileFallbackInstruction(promptFile), "--allow-all-tools"]);
+      const resolved = resolvePromptFileInput(["--prompt-file", promptFile, "--allow-all-tools"]);
+      expect(resolved.args).toEqual(["--allow-all-tools"]);
+      expect(resolved.stdin).toEqual(prompt);
+    });
+
+    it("removes explicit prompt args when streaming a prompt file through stdin", () => {
+      const promptFile = path.join(os.tmpdir(), `copilot-driver-conflict-${Date.now()}.txt`);
+      const prompt = Buffer.concat([Buffer.from("generated prompt\n", "utf8"), Buffer.alloc(PROMPT_FILE_INLINE_THRESHOLD_BYTES, 0x79)]);
+      fs.writeFileSync(promptFile, prompt);
+
+      const resolved = resolvePromptFileInput(["--prompt", "ignored before", "--add-dir", "/tmp", "--prompt-file", promptFile, "-p", "ignored after", "--prompt=also ignored", "-p=ignored inline", "--allow-all-tools"]);
+      expect(resolved.args).toEqual(["--add-dir", "/tmp", "--allow-all-tools"]);
+      expect(resolved.stdin).toEqual(prompt);
+    });
+
+    it("preserves flags after explicit prompt args without values when streaming through stdin", () => {
+      const promptFile = path.join(os.tmpdir(), `copilot-driver-prompt-flag-${Date.now()}.txt`);
+      const prompt = Buffer.concat([Buffer.from("generated prompt\n", "utf8"), Buffer.alloc(PROMPT_FILE_INLINE_THRESHOLD_BYTES, 0x7a)]);
+      fs.writeFileSync(promptFile, prompt);
+
+      const resolved = resolvePromptFileInput(["--prompt", "--allow-all-tools", "--prompt-file", promptFile, "-p"]);
+      expect(resolved.args).toEqual(["--allow-all-tools"]);
+      expect(resolved.stdin).toEqual(prompt);
     });
 
     it("keeps --prompt-file arguments unchanged when file resolution fails", () => {
       const missingPath = path.join(os.tmpdir(), `copilot-driver-missing-${Date.now()}.txt`);
-      const resolved = resolvePromptFileArgs(["--prompt-file", missingPath, "--allow-all-tools"]);
-      expect(resolved).toEqual(["--prompt-file", missingPath, "--allow-all-tools"]);
+      const resolved = resolvePromptFileInput(["--prompt-file", missingPath, "--allow-all-tools"]);
+      expect(resolved.args).toEqual(["--prompt-file", missingPath, "--allow-all-tools"]);
+      expect(resolved.stdin).toBeUndefined();
+    });
+
+    it("delivers a large prompt to the child unchanged through stdin", () => {
+      const tempDir = makeHarnessTempDir("copilot-large-prompt-");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const capturedPath = path.join(tempDir, "captured-prompt.bin");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const prompt = Buffer.concat([Buffer.from("system instructions\n", "utf8"), Buffer.alloc(PROMPT_FILE_INLINE_THRESHOLD_BYTES, 0x41)]);
+      fs.writeFileSync(promptPath, prompt);
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => fs.writeFileSync(process.env.COPILOT_HARNESS_STUB_STDIN, Buffer.concat(chunks)));`,
+        "utf8"
+      );
+
+      const result = spawnSync(process.execPath, ["copilot_harness.cjs", process.execPath, stubPath, "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./copilot_harness.cjs")),
+        env: {
+          ...harnessChildEnv,
+          COPILOT_HARNESS_STUB_STDIN: capturedPath,
+          GH_AW_HARNESS_MAX_RETRIES: "0",
+          GH_AW_HARNESS_STALL_WARNING_MS: "0",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+
+      expect(result.status).toBe(0);
+      expect(fs.readFileSync(capturedPath)).toEqual(prompt);
+      expect(result.stderr).toContain("streaming prompt via stdin");
     });
   });
 
@@ -2822,6 +3062,48 @@ process.exit(1);`,
     });
   });
 
+  describe("tool-call ID schema failure retry guard", () => {
+    it.each([false, true])("stops on the schema error after an earlier partial attempt: %s", firstAttemptPartial => {
+      const tempDir = makeHarnessTempDir("copilot-tool-call-id-schema-");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.COPILOT_HARNESS_STUB_CALLS;
+const priorCalls = fs.existsSync(callsPath) ? fs.readFileSync(callsPath, "utf8").trim().split("\\n").length : 0;
+fs.appendFileSync(callsPath, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.env.FIRST_ATTEMPT_PARTIAL === "true" && priorCalls === 0) {
+  process.stdout.write("partial work done\\n");
+  process.exit(1);
+}
+process.stderr.write("400 Invalid 'input[61].id': 'ctc_call_WcucFu1zMaJJNQNn1Y6ioyx6'. Expected an ID that begins with 'fc'.\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["copilot_harness.cjs", process.execPath, stubPath, "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./copilot_harness.cjs")),
+        env: { ...harnessChildEnv, FIRST_ATTEMPT_PARTIAL: String(firstAttemptPartial), COPILOT_HARNESS_STUB_CALLS: callsPath, GH_AW_SAFE_OUTPUTS: path.join(tempDir, "safe-outputs.jsonl") },
+        encoding: "utf8",
+        timeout: 15000,
+      });
+
+      expect(result.status).toBe(1);
+      const calls = fs
+        .readFileSync(callsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      expect(calls).toHaveLength(firstAttemptPartial ? 2 : 1);
+      if (firstAttemptPartial) expect(calls[1]).toContain("--continue");
+      expect(result.stderr).toContain("failureClass=tool_call_id_schema_error");
+      expect(result.stderr).toContain("tool-call ID schema error — not retrying");
+    });
+  });
+
   describe("post-result watchdog suppression when terminal safe-output already produced", () => {
     it("exits 0 without retrying when a terminal safe-output was already produced and run fails with partial_execution", () => {
       const tempDir = makeHarnessTempDir("copilot-watchdog-suppression-");
@@ -3041,6 +3323,53 @@ process.exit(1);`,
       fs.writeFileSync(path.join(tokenUsageDir, "token-usage.jsonl"), `${JSON.stringify({ status: 200, ai_credits_total: 302.111025 })}\n`, "utf8");
       return path.join(tempDir, "agent-output.json");
     }
+
+    it.each([
+      { used: 240.22396, expectedExit: 0, expectedAttempts: 1 },
+      { used: 239.9, expectedExit: 1, expectedAttempts: 2 },
+    ])("classifies proxy HTTP 403 with network-only audit and compiled cap at usage $used", ({ used, expectedExit, expectedAttempts }) => {
+      const tempDir = makeHarnessTempDir("copilot-proxy-403-compiled-cap-");
+      const auditDir = path.join(tempDir, "sandbox", "firewall", "logs");
+      const tokenUsageDir = path.join(auditDir, "api-proxy-logs");
+      fs.mkdirSync(tokenUsageDir, { recursive: true });
+      fs.writeFileSync(path.join(auditDir, "audit.jsonl"), `${JSON.stringify({ event: "http_access", status: 200 })}\n`);
+      fs.writeFileSync(path.join(tokenUsageDir, "token-usage.jsonl"), `${JSON.stringify({ status: 200, ai_credits_total: used })}\n`);
+      const configPath = path.join(tempDir, "awf-config.json");
+      fs.writeFileSync(configPath, JSON.stringify({ apiProxy: { enabled: true, maxAiCredits: 240 } }));
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+fs.appendFileSync(process.env.COPILOT_HARNESS_STUB_CALLS, "attempt\\n");
+process.stderr.write("Authentication failed with provider at http://172.30.0.30:10002 (HTTP 403).\\n");
+process.exit(1);`
+      );
+
+      const result = spawnSync(process.execPath, ["copilot_harness.cjs", process.execPath, stubPath], {
+        cwd: path.dirname(require.resolve("./copilot_harness.cjs")),
+        env: {
+          ...harnessChildEnv,
+          COPILOT_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_AGENT_OUTPUT: path.join(tempDir, "agent-output.json"),
+          GH_AW_AWF_CONFIG_PATH: configPath,
+          GH_AW_MAX_AI_CREDITS: "",
+          GH_AW_HARNESS_MAX_RETRIES: "3",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      expect(result.status).toBe(expectedExit);
+      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toHaveLength(expectedAttempts);
+      if (expectedExit === 0) {
+        expect(result.stderr).toContain("failureClass=ai_credits_exhausted");
+        expect(result.stderr).toContain("AI credits budget enforced");
+        expect(result.stderr).not.toContain("centralized Copilot billing");
+      } else {
+        expect(result.stderr).toContain("failureClass=authentication_failed");
+        expect(result.stderr).not.toContain("AI credits budget enforced");
+      }
+    });
 
     it("exits 0 when the agent outputs max_ai_credits_exceeded and the CLI exits non-zero", () => {
       const tempDir = makeHarnessTempDir("copilot-ai-credits-exceeded-");
@@ -3263,6 +3592,8 @@ process.exit(1);`,
             models: {
               "gpt-5-mini": { wire_api: "responses" },
               "gpt-5.5": { wire_api: "responses" },
+              "gpt-5.6-luna": { wire_api: "responses" },
+              "gpt-4.1": { wire_api: "completions" },
               "gemini-2.5-pro": { wire_api: "completions" },
               "mai-code-1-flash-picker": { wire_api: "responses" },
               "claude-sonnet-4": {},
@@ -3278,7 +3609,33 @@ process.exit(1);`,
       expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("responses");
     });
 
-    it.each(["grok-4.5", "grok-4.6"])("uses the responses API from the bundled catalog for %s", model => {
+    it("uses the catalog wire API for a Copilot utility model variant", () => {
+      process.env.COPILOT_MODEL = "gpt-5.6-luna-utility";
+      applyCopilotWireAPI({ modelsJson: makeModelsJson(), logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("responses");
+    });
+
+    it("prefers an exact catalog match over the utility model base", () => {
+      process.env.COPILOT_MODEL = "gpt-5.6-luna-utility";
+      const modelsJson = makeModelsJson();
+      modelsJson.providers["github-copilot"].models["gpt-5.6-luna-utility"] = { wire_api: "completions" };
+      applyCopilotWireAPI({ modelsJson, logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("completions");
+    });
+
+    it("defaults GPT models to the responses API when absent from the catalog", () => {
+      process.env.COPILOT_MODEL = "gpt-5.6-luna-utility";
+      applyCopilotWireAPI({ modelsJson: { providers: { "github-copilot": { models: {} } } }, logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("responses");
+    });
+
+    it("does not assume the Responses API for unknown GPT-4 models", () => {
+      process.env.COPILOT_MODEL = "gpt-4.2";
+      applyCopilotWireAPI({ modelsJson: { providers: { "github-copilot": { models: {} } } }, logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
+    });
+
+    it.each(["grok-4.5", "grok-4.6", "grok-4.7"])("uses the responses API from the bundled catalog for %s", model => {
       process.env.COPILOT_MODEL = model;
       const modelsJson = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "models.json"), "utf8"));
       applyCopilotWireAPI({ modelsJson, logger: () => {} });
@@ -3287,6 +3644,12 @@ process.exit(1);`,
 
     it("sets COPILOT_PROVIDER_WIRE_API=completions for a completions model", () => {
       process.env.COPILOT_MODEL = "gemini-2.5-pro";
+      applyCopilotWireAPI({ modelsJson: makeModelsJson(), logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("completions");
+    });
+
+    it("uses the catalog wire API in preference to the GPT default", () => {
+      process.env.COPILOT_MODEL = "gpt-4.1";
       applyCopilotWireAPI({ modelsJson: makeModelsJson(), logger: () => {} });
       expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("completions");
     });
@@ -3312,6 +3675,12 @@ process.exit(1);`,
       expect(process.env.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
     });
 
+    it("leaves COPILOT_PROVIDER_WIRE_API unset when a utility model and its base are unknown", () => {
+      process.env.COPILOT_MODEL = "totally-unknown-model-utility";
+      applyCopilotWireAPI({ modelsJson: makeModelsJson(), logger: () => {} });
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
+    });
+
     it("is case-insensitive for the model name", () => {
       process.env.COPILOT_MODEL = "GPT-5-MINI";
       applyCopilotWireAPI({ modelsJson: makeModelsJson(), logger: () => {} });
@@ -3330,10 +3699,10 @@ process.exit(1);`,
       expect(process.env.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
     });
 
-    it("skips configuration when modelsJson is null", () => {
+    it("defaults GPT models to responses when modelsJson is null", () => {
       process.env.COPILOT_MODEL = "gpt-5-mini";
       applyCopilotWireAPI({ modelsJson: null, logger: () => {} });
-      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
+      expect(process.env.COPILOT_PROVIDER_WIRE_API).toBe("responses");
     });
   });
 

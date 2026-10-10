@@ -16,6 +16,17 @@ This changelog records the version history and the dated mapping audits for `spe
 
 | Version | Change |
 |---|---|
+| 1.0.47 | Audit-only clarification that same-repository checkout for allow-listed App comments is a runtime trust control governed by Security Architecture Specification RS-05a, not a new compiler threat rule. |
+| 1.0.46 | Extended CTR-017 OTLP exclusions to evals AWF sandboxes and mapped evals-enabled/disabled regression coverage. |
+| 1.0.45 | Extended CTR-017 with OTLP collector endpoint/header exclusions for agent and inline/external threat-detection AWF sandboxes when `--exclude-env` is supported; retained host-side exporter access and mapped OTLP-enabled/disabled regression coverage. |
+| 1.0.44 | Clarified CTR-001: the `id-token: write` audience/trust-policy reminder is informational and does not increment compiler warnings or block warnings-as-errors validation; OIDC permission enforcement remains unchanged. |
+| 1.0.43 | Clarified CTR-008 for the scoped `pull_request_target` checkout policy: exact literal allowlist matching, warning-only risk acknowledgment, and rejection of configured `fetch` values. |
+| 1.0.42 | Audit-only clarification that same-repository bot PR checkout authorization is a runtime trust control governed by Security Architecture Specification RS-05a, not a new compiler threat rule. |
+| 1.0.41 | Added CTR-031 for strict rejection and non-strict warning of `tools.github.private-to-public-flows`, which can expose private data through public logs or destinations. |
+| 1.0.40 | Added CTR-030 for PR-base provenance of activation sparse checkout before loading imports or skills; preserves non-PR refs and the `GITHUB_TOKEN` same-repo fallback guard. |
+| 1.0.39 | Added CTR-029 for fail-closed authorization of allowlisted GitHub Apps that send `repository_dispatch`; a conclusive absent collaborator lookup is accepted only for the allowlisted App on that trigger. |
+| 1.0.38 | Audit-only review of the safe-outputs workspace checkout discovery path; the agent-writable workspace trust boundary is a runtime control recorded in the safe-outputs (Threat T7, RCR1–RCR7) and checkout-behavior (§3.5, T-CHK-016) specifications, and is not a new compiler threat class. |
+| 1.0.37 | Added CTR-028 for base-branch agent configuration restore provenance on pull-request triggers; the restore is emitted after the PR checkout and before any step that installs agent content, for every engine. |
 | 1.0.36 | Audit-only review; Opengrep build-reproducibility alerts (`github-actions-npm-install-non-deterministic`, `actions-uv-pip-install-non-deterministic`, `actions-pip-install-inline-no-hash-check`, `github-actions-setup-node-missing-version`, `dockerfile-non-sha-pinned-image`) are external-scanner findings outside conformance scope; no new CTR rule required. |
 | 1.0.35 | Audit-only review; open code-scanning alerts (#681/#678/#676/#675 allocation-overflow, #679 useless-assignment, #674/#669/#668/#667 bad-redirect-check, #663 http-to-file-access, #657 smoke-test dummy, #652/#651 stale GraphQL-injection claim, #680 out-of-context stray commit artifacts) are not new compiler threat classes. |
 | 1.0.34 | Added CTR-027 for trusted same-repository allowlisted bot synchronization and fail-closed confused-deputy handling. |
@@ -31,6 +42,26 @@ This changelog records the version history and the dated mapping audits for `spe
 | 1.0.7–1.0.0 | Established CTR-001–015, conformance model, and daily reconciliation. |
 
 ## Mapping Audits
+
+### Mapping Audit (2026-10-09)
+
+Reviewed the allow-listed GitHub App checkout exception for `issue_comment` and `pull_request_review_comment` in `actions/setup/js/checkout_pr_branch.cjs`, together with its regression tests and RS-05a validation evidence.
+
+Findings and disposition:
+
+- The exception requires a Bot sender whose login exactly matches the comment author and canonically matches the runtime actor, an explicit `on.bots` allow-list entry, and a positive runtime repository ID equal to the API-verified PR head and base repository IDs.
+- Fork PRs, unlisted bots, identity mismatches, missing repository provenance, and other actors retain the collaborator-permission floor. App slug and `[bot]` identities are treated as equivalent only for comparison with the runtime actor.
+- No compiler-generated construct or active CTR rule changed. This is a runtime checkout authorization control governed by Security Architecture Specification RS-05a; no new `CTR-*` rule is warranted.
+
+### Mapping Audit (2026-09-23)
+
+Reviewed the safe-outputs checkout-resolution change in `actions/setup/js/find_repo_checkout.cjs` (workspace git-scan fallback reading `remote.origin.url` under a per-invocation `safe.directory` override) together with its callers in `create_pull_request.cjs`, `push_to_pull_request_branch.cjs`, and `safe_outputs_handlers.cjs`.
+
+Findings and disposition:
+
+- The discovery read is confined to `$GITHUB_WORKSPACE`, uses only `git config --get` (which executes no hooks, pagers, filesystem monitors, or credential helpers), and does not mutate the process environment, so it does not create a compiler-detectable unsafe generated-workflow construct.
+- Remote-host spoofing through an agent-planted `.git/config` was identified as a real runtime risk and remediated in the runtime path by constraining scanned remotes to the host of `GITHUB_SERVER_URL` or `github.com`; cross-repository allowlist validation continues to precede any durable trust or push.
+- No `CTR-*` rule applies: the compiler emits no construct that selects a safe-outputs checkout directory, and no existing rule mapping changed. The controls are recorded in the Safe Outputs MCP Gateway Specification (Threat T7, RCR1–RCR7) and the Checkout Behavior Specification (§3.5, T-CHK-016).
 
 ### Mapping Audit (2026-09-15)
 

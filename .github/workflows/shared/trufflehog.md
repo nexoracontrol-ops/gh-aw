@@ -13,7 +13,7 @@ jobs:
       - name: Download agent output artifact
         id: download-agent
         continue-on-error: true
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: agent
           path: /tmp/gh-aw/agent
@@ -21,7 +21,7 @@ jobs:
       - name: Download cache-memory artifact
         id: download-cache-memory
         continue-on-error: true
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: cache-memory
           path: /tmp/gh-aw/cache-memory
@@ -29,7 +29,7 @@ jobs:
       - name: Download repo-memory artifact
         id: download-repo-memory
         continue-on-error: true
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: repo-memory-default
           path: /tmp/gh-aw/repo-memory/default
@@ -151,7 +151,7 @@ jobs:
 
       - name: Upload TruffleHog scan results
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: trufflehog-scan-results
           path: /tmp/gh-aw/agent/trufflehog/

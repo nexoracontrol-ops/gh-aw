@@ -125,7 +125,11 @@ tools:
 
 **Note:** Some engines require third-party Model Context Protocol (MCP) servers for web search. See [Using Web Search](/gh-aw/reference/web-search/).
 
-For the **Codex** engine, `web-search:` is disabled by default. Web search is only enabled when `web-search:` is explicitly declared in the `tools:` block. Without this declaration, Codex runs with `-c web_search="disabled"` and cannot access the web.
+Web search is disabled by default for **Codex** and **Claude**. Claude enables it only when `web-search:` is declared. Codex enables a shared native search/browsing tool when either `web-search:` or `web-fetch:` is declared; the two capabilities cannot be disabled independently. With neither tool, Codex runs with `-c web_search="disabled"`. Use `network.hosted-web` to restrict Codex's hosted retrieval.
+
+**Copilot** runs in offline BYOK mode, which disables its native web tools. Compilation rejects `web-search:` and, in CLI mode, `web-fetch:`. Use an MCP server for search or fetch. With `engine.copilot-sdk: true`, `web-fetch:` remains supported by a custom proxy-aware tool that follows `network.allowed`; this does not enable native web search.
+
+The **Gemini** and **Pi** engines have no built-in web search. Declaring `web-search:` with either engine has no effect, and `gh aw compile` prints a warning. To search the web with these engines, configure a third-party MCP server as described in [Using Web Search](/gh-aw/reference/web-search/).
 
 ### Playwright Tool (`playwright:`)
 
@@ -232,7 +236,7 @@ With `cli-proxy: false` and an MCP-backed GitHub mode (`local` or `remote`), MCP
 
 ### Tool Operation Timeout (`tools.timeout`)
 
-Sets the per-operation timeout in seconds for tool and MCP server calls. Applies to all tools and MCP servers when supported by the engine. Defaults vary by engine (Claude: 60 s, Codex: 120 s).
+Sets the per-operation timeout in seconds when supported by the engine. Claude and Codex default to 60 seconds. For Codex, this configures native MCP tool calls, not shell-command duration; use `timeout-minutes` for the overall execution limit.
 
 ```yaml wrap
 tools:
@@ -257,7 +261,7 @@ tools:
 ```
 
 > [!NOTE]
-> Expression values are passed through environment variables in the compiled workflow. TOML-based engine configs (Codex MCP gateway) fall back to engine defaults when an expression is used, since TOML has no expression syntax.
+> Expression values are passed through environment variables and resolved before execution. Codex's configuration renderer converts the resolved values into numeric TOML settings; expressions do not fall back to defaults. An explicit per-server timeout in `engine.config` takes precedence over `tools.timeout` or `tools.startup-timeout`.
 
 ## Custom MCP Servers (`mcp-servers:`)
 

@@ -10,12 +10,6 @@ on:
     strategy: centralized
     events: [issues, issue_comment, pull_request, pull_request_comment]
   workflow_dispatch:
-    inputs:
-      aw_context:
-        description: Agent caller context (used internally by Agentic Workflows).
-        required: false
-        type: string
-        default: ""
   pull_request:
     types: [labeled]
     names: ["smoke"]
@@ -27,8 +21,11 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Codex
-engine: codex
-model: copilot/gpt-5.3-codex
+engine:
+  id: codex
+  fallback-models:
+    - openai/gpt-5.4
+    - openai/gpt-5.4-mini
 imports:
   - shared/gh.md
   - shared/reporting-otlp.md
@@ -43,10 +40,15 @@ network:
     - defaults
     - github
     - playwright
+  hosted-web:
+    allowed:
+      - microsoft.com
+      - learn.microsoft.com
 tools:
   cli-proxy: true
   cache-memory: true
   comment-memory: true
+  web-search:
   github:
     mode: gh-proxy
   playwright:

@@ -16,8 +16,14 @@ const mockCore = {
 global.core = mockCore;
 
 const mockGraphql = vi.fn();
+const mockGetIssue = vi.fn();
 const mockGithub = {
   graphql: mockGraphql,
+  rest: {
+    issues: {
+      get: mockGetIssue,
+    },
+  },
 };
 
 global.github = mockGithub;
@@ -77,6 +83,12 @@ describe("resolve_pr_review_thread", () => {
 
     // Default: thread belongs to triggering PR #42
     mockGraphqlForThread(42);
+    mockGetIssue.mockResolvedValue({
+      data: {
+        title: "Test pull request",
+        labels: [],
+      },
+    });
 
     const { main } = require("./resolve_pr_review_thread.cjs");
     handler = await main({ max: 10 });
@@ -109,6 +121,30 @@ describe("resolve_pr_review_thread", () => {
     expect(mockGraphql).toHaveBeenCalledWith(expect.stringContaining("resolveReviewThread"), expect.objectContaining({ threadId: "PRRT_kwDOABCD123456" }));
   });
 
+  it("should not resolve a review thread when a required label is missing", async () => {
+    const { main } = require("./resolve_pr_review_thread.cjs");
+    const filteredHandler = await main({ max: 10, required_labels: ["automation"] });
+
+    const result = await filteredHandler(
+      {
+        type: "resolve_pull_request_review_thread",
+        thread_id: "PRRT_kwDOABCD123456",
+      },
+      {}
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.skipped).toBe(true);
+    expect(result.error).toContain("required-labels");
+    expect(mockGetIssue).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      issue_number: 42,
+    });
+    expect(mockGraphql).toHaveBeenCalledTimes(1);
+    expect(mockGraphql.mock.calls.some(([query]) => query.includes("resolveReviewThread"))).toBe(false);
+  });
+
   it("should reject a thread that belongs to a different PR", async () => {
     // Thread belongs to PR #99, not triggering PR #42
     mockGraphqlForThread(99);
@@ -126,6 +162,41 @@ describe("resolve_pr_review_thread", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("PR #99");
     expect(result.error).toContain("triggering PR #42");
+  });
+
+  it("should resolve the triggering PR from a forwarded workflow_dispatch aw_context invocation", async () => {
+    // Thread belongs to PR #42, and the run was forwarded via workflow_dispatch with
+    // aw_context describing PR #42 as the triggering item, rather than context.payload.pull_request.
+    mockGraphqlForThread(42);
+
+    global.context = {
+      ...mockContext,
+      eventName: "workflow_dispatch",
+      payload: {
+        inputs: {
+          aw_context: JSON.stringify({
+            event_type: "issue_comment",
+            item_type: "pull_request",
+            item_number: "42",
+            repo: "test-owner/test-repo",
+          }),
+        },
+      },
+    };
+
+    const { main } = require("./resolve_pr_review_thread.cjs");
+    const freshHandler = await main({ max: 10 });
+
+    const message = {
+      type: "resolve_pull_request_review_thread",
+      thread_id: "PRRT_kwDOForwardedThread",
+    };
+
+    const result = await freshHandler(message, {});
+
+    global.context = mockContext;
+
+    expect(result.success).toBe(true);
   });
 
   it("should succeed as a no-op when thread is not found (stale or already resolved)", async () => {
@@ -518,7 +589,7 @@ describe("resolve_pr_review_thread", () => {
     expect(mockGraphql).toHaveBeenCalledTimes(1);
   });
 
-  it("should succeed when not in a pull request context but explicit thread_id is provided", async () => {
+  it("should reject an explicit thread when triggering PR context is unavailable", async () => {
     // Override context to non-PR event (afterEach restores the original payload)
     global.context.payload = {
       repository: { html_url: "https://github.com/test-owner/test-repo" },
@@ -534,13 +605,11 @@ describe("resolve_pr_review_thread", () => {
 
     const result = await freshHandler(message, {});
 
-    // Should succeed: thread_id was explicitly provided and resolved to a PR via the API
-    expect(result.success).toBe(true);
-    expect(result.thread_id).toBe("PRRT_kwDOABCD123456");
-    expect(result.is_resolved).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("outside of a pull request context");
   });
 
-  it("should succeed when triggered by a schedule event (no PR context) with explicit thread_id", async () => {
+  it("should reject a schedule-triggered thread when target defaults to triggering", async () => {
     // Simulate a schedule-triggered workflow (no pull_request in payload)
     global.context.payload = {};
 
@@ -556,12 +625,9 @@ describe("resolve_pr_review_thread", () => {
 
     const result = await freshHandler(message, {});
 
-    expect(result.success).toBe(true);
-    expect(result.thread_id).toBe("PRRT_kwDOSchedule77");
-    expect(result.is_resolved).toBe(true);
-    // Should have made two GraphQL calls: thread lookup + resolve mutation
-    expect(mockGraphql).toHaveBeenCalledTimes(2);
-    expect(mockGraphql).toHaveBeenCalledWith(expect.stringContaining("resolveReviewThread"), expect.objectContaining({ threadId: "PRRT_kwDOSchedule77" }));
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("outside of a pull request context");
+    expect(mockGraphql).toHaveBeenCalledTimes(1);
   });
 
   it("should fail in legacy mode when schedule-triggered and thread repo cannot be determined", async () => {
@@ -589,7 +655,7 @@ describe("resolve_pr_review_thread", () => {
     const result = await freshHandler(message, {});
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Unable to determine repository");
+    expect(result.error).toContain("determine the repository");
   });
 
   it("should skip (not fail fatally) in legacy mode when schedule-triggered and thread belongs to a different repo", async () => {

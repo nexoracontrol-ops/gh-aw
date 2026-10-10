@@ -9,7 +9,114 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const req = createRequire(import.meta.url);
-const { parseFirewallLogs, parseSessionLogs, parseGatewayActivity, parseSafeOutputsManifest, parseExperimentsData, calculateWorkingSetFromJSONL, parseWorkingSetMetrics, MANIFEST_FILE_PATH } = req("./generate_usage_activity_summary.cjs");
+const {
+  parseFirewallLogs,
+  parseSessionLogs,
+  parseSteeringEvents,
+  parseGatewayActivity,
+  parseSafeOutputsManifest,
+  parseLedgerCompaction,
+  ledgerActivityFromSafeOutputs,
+  parseExperimentsData,
+  calculateWorkingSetFromJSONL,
+  parseWorkingSetMetrics,
+  buildFrictionSummary,
+  buildFrictionStepSummary,
+  writeFrictionStepSummary,
+  readTokenUsageContent,
+  main,
+  MANIFEST_FILE_PATH,
+  writeDetectionUsageResult,
+} = req("./generate_usage_activity_summary.cjs");
+
+describe("generate_usage_activity_summary.cjs", () => {
+  it("exports its main function for github-script execution", () => {
+    expect(typeof main).toBe("function");
+  });
+});
+
+describe("writeDetectionUsageResult", () => {
+  const original = {
+    job: process.env.GH_AW_DETECTION_JOB_RESULT,
+    conclusion: process.env.GH_AW_DETECTION_CONCLUSION,
+    reason: process.env.GH_AW_DETECTION_REASON,
+  };
+  afterEach(() => {
+    for (const [key, name] of [
+      ["job", "GH_AW_DETECTION_JOB_RESULT"],
+      ["conclusion", "GH_AW_DETECTION_CONCLUSION"],
+      ["reason", "GH_AW_DETECTION_REASON"],
+    ]) {
+      if (original[key] === undefined) delete process.env[name];
+      else process.env[name] = original[key];
+    }
+  });
+
+  it("stores only verdict flags and trusted outcomes, not detector reasons", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detection-usage-"));
+    try {
+      const output = path.join(dir, "usage", "detection_result.json");
+      fs.writeFileSync(
+        path.join(dir, "detection_result.json"),
+        JSON.stringify({
+          prompt_injection: true,
+          secret_leak: false,
+          malicious_patch: false,
+          reasons: ["sensitive secret"],
+        })
+      );
+      process.env.GH_AW_DETECTION_JOB_RESULT = "failure";
+      process.env.GH_AW_DETECTION_CONCLUSION = "failure";
+      process.env.GH_AW_DETECTION_REASON = "threat_detected";
+      writeDetectionUsageResult(dir, output);
+      expect(JSON.parse(fs.readFileSync(output, "utf8"))).toEqual({
+        job_result: "failure",
+        conclusion: "failure",
+        reason: "threat_detected",
+        prompt_injection: true,
+        secret_leak: false,
+        malicious_patch: false,
+      });
+      expect(fs.readFileSync(output, "utf8")).not.toContain("sensitive secret");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves warnings without a verdict and excludes untrusted output fields", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detection-usage-"));
+    try {
+      const output = path.join(dir, "usage", "detection_result.json");
+      process.env.GH_AW_DETECTION_JOB_RESULT = "success";
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      process.env.GH_AW_DETECTION_REASON = "private value";
+      writeDetectionUsageResult(dir, output);
+      expect(JSON.parse(fs.readFileSync(output, "utf8"))).toEqual({
+        job_result: "success",
+        conclusion: "warning",
+        reason: "",
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts a verdict from the inline detector log without copying log content", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detection-usage-"));
+    try {
+      const output = path.join(dir, "usage", "detection_result.json");
+      fs.writeFileSync(path.join(dir, "detection.log"), 'sensitive transcript\nTHREAT_DETECTION_RESULT:{"prompt_injection":false,"secret_leak":true,"malicious_patch":false,"reasons":["sensitive transcript"]}\n');
+      process.env.GH_AW_DETECTION_JOB_RESULT = "failure";
+      process.env.GH_AW_DETECTION_CONCLUSION = "failure";
+      process.env.GH_AW_DETECTION_REASON = "threat_detected";
+      writeDetectionUsageResult(dir, output);
+      expect(JSON.parse(fs.readFileSync(output, "utf8"))).toMatchObject({ secret_leak: true });
+      expect(fs.readFileSync(output, "utf8")).not.toContain("sensitive transcript");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("generate_usage_activity_summary.cjs", () => {
   /** Unique directory for each test to avoid cross-test interference */
@@ -114,6 +221,121 @@ describe("generate_usage_activity_summary.cjs", () => {
         fs.rmSync(sessionRoot, { recursive: true, force: true });
       }
     });
+
+    it("aggregates named skill tool invocations without retaining trace payloads", () => {
+      const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "session-skills-test-"));
+      try {
+        const sessionDir = path.join(sessionRoot, "session-1");
+        fs.mkdirSync(sessionDir, { recursive: true });
+        const events = [
+          { type: "tool.execution_start", timestamp: "2026-09-26T00:00:00Z", data: { toolCallId: "call-1", toolName: "skill", input: { skill: "documentation" } } },
+          { type: "tool.execution_complete", timestamp: "2026-09-26T00:00:01Z", data: { toolCallId: "call-1", toolName: "skill", success: true } },
+          { type: "tool.execution_start", timestamp: "2026-09-26T00:00:02Z", data: { toolCallId: "call-2", toolName: "skill", arguments: { skill: "documentation" } } },
+          { type: "tool.execution_complete", timestamp: "2026-09-26T00:00:03Z", data: { toolCallId: "call-2", toolName: "skill", success: false } },
+          { type: "tool.execution_start", timestamp: "2026-09-26T00:00:04Z", data: { toolCallId: "call-3", toolName: "view", input: { path: "/tmp/file" } } },
+        ];
+        fs.writeFileSync(path.join(sessionDir, "events.jsonl"), events.map(JSON.stringify).join("\n"));
+
+        expect(parseSessionLogs([sessionRoot])).toMatchObject({
+          tool_execution_starts: 3,
+          tool_execution_completes: 2,
+          skills: {
+            total_invocations: 2,
+            unique_skills: 1,
+            items: [
+              {
+                name: "documentation",
+                invocation_count: 2,
+                failed_count: 1,
+                first_timestamp: "2026-09-26T00:00:00Z",
+                last_timestamp: "2026-09-26T00:00:02Z",
+              },
+            ],
+          },
+        });
+      } finally {
+        fs.rmSync(sessionRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("correlates ID-less failures and orders skill timestamps chronologically", () => {
+      const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "session-skills-order-test-"));
+      try {
+        for (const [name, events] of [
+          [
+            "a-newer",
+            [
+              { type: "tool.execution_start", timestamp: "2026-09-26T00:00:03Z", data: { toolName: "skill", input: { skill: "documentation" } } },
+              { type: "tool.execution_complete", timestamp: "2026-09-26T00:00:04Z", data: { toolName: "skill", success: true } },
+            ],
+          ],
+          [
+            "z-older",
+            [
+              { type: "tool.execution_start", timestamp: "2026-09-26T00:00:01Z", data: { toolName: "skill", input: { skill: "documentation" } } },
+              { type: "tool.execution_complete", timestamp: "2026-09-26T00:00:02Z", data: { toolName: "skill", success: false } },
+            ],
+          ],
+        ]) {
+          const sessionDir = path.join(sessionRoot, name);
+          fs.mkdirSync(sessionDir, { recursive: true });
+          fs.writeFileSync(path.join(sessionDir, "events.jsonl"), events.map(JSON.stringify).join("\n"));
+        }
+
+        expect(parseSessionLogs([sessionRoot]).skills.items).toEqual([
+          {
+            name: "documentation",
+            invocation_count: 2,
+            failed_count: 1,
+            first_timestamp: "2026-09-26T00:00:01Z",
+            last_timestamp: "2026-09-26T00:00:03Z",
+          },
+        ]);
+      } finally {
+        fs.rmSync(sessionRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("parseSteeringEvents", () => {
+    it("aggregates steering counters from the first available AWF event log", () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "steering-events-test-"));
+      const missingPath = path.join(root, "missing.jsonl");
+      const eventsPath = path.join(root, "events.jsonl");
+      fs.writeFileSync(eventsPath, ['{"event":"token_steering"}', '{"type":"TOKEN_STEERING"}', '{"event_name":"timeout_steering"}', '{"eventName":"model_steering"}', '{"event":"request"}'].join("\n"));
+
+      try {
+        expect(parseSteeringEvents([missingPath, eventsPath])).toEqual({
+          total_events: 4,
+          event_counts: {
+            model_steering: 1,
+            timeout_steering: 1,
+            token_steering: 2,
+          },
+        });
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("falls back past empty and steering-free event logs", () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "steering-events-fallback-test-"));
+      const emptyPath = path.join(root, "event-logs.jsonl");
+      const unrelatedPath = path.join(root, "unrelated.jsonl");
+      const eventsPath = path.join(root, "events.jsonl");
+      fs.writeFileSync(emptyPath, "");
+      fs.writeFileSync(unrelatedPath, '{"event":"request"}\n');
+      fs.writeFileSync(eventsPath, '{"event":"token_steering"}\n');
+
+      try {
+        expect(parseSteeringEvents([emptyPath, unrelatedPath, eventsPath])).toEqual({
+          total_events: 1,
+          event_counts: { token_steering: 1 },
+        });
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("parseGatewayActivity", () => {
@@ -154,8 +376,10 @@ describe("generate_usage_activity_summary.cjs", () => {
           total_calls: 2,
           failed_calls: 1,
           total_input_size: Buffer.byteLength(JSON.stringify(firstArguments)) + Buffer.byteLength(JSON.stringify(secondArguments)),
+          avg_input_size: Math.round((Buffer.byteLength(JSON.stringify(firstArguments)) + Buffer.byteLength(JSON.stringify(secondArguments))) / 2),
           max_input_size: Buffer.byteLength(JSON.stringify(firstArguments)),
           total_output_size: Buffer.byteLength(JSON.stringify(firstResult)) + Buffer.byteLength(JSON.stringify(secondResult)),
+          avg_output_size: Math.round((Buffer.byteLength(JSON.stringify(firstResult)) + Buffer.byteLength(JSON.stringify(secondResult))) / 2),
           max_output_size: Buffer.byteLength(JSON.stringify(secondResult)),
           total_duration_ms: 65,
           max_duration_ms: 40,
@@ -166,6 +390,10 @@ describe("generate_usage_activity_summary.cjs", () => {
             request_count: 2,
             tool_call_count: 2,
             failed_calls: 1,
+            avg_input_size: Math.round((Buffer.byteLength(JSON.stringify(firstArguments)) + Buffer.byteLength(JSON.stringify(secondArguments))) / 2),
+            avg_output_size: Math.round((Buffer.byteLength(JSON.stringify(firstResult)) + Buffer.byteLength(JSON.stringify(secondResult))) / 2),
+            max_input_size: Buffer.byteLength(JSON.stringify(firstArguments)),
+            max_output_size: Buffer.byteLength(JSON.stringify(secondResult)),
             avg_duration_ms: 32.5,
           }),
         ]);
@@ -286,12 +514,14 @@ describe("generate_usage_activity_summary.cjs", () => {
     it("returns null when the manifest file does not exist", () => {
       const result = parseSafeOutputsManifest(manifestPath);
       expect(result).toBeNull();
+      expect(ledgerActivityFromSafeOutputs(result)).toBeNull();
     });
 
     it("returns zero-item result when the manifest file is empty", () => {
       fs.writeFileSync(manifestPath, "");
       const result = parseSafeOutputsManifest(manifestPath);
       expect(result).toEqual({ total_items: 0, items_by_type: {}, items: [] });
+      expect(ledgerActivityFromSafeOutputs(result)).toEqual({ transactions_added: 0 });
     });
 
     it("returns zero-item result when the manifest contains only blank lines", () => {
@@ -325,6 +555,32 @@ describe("generate_usage_activity_summary.cjs", () => {
       expect(result.total_items).toBe(3);
       expect(result.items_by_type).toEqual({ create_issue: 2, add_comment: 1 });
       expect(result.items).toEqual(lines.split("\n").map(line => JSON.parse(line)));
+      expect(ledgerActivityFromSafeOutputs(result)).toEqual({ transactions_added: 0 });
+    });
+
+    it("counts only recorded ledger mutations as added transactions", () => {
+      const lines = [{ type: "ledger_mutation" }, { type: "ledger_append" }, { type: "create_issue" }, { type: "ledger_mutation" }, { type: "ledger_mutation" }];
+      fs.writeFileSync(manifestPath, lines.map(JSON.stringify).join("\n"));
+      expect(ledgerActivityFromSafeOutputs(parseSafeOutputsManifest(manifestPath))).toEqual({ transactions_added: 3 });
+    });
+
+    it("collects compaction stats independently of the safe-output manifest", () => {
+      const compaction = {
+        before: 4,
+        after: 2,
+        selected: 3,
+        records: 12,
+        replacement: "abc123",
+        retired: 3,
+        changed: true,
+      };
+      expect(parseLedgerCompaction(JSON.stringify(compaction))).toEqual(compaction);
+      expect(ledgerActivityFromSafeOutputs(null, compaction)).toEqual({ compaction });
+      expect(ledgerActivityFromSafeOutputs({ items_by_type: {} }, compaction)).toEqual({
+        transactions_added: 0,
+        compaction,
+      });
+      expect(parseLedgerCompaction('{"before":-1}')).toBeNull();
     });
 
     it("skips lines with missing or empty type field", () => {
@@ -447,6 +703,201 @@ describe("generate_usage_activity_summary.cjs", () => {
       expect(Number.isFinite(workingSet.rebuild_factor)).toBe(true);
       expect(workingSet.rebuild_factor).toBeGreaterThanOrEqual(1);
       expect(workingSet.cumulative_input_tokens).toBe(Number(BigInt(large) * 2n));
+    });
+  });
+
+  describe("friction-cost section", () => {
+    let frictionDir;
+
+    beforeEach(() => {
+      frictionDir = fs.mkdtempSync(path.join(__dirname, ".friction-test-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(frictionDir, { recursive: true, force: true });
+    });
+
+    const writeTokenUsage = lines => {
+      const target = path.join(frictionDir, "token_usage.jsonl");
+      fs.writeFileSync(target, lines.map(line => JSON.stringify(line)).join("\n"));
+      return target;
+    };
+
+    it("reports an unavailable section when no activity source exists", () => {
+      const friction = buildFrictionSummary({ gateway: null, integrity: null, session: null, firewall: null }, path.join(frictionDir, "missing.jsonl"));
+      expect(friction).not.toHaveProperty("schema");
+      expect(friction.canonical_unit).toBe("aic");
+      expect(friction.measurement_state).toBe("unavailable");
+      expect(friction.cost.aic).toBe(0);
+    });
+
+    it("computes friction from parsed activity sections and the token-usage file", () => {
+      const tokenUsagePath = writeTokenUsage([
+        { timestamp: "2026-01-01T00:00:01Z", input_tokens: 100, output_tokens: 10, ai_credits_this_response: 0.5, duration_ms: 100 },
+        { timestamp: "2026-01-01T00:00:03Z", input_tokens: 100, output_tokens: 10, ai_credits_this_response: 0.25, duration_ms: 100 },
+      ]);
+      const friction = buildFrictionSummary(
+        {
+          gateway: { tool_calls: [{ tool_call_id: "call-1", timestamp: "2026-01-01T00:00:02Z", server_name: "github", tool_name: "issue_read", outcome: "failure", duration_ms: 42 }] },
+          integrity: null,
+          session: null,
+          firewall: null,
+        },
+        tokenUsagePath
+      );
+      expect(friction.measurement_state).toBe("causal");
+      expect(friction.cost.aic).toBe(0.25);
+      expect(friction.cost.tool_calls).toBe(1);
+      expect(friction.sources).toContain("mcp_gateway");
+      expect(friction.sources).toContain("agent_token_usage");
+    });
+
+    it("reads token usage content only when the file exists", () => {
+      expect(readTokenUsageContent(path.join(frictionDir, "missing.jsonl"))).toEqual({ content: "", available: false });
+      const tokenUsagePath = writeTokenUsage([{ timestamp: "2026-01-01T00:00:01Z", input_tokens: 1 }]);
+      const { content, available } = readTokenUsageContent(tokenUsagePath);
+      expect(available).toBe(true);
+      expect(content).toContain("input_tokens");
+    });
+
+    it("serializes to JSON without losing aggregate or event-level detail", () => {
+      const friction = buildFrictionSummary(
+        {
+          gateway: null,
+          integrity: null,
+          session: null,
+          firewall: { requests_by_domain: { "blocked.example": { allowed: 0, blocked: 2 } } },
+        },
+        path.join(frictionDir, "missing.jsonl")
+      );
+      const roundTripped = JSON.parse(JSON.stringify(friction));
+      expect(roundTripped.total_occurrences).toBe(2);
+      expect(roundTripped.events[0].driver).toBe("firewall_block");
+      expect(roundTripped.drivers[0].driver).toBe("firewall_block");
+      expect(roundTripped.groups[0].group_id).toBe("network_block");
+    });
+
+    it("renders friction cost and driver data in a collapsed step summary section", () => {
+      const summary = buildFrictionStepSummary({
+        measurement_state: "causal",
+        counted_occurrences: 2,
+        friction_ratio: 0.125,
+        cost: {
+          aic: 0.25,
+          tokens: { total: 1234 },
+          turns: 1,
+          tool_calls: 2,
+          latency_ms: 500,
+        },
+        drivers: [
+          {
+            driver: "mcp_tool_error",
+            source: "mcp_gateway",
+            state: "causal",
+            counted_occurrences: 2,
+            cost: { aic: 0.25 },
+          },
+        ],
+      });
+
+      expect(summary).toContain("<details>\n<summary>Friction Cost: 0.25 AIC (causal)</summary>");
+      expect(summary).toContain("### Friction Cost");
+      expect(summary).toContain("| 0.25 | 12.5% | 2 | 1,234 | 1 | 2 | 500 ms |");
+      expect(summary).toContain("| `mcp_tool_error` | `mcp_gateway` | `causal` | 2 | 0.25 |");
+      expect(summary).toContain("</details>");
+    });
+
+    it("renders unavailable friction measurements without implying a measured ratio", () => {
+      const summary = buildFrictionStepSummary({
+        measurement_state: "unavailable",
+        counted_occurrences: 0,
+        cost: {
+          aic: 0,
+          tokens: { total: 0 },
+          turns: 0,
+          tool_calls: 0,
+          latency_ms: 0,
+        },
+        drivers: [],
+      });
+
+      expect(summary).toContain("<summary>Friction Cost: 0 AIC (unavailable)</summary>");
+      expect(summary).toContain("| 0 | unavailable | 0 | 0 | 0 | 0 | 0 ms |");
+    });
+
+    it("suppresses the ratio for an unavailable aggregate even when friction_ratio is finite", () => {
+      // Mirrors the mixed measured API-error plus unavailable firewall-block case in
+      // friction_cost_metrics.test.cjs, where computeFrictionCost can emit an unavailable
+      // aggregate alongside a finite friction_ratio.
+      const summary = buildFrictionStepSummary({
+        measurement_state: "unavailable",
+        counted_occurrences: 1,
+        friction_ratio: 0.4,
+        cost: {
+          aic: 0.1,
+          tokens: { total: 100 },
+          turns: 1,
+          tool_calls: 1,
+          latency_ms: 10,
+        },
+        drivers: [],
+      });
+
+      expect(summary).toContain("<summary>Friction Cost: 0.1 AIC (unavailable)</summary>");
+      expect(summary).toContain("| 0.1 | unavailable | 1 | 100 | 1 | 1 | 10 ms |");
+    });
+
+    describe("writeFrictionStepSummary", () => {
+      let summaryFile;
+      let previousSummaryEnv;
+
+      beforeEach(() => {
+        summaryFile = path.join(frictionDir, "step-summary.md");
+        previousSummaryEnv = process.env.GITHUB_STEP_SUMMARY;
+      });
+
+      afterEach(() => {
+        if (previousSummaryEnv === undefined) {
+          delete process.env.GITHUB_STEP_SUMMARY;
+        } else {
+          process.env.GITHUB_STEP_SUMMARY = previousSummaryEnv;
+        }
+      });
+
+      it("appends the rendered section to GITHUB_STEP_SUMMARY without using core.summary", async () => {
+        process.env.GITHUB_STEP_SUMMARY = summaryFile;
+        fs.writeFileSync(summaryFile, "existing content\n", "utf8");
+
+        await writeFrictionStepSummary("<details>friction</details>");
+
+        expect(fs.readFileSync(summaryFile, "utf8")).toBe("existing content\n<details>friction</details>");
+      });
+
+      it("inserts a newline separator when existing content has no trailing newline", async () => {
+        process.env.GITHUB_STEP_SUMMARY = summaryFile;
+        fs.writeFileSync(summaryFile, "existing content", "utf8");
+
+        await writeFrictionStepSummary("<details>friction</details>");
+
+        expect(fs.readFileSync(summaryFile, "utf8")).toBe("existing content\n<details>friction</details>");
+      });
+
+      it("does not prepend a blank line when the summary file is missing or empty", async () => {
+        process.env.GITHUB_STEP_SUMMARY = summaryFile;
+
+        await writeFrictionStepSummary("<details>friction</details>");
+
+        expect(fs.readFileSync(summaryFile, "utf8")).toBe("<details>friction</details>");
+      });
+
+      it("is a no-op when the section is empty", async () => {
+        process.env.GITHUB_STEP_SUMMARY = summaryFile;
+        fs.writeFileSync(summaryFile, "existing content\n", "utf8");
+
+        await writeFrictionStepSummary("");
+
+        expect(fs.readFileSync(summaryFile, "utf8")).toBe("existing content\n");
+      });
     });
   });
 });

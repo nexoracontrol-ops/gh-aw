@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"fmt"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -18,7 +20,10 @@ var prLog = logger.New("workflow:pr")
 // checkout_pr_branch.cjs fetches refs/pull/<n>/head (the untrusted PR head),
 // which replaces any safe base-SHA checkout and is inaccessible for fork PRs.
 func ShouldGeneratePRCheckoutStep(data *WorkflowData) bool {
-	if data.CheckoutDisabled || data.IsPullRequestTarget {
+	if data.CheckoutDisabled || data.IsPullRequestTarget || isPRCheckoutDisabled(data) {
+		return false
+	}
+	if !canRestoreAgentConfigFolders(data) {
 		return false
 	}
 	if data.CachedPermissions != nil {
@@ -26,6 +31,40 @@ func ShouldGeneratePRCheckoutStep(data *WorkflowData) bool {
 	}
 	permParser := NewPermissionsParser(data.Permissions)
 	return permParser.HasContentsReadAccess()
+}
+
+func isPRCheckoutDisabled(data *WorkflowData) bool {
+	if data == nil {
+		return false
+	}
+	for _, checkout := range data.CheckoutConfigs {
+		if checkout != nil && checkout.PullRequest != nil && !*checkout.PullRequest {
+			return true
+		}
+	}
+	return false
+}
+
+// The activation snapshot belongs to the workflow repository. Do not copy it
+// into a different repository checked out at the workspace root.
+func canRestoreAgentConfigFolders(data *WorkflowData) bool {
+	if data.CustomSteps != "" && ContainsCheckout(data.CustomSteps) {
+		return false
+	}
+	for _, checkout := range data.CheckoutConfigs {
+		if checkout == nil {
+			continue
+		}
+		checkoutPath := path.Clean(strings.ReplaceAll(checkout.Path, "\\", "/"))
+		if checkoutPath != "." && !strings.Contains(checkout.Path, "${{") {
+			continue
+		}
+		repository := strings.TrimSpace(checkout.Repository)
+		if checkout.Wiki || (repository != "" && repository != "${{ github.repository }}") {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveAgentManifestPaths(registry *EngineRegistry, data *WorkflowData) (folders, files []string) {
@@ -92,20 +131,30 @@ func generateSaveBaseGitHubFoldersStep(folders, files []string) []string {
 }
 
 // generateRestoreBaseGitHubFoldersStep generates a step (for the agent job) that restores
-// agent config from the activation artifact after checkout_pr_branch.cjs has run.
+// engine-declared agent config folders and files from the activation artifact.
 // This prevents fork PRs from injecting malicious skill or instruction files.
-// The step also removes .github/mcp.json and only runs when the PR checkout step succeeded.
+// With afterPRCheckout set, restoration requires a successful PR checkout.
+// Otherwise it runs whenever the activation snapshot is available.
 //
 // folders: the agent config directories to restore (must match save step)
 // files:   the root instruction files to restore (must match save step)
-func generateRestoreBaseGitHubFoldersStep(yaml *strings.Builder, folders, files []string) {
+func generateRestoreBaseGitHubFoldersStep(yaml *strings.Builder, folders, files []string, afterPRCheckout bool) {
 	prLog.Print("Generating step to restore agent config folders from base branch")
 	yaml.WriteString("      - name: Restore agent config folders from base branch\n")
-	yaml.WriteString("        if: steps.checkout-pr.outcome == 'success'\n")
+	if afterPRCheckout {
+		yaml.WriteString("        if: steps.checkout-pr.outcome == 'success'\n")
+	}
 	yaml.WriteString("        env:\n")
-	fmt.Fprintf(yaml, "          GH_AW_AGENT_FOLDERS: \"%s\"\n", strings.Join(folders, " "))
-	fmt.Fprintf(yaml, "          GH_AW_AGENT_FILES: \"%s\"\n", strings.Join(files, " "))
-	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/restore_base_github_folders.sh\"\n")
+	yaml.WriteString("          GH_AW_AGENT_FOLDERS: \"" + strings.Join(folders, " ") + "\"\n")
+	yaml.WriteString("          GH_AW_AGENT_FILES: \"" + strings.Join(files, " ") + "\"\n")
+	if afterPRCheckout {
+		yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/restore_base_github_folders.sh\"\n")
+	} else {
+		yaml.WriteString("        run: |\n")
+		yaml.WriteString("          if [ -d /tmp/gh-aw/base ]; then\n")
+		yaml.WriteString("            bash \"${RUNNER_TEMP}/gh-aw/actions/restore_base_github_folders.sh\"\n")
+		yaml.WriteString("          fi\n")
+	}
 }
 
 // generatePRReadyForReviewCheckout generates a step to checkout the PR branch when PR context is available
@@ -129,24 +178,22 @@ func (c *Compiler) generatePRReadyForReviewCheckout(yaml *strings.Builder, data 
 	// OR github.event.issue.pull_request exists (for issue_comment events on PRs).
 	// Note: issue_comment events on PRs do NOT set github.event.pull_request; instead
 	// github.event.issue.pull_request is set to indicate the issue is a PR.
-	dispatchPRContextCondition := BuildAnd(
-		BuildEventTypeEquals("workflow_dispatch"),
-		BuildEquals(
-			BuildPropertyAccess("fromJSON(github.event.inputs.aw_context || '{}').item_type"),
-			BuildStringLiteral("pull_request"),
-		),
-	)
+	// The checkout script parses aw_context and skips dispatches without valid PR
+	// context; parsing free-text input in an if expression can fail the whole job.
 	condition := BuildOr(
 		BuildOr(
 			BuildPropertyAccess("github.event.pull_request"),
 			BuildPropertyAccess("github.event.issue.pull_request"),
 		),
-		dispatchPRContextCondition,
+		BuildEventTypeEquals("workflow_dispatch"),
 	)
 	RenderConditionAsIf(yaml, condition, "          ")
+	writePRReadyForReviewCheckoutAction(yaml, data, useRequire)
+}
 
+func writePRReadyForReviewCheckoutAction(yaml *strings.Builder, data *WorkflowData, useRequire bool) {
 	// Use actions/github-script instead of shell script
-	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	yaml.WriteString("        uses: " + getCachedActionPin("actions/github-script", data) + "\n")
 
 	// Add env section with GH_TOKEN for gh CLI
 	// Use safe-outputs github-token if available, otherwise default token
@@ -157,12 +204,15 @@ func (c *Compiler) generatePRReadyForReviewCheckout(yaml *strings.Builder, data 
 	resolvedToken := resolveGitHubToken(safeOutputsToken)
 	prLog.Print("PR checkout step configured with GitHub token")
 	yaml.WriteString("        env:\n")
-	fmt.Fprintf(yaml, "          GH_TOKEN: %s\n", resolvedToken)
+	yaml.WriteString("          GH_TOKEN: " + resolvedToken + "\n")
+	if len(data.Bots) > 0 {
+		yaml.WriteString("          GH_AW_ALLOWED_BOTS: " + strconv.Quote(strings.Join(data.Bots, ",")) + "\n")
+	}
 
 	yaml.WriteString("        with:\n")
 
 	// Add github-token to make it available to the GitHub API client
-	fmt.Fprintf(yaml, "          github-token: %s\n", resolvedToken)
+	yaml.WriteString("          github-token: " + resolvedToken + "\n")
 
 	yaml.WriteString("          script: |\n")
 

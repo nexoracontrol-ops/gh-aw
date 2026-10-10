@@ -19,6 +19,8 @@ When the workflow runs, the markdown body is loaded at runtime — you can edit 
 
 The compiler extracts the YAML frontmatter, validates it against the workflow schema, validates expression safety (only allow-listed GitHub Actions expressions), and resolves imports.
 
+The compiler also warns when explicit prompt instructions require shell commands, native reads, or MCP tools denied by the resolved tool configuration. For example, ``Run `jq --version` `` or `Call mcp__github__list_issues` is checked against tool allowlists and GitHub toolsets, including imports. These advisory checks do not infer every command from prose or complex shell scripts and never expand permissions. Resolve warnings by changing the prompt to use permitted tools or allowing the specific required capability.
+
 #### Import Resolution
 
 Imports are resolved with a deterministic breadth-first traversal: starting from `imports:` in the main workflow, each file is loaded, its configurations are extracted, and any nested imports are appended to the queue. Visited files are tracked to detect cycles.
@@ -227,6 +229,8 @@ Pre-activation runs gating checks sequentially before any AI execution. Any fail
 | `gh aw compile my-workflow` | Compile specific workflow |
 | `gh aw compile --verbose` | Enable verbose output |
 | `gh aw compile --strict` | Enhanced security validation |
+| `gh aw compile my-workflow --dry-run` | Compile for development testing with staging, mandatory validation/shellcheck/model checks, and warnings as errors; Docker scanners are opt-in |
+| `gh aw compile my-workflow --environment gh-aw-debug` | Replace the environment on every generated job |
 | `gh aw compile --no-emit` | Validate without generating files |
 | `gh aw compile --actionlint --zizmor --poutine --grant` | Run security scanners |
 | `gh aw compile --actionlint --zizmor --poutine --yamllint` | Run security scanners |
@@ -245,6 +249,151 @@ Pre-activation runs gating checks sequentially before any AI execution. Any fail
 
 > [!NOTE]
 > The `--actions-repo` flag overrides the default `github/gh-aw-actions` repository used when `--action-mode action` is set. Use it together with `--action-tag` to compile against a branch or fork during development.
+
+The optional `--actionlint`, `--zizmor`, and `--poutine` scanners prefer local
+binaries on `PATH` when their versions meet the pinned Docker image versions
+(actionlint ≥ 1.7.12, zizmor ≥ 1.30.1, poutine ≥ 1.1.6). Missing, older, or
+unrecognized versions fall back to Docker. Local actionlint uses shellcheck and
+pyflakes from `PATH` when those integrations are enabled; it does not install them.
+
+### Development Testing Mode
+
+`--dry-run` enables `--strict`, `--staged`, `--validate`, `--shellcheck`,
+and `--models`. These settings are
+forced regardless of frontmatter; explicitly disabling a required flag is rejected. Compiler warnings,
+including safe-update warnings, and scanner failures cause a nonzero exit status
+and invalid JSON validation results. Missing required tools block compilation
+rather than silently skipping checks. Model checking uses the observed active
+model inventory; development compilation fails if that inventory is unavailable
+and the workflow declares `models` policies or `engine.models`. It does not prove
+live model availability.
+Observed-inventory refresh and collection warnings are also reported: they fail
+the dry-run gate even when cached observations remain available. Ordinary
+`--models` compilation reports them as warnings instead.
+
+To acknowledge experimental-feature notices explicitly, add `--allow-experimental`
+to `--dry-run`. Notices remain visible and the JSON dry-run summary records
+`accepted_experimental_warnings`. This accepts only the compiler's built-in
+experimental-feature notices, not arbitrary warning text. Security, safe-update,
+schedule, model-inventory and other warnings, validation errors, and scanner
+failures still block the gate. Required checks and staging remain enabled.
+
+Docker-based scanners and `--validate-images` remain opt-in. Docker unavailability
+does not block the dry-run gate; install native `shellcheck` for required run-step
+linting without Docker. When Docker is available, running `gh aw validate my-workflow`
+is recommended for source checks, alongside
+`gh aw compile my-workflow --dry-run --zizmor --actionlint --poutine` for scanner
+checks. `validate` uses `--no-emit` and skips these scanners; its success does not
+establish scanner coverage. Run the scanner-enabled compile command when possible
+and report unavailable checks as unverified. Explicitly requested checks
+still fail the dry-run gate on findings or scanner failures.
+
+MCP callers can opt into required image validation with `validate_images: true`,
+including with `dry_run: true`; Docker unavailability then fails compilation.
+
+```bash
+gh aw compile my-workflow --dry-run --environment gh-aw-debug
+```
+
+The optional `--environment NAME` replaces every job's environment in compiled
+`.lock.yml` files, including
+existing name/URL objects, manual-approval environments, custom jobs, and framework
+jobs. It accepts a literal, non-blank name of at most 255 characters. Expressions
+and control characters are rejected. GitHub Actions does not allow an environment
+on reusable-workflow caller jobs, so compilation fails if such a job is present
+instead of silently leaving it outside the override. Configure the environment in
+the called workflow and compile the caller without the override when using
+reusable workflows.
+
+A protected test environment with rotated, restricted development credentials
+is recommended, not required. Replacing an approval environment also replaces
+its protection rules: configure and review the test environment's protections.
+Authorized repository, organization, and enterprise-provided shared secrets
+remain in the job's applicable secret scope; an environment name is not secret
+isolation and does not automatically export secrets into process environment
+variables.
+
+Dry-run mode stages safe outputs and disables compiler-managed GitHub mutations:
+push jobs, memory/cache persistence, reusable safe-output calls, work-queue
+operations, reactions, status/failure comments and issues, label removal, and
+issue locking. `aw_info.json` records the boolean `dry_run` flag. Failure handling,
+local diagnostics, step summaries, and run artifacts remain enabled. No new
+memory-tool fields are required; ordinary compilation preserves persistence.
+
+Dry-run compilation adds `workflow_dispatch`, preserves existing manual inputs,
+and copies reusable-workflow inputs when adding manual dispatch. Actor roles are
+restricted to `admin`/`maintainer` (including `maintain`); an existing narrower
+subset is preserved and bot exemptions are removed. Other triggers remain intact.
+This does not upload the lock or authorize a live run.
+
+Daily credit accounting, its ledger/app wiring, and `max-daily-ai-credits` are
+removed from the diagnostic configuration. An existing positive per-run
+`max-ai-credits` cap or expression is preserved. Otherwise an explicitly configured
+or imported daily limit becomes the per-run cap, including runtime expressions.
+The ordinary per-run default remains when the daily limit was only a default;
+an active default daily guard replaces an explicitly disabled per-run cap with
+the standard per-run cap. Explicitly disabling both limits remains unchanged.
+
+Set `DEBUG=workflow:compiler_development,cli:compile_development` to log each
+dry-run configuration mutation, removed environment key, disabled job, and forced
+CLI flag to stderr. Logs identify changed fields/keys, never their values.
+
+Dry-run locks omit `OTEL_*` and `GH_AW_OTLP_*` variables from workflow, job,
+step, container, and service environment mappings, including user-defined values.
+Workflow environment suppression occurs before job and header generation so
+telemetry-only masking steps and environment-source entries are also omitted.
+Automatic OTLP export configuration and telemetry authentication steps are also
+disabled. Existing network permissions, local diagnostics, summaries, and artifacts remain
+available; ordinary compilation preserves telemetry configuration. This does not
+rewrite custom scripts that configure their own exporters.
+
+Suppression applies to the lock emitted by `--dry-run`, not a previously compiled
+normal lock on GitHub. Restoring that normal lock after diagnostic compilation
+does not disable its telemetry. Any permitted live test must review and execute
+the same emitted lock revision; dispatching an unchanged remote ref executes its
+existing lock instead.
+
+Custom scripts/jobs, agent shell commands, external MCP servers, and custom
+credentials remain unverified and are explicitly reported at runtime. Dry-run is
+not an execution sandbox or a guarantee that those extensions cannot mutate GitHub.
+
+`--dry-run` cannot be combined with `--no-emit`, `--watch`, `--approve`, or
+`--allow-action-refs`, because those options bypass required checks or the trusted
+safe-update baseline. It is distinct from `--action-mode dev`, does not change
+action reference mode, and does not upload, push, dispatch, or run workflows.
+Generated files remain available for inspection after failed checks and must not
+be treated as approved artifacts.
+
+#### Dry-run coverage output
+
+Compilation prints its limited effect scope before checks and a scanner-coverage
+summary afterward. With `--json`, the existing result array gains a batch-scoped
+`workflow: "dry-run"` entry containing `dry_run.gate`, forced `required_flags`,
+and a `scanners` map. Each scanner has `requested` and `status` fields:
+
+| Status | Meaning |
+|---|---|
+| `passed` | The scanner invocation completed successfully against emitted inputs |
+| `failed` | The invocation reported findings or an execution failure, including unavailable tooling |
+| `not_run` | The scanner was not requested, was not reached, or had no emitted inputs |
+
+This is invocation coverage, not per-script or per-image coverage. Optional image
+validation is identified separately by `validate_images_required`; the summary
+does not attest individual image checks. `model_inventory_available` indicates
+an observed inventory exists, not that runtime models are authorized or available.
+
+`dry_run.gate` reflects both workflow and batch failures. Check the command exit
+status and the entire result array, not only individual workflow `valid` fields.
+Preflight failures can stop compilation before this summary is emitted.
+`compile_only` is true and `execution_authorized` is false even when the gate
+passes. `unverified_effects` lists excluded surfaces, not a per-workflow effect
+inventory; custom code, hosted identity/approvals, live model availability, and
+diagnostic exports remain unverified. Ordinary compilation keeps its existing
+output shape.
+
+For diagnosis/patching versus active debugging, live-test review gates, and
+Codespaces/SAML triage, follow the
+[shared local-debugging strategy](https://github.com/github/gh-aw/blob/main/.github/aw/debug-agentic-workflow.md).
 
 ## Debugging Compilation
 

@@ -51,16 +51,20 @@ const copilotSettingsPath = "$HOME/.copilot/settings.json"
 
 // copilotSettingsDefaultContent is the default JSON content written to the Copilot CLI
 // settings file when no additional settings are configured.
-const copilotSettingsDefaultContent = `{"builtInAgents":{"rubberDuck":false}}`
+const copilotSettingsDefaultContent = `{"builtInAgents":{"rubberDuck":false},"enabledFeatureFlags":{"EXTENSIONS":false}}`
 
 type copilotSettings struct {
-	BuiltInAgents map[string]bool            `json:"builtInAgents"`
-	LSPServers    map[string]LSPServerConfig `json:"lspServers,omitempty"`
+	BuiltInAgents       map[string]bool            `json:"builtInAgents"`
+	EnabledFeatureFlags map[string]bool            `json:"enabledFeatureFlags"`
+	LSPServers          map[string]LSPServerConfig `json:"lspServers,omitempty"`
 }
 
 func buildCopilotSettingsContent(workflowData *WorkflowData) string {
 	settings := copilotSettings{
 		BuiltInAgents: map[string]bool{"rubberDuck": false},
+		EnabledFeatureFlags: map[string]bool{
+			"EXTENSIONS": workflowData != nil && workflowData.EngineConfig.DynamicWorkflowsEnabled(),
+		},
 	}
 	if workflowData != nil {
 		manager := NewLSPManager(workflowData.LSP)
@@ -68,13 +72,13 @@ func buildCopilotSettingsContent(workflowData *WorkflowData) string {
 	}
 	settingsBytes, err := json.Marshal(settings)
 	if err != nil {
-		return copilotSettingsDefaultContent
+		panic(fmt.Sprintf("BUG: failed to marshal Copilot settings: %v", err))
 	}
 	return string(settingsBytes)
 }
 
 // buildCopilotSettingsSetup returns shell commands that write the Copilot CLI settings
-// file before the agent runs, disabling the rubber-duck sub-agent.
+// file before the agent runs, configuring extensions and disabling the rubber-duck sub-agent.
 func buildCopilotSettingsSetup(settingsContent string, fixOwnershipForCustomCommand bool) string {
 	if settingsContent == "" {
 		settingsContent = copilotSettingsDefaultContent
@@ -232,12 +236,7 @@ func (e *CopilotEngine) buildCopilotArgs(workflowData *WorkflowData) ([]string, 
 	isDetectionJob := isDetectionRun(workflowData)
 	copilotArgs := e.buildCopilotBaseArgs(sandboxEnabled)
 
-	// Disable Copilot CLI built-in MCP servers unless a workflow opts into
-	// web-fetch. The CLI exposes web_fetch through its built-in tool schema, so
-	// disabling built-ins would leave --allow-tool web_fetch with no callable tool.
-	if !copilotNeedsBuiltinMCPs(workflowData) {
-		copilotArgs = append(copilotArgs, "--disable-builtin-mcps")
-	}
+	copilotArgs = append(copilotArgs, "--disable-builtin-mcps")
 	// Add --no-ask-user to enable fully autonomous runs (suppresses interactive prompts).
 	// Emitted for both agent and detection jobs when the Copilot CLI version supports it
 	// (v1.0.19+). Latest and unspecified versions always include the flag.
@@ -265,13 +264,6 @@ func (e *CopilotEngine) buildCopilotArgs(workflowData *WorkflowData) ([]string, 
 	return e.buildCopilotFeatureArgs(workflowData, copilotArgs, toolArgs), toolArgs
 }
 
-func copilotNeedsBuiltinMCPs(workflowData *WorkflowData) bool {
-	if workflowData == nil || workflowData.Tools == nil || isCopilotSDKMode(workflowData) {
-		return false
-	}
-	return isCopilotToolValueEnabled(workflowData.Tools, "web-fetch")
-}
-
 func (e *CopilotEngine) buildCopilotBaseArgs(sandboxEnabled bool) []string {
 	if sandboxEnabled {
 		// Simplified args for sandbox mode (AWF)
@@ -292,6 +284,12 @@ func (e *CopilotEngine) buildCopilotFeatureArgs(workflowData *WorkflowData, copi
 		copilotExecLog.Printf("Adding %d tool permission arguments", len(toolArgs))
 	}
 	copilotArgs = append(copilotArgs, toolArgs...)
+	if dynamicWorkflowsEnabled(e, workflowData.EngineConfig) {
+		copilotArgs = append(copilotArgs, "--allow-tool", "workflow")
+	} else {
+		// Denial takes precedence over --allow-all-tools and explicit experimental flags.
+		copilotArgs = append(copilotArgs, "--deny-tool", "workflow")
+	}
 	// Add --add-dir for each configured memory backend.
 	if workflowData.CacheMemoryConfig != nil {
 		for _, cache := range workflowData.CacheMemoryConfig.Caches {
@@ -356,7 +354,7 @@ func (e *CopilotEngine) resolveCopilotCommand(workflowData *WorkflowData, sandbo
 	}
 	if sandboxEnabled {
 		// Every AWF runtime receives RUNNER_TEMP/gh-aw as a read-only mount. Standard,
-		// gVisor, and docker-sbx runs stage the activated binary in the execution step;
+		// Cloud Hypervisor runs stage the activated binary in the execution step;
 		// ARC/DinD stages it during installation so the remote daemon can see it.
 		return `"` + constants.GhAwRootDirShell + `/bin/copilot"`, ""
 	}
@@ -580,7 +578,7 @@ func (e *CopilotEngine) buildCopilotBaseStepEnv(workflowData *WorkflowData, llmP
 	// Auto-configure Copilot BYOK routing when engine.model-provider selects a non-GitHub provider.
 	// Explicit engine.env values still win later via maps.Copy.
 	if llmProvider != LLMProviderGitHub && isFirewallEnabled(workflowData) {
-		env[constants.CopilotProviderBaseURL] = llmProviderGatewayBaseURL(llmProvider)
+		env[constants.CopilotProviderBaseURL] = llmProviderGatewayBaseURL(llmProvider, workflowData)
 		env[constants.CopilotProviderAPIKey] = llmProviderSecretExpression(llmProvider, workflowData)
 	}
 	// Inject the GitHub token only when not in BYOK mode. The engine.env merge that
@@ -621,6 +619,9 @@ func (e *CopilotEngine) addCopilotWorkflowStepEnv(env map[string]string, workflo
 	}
 	// Always add GH_AW_PROMPT for agentic workflows
 	env["GH_AW_PROMPT"] = constants.AwPromptsFile
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ModelRouting != nil {
+		env["GH_AW_MODEL_ROUTING"] = "1"
+	}
 	// Tag the step as a GitHub AW agentic execution for discoverability by agents
 	env["GITHUB_AW"] = "true"
 	env["GH_AW_PHASE"] = workflowRunPhase(workflowData)
@@ -647,7 +648,10 @@ func (e *CopilotEngine) addCopilotGitHubToolEnv(env map[string]string, workflowD
 	if !hasGitHubTool(workflowData.ParsedTools) {
 		return
 	}
-	githubToolConfig, _ := workflowData.Tools["github"].(map[string]any)
+	var githubToolConfig map[string]any
+	if config, ok := workflowData.Tools["github"].(map[string]any); ok {
+		githubToolConfig = config
+	}
 	customGitHubToken := getGitHubToken(githubToolConfig)
 	if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil && workflowData.ParsedTools.GitHub.GitHubApp != nil {
 		tokenExpression := "${{ steps.github-mcp-app-token.outputs.token }}"
@@ -661,6 +665,9 @@ func (e *CopilotEngine) addCopilotGitHubToolEnv(env map[string]string, workflowD
 }
 
 func (e *CopilotEngine) addCopilotModelEnv(env map[string]string, workflowData *WorkflowData, modelConfigured bool, modelEnvVar string) {
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ModelRouting != nil {
+		return
+	}
 	// Set the model environment variable.
 	// The model is always passed via the native COPILOT_MODEL env var, which the Copilot CLI reads directly.
 	// When model is not configured, map the GitHub org variable to COPILOT_MODEL so users can set a default.
@@ -682,6 +689,7 @@ func (e *CopilotEngine) addCopilotFinalStepEnv(env map[string]string, workflowDa
 	// Always inject the Copilot integration ID for agentic workflows after all env merges
 	// so user-supplied env does not override this value.
 	env[constants.CopilotCLIIntegrationIDEnvVar] = constants.CopilotCLIIntegrationIDValue
+	env["GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS"] = strconv.FormatBool(dynamicWorkflowsEnabled(e, workflowData.EngineConfig))
 	// Add HTTP MCP header secrets to env for passthrough
 	for varName, secretExpr := range collectHTTPMCPHeaderSecrets(workflowData.Tools) {
 		if _, exists := env[varName]; !exists {
@@ -777,9 +785,15 @@ func copilotSupportsNoAskUser(engineConfig *EngineConfig) bool {
 // extractAddDirPaths extracts all directory paths from copilot args that follow --add-dir flags
 func extractAddDirPaths(args []string) []string {
 	var dirs []string
-	for i := range len(args) - 1 {
-		if args[i] == "--add-dir" {
-			dirs = append(dirs, args[i+1])
+	expectDir := false
+	for _, arg := range args {
+		if expectDir {
+			dirs = append(dirs, arg)
+			expectDir = false
+			continue
+		}
+		if arg == "--add-dir" {
+			expectDir = true
 		}
 	}
 	return dirs
@@ -806,7 +820,7 @@ umask "$GH_AW_PREV_UMASK"`, customEngineCommandScriptPath, heredocDelimiter, scr
 }
 
 // generateCopilotSessionFileCopyStep generates a step to copy the entire Copilot
-// session-state directory from ~/.copilot/session-state/ to /tmp/gh-aw/sandbox/agent/logs/
+// session-state directory from the AWF-managed host path to /tmp/gh-aw/sandbox/agent/logs/
 // This ensures all session files (events.jsonl, session.db, plan.md, checkpoints, etc.)
 // are in /tmp/gh-aw/ where secret redaction can scan them and they get uploaded as artifacts.
 // The logic is in actions/setup/sh/copy_copilot_session_state.sh.

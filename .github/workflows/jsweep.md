@@ -15,7 +15,7 @@ engine:
 max-tool-denials: 3
 runtimes:
   node:
-    version: "20"
+    version: "24"
 imports:
   - shared/otlp.md
   - shared/reporting.md
@@ -56,9 +56,6 @@ timeout-minutes: 20
 strict: true
 
 
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # jsweep - JavaScript Unbloater

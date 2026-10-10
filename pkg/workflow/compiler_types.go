@@ -29,6 +29,8 @@ type Compiler struct {
 	allowActionRefs         bool                     // If true, unresolved action refs are warnings instead of errors
 	approve                 bool                     // If true, approve safe update changes (skip safe update enforcement)
 	forceStaged             bool                     // If true, force all safe-outputs into staged mode
+	dryRun                  bool                     // If true, disable push jobs and conclusion issue/comment writes
+	environmentOverride     string                   // If set, override the environment on every generated job
 	trialMode               bool                     // If true, suppress safe outputs for trial mode execution
 	trialLogicalRepoSlug    string                   // If set in trial mode, the logical repository to checkout
 	useSamples              bool                     // If true, replace the agentic step with a deterministic samples replay driver (hidden feature)
@@ -45,6 +47,7 @@ type Compiler struct {
 	engineCatalog           *EngineCatalog           // Catalog of engine definitions backed by the registry
 	fileTracker             FileCreationTracker      // Optional file tracker for tracking created files
 	warningCount            int                      // Number of warnings encountered during compilation
+	experimentalWarnings    int                      // Experimental-feature notices, also included in warningCount
 	stepOrderTracker        *StepOrderTracker        // Tracks step ordering for validation
 	actionCache             *ActionCache             // Shared cache for action pin resolutions across all workflows
 	actionResolver          *ActionResolver          // Shared resolver for action pins across all workflows
@@ -66,6 +69,7 @@ type Compiler struct {
 	inlinePrompt            bool                     // If true, inline markdown content in YAML instead of using runtime-import macros (for Wasm builds)
 	priorManifests          map[string]*GHAWManifest // Pre-cached manifests keyed by lock file path; takes precedence over git HEAD / filesystem reads
 	requireDocker           bool                     // If true, fail validation when Docker is not available instead of silently skipping
+	requireSelfHosted       bool                     // If true, validate that every generated job selects a self-hosted runner
 	ghesCompatFromCLI       bool                     // If true, GHES compat was requested via --ghes CLI flag (takes precedence over aw.json)
 	ghesArtifactCompat      bool                     // If true, emit GHES-compatible v3 pins for artifact actions
 	ghesCompatConfigured    bool                     // True once GHES compatibility has been resolved from CLI/config
@@ -75,11 +79,12 @@ type Compiler struct {
 	featureUsage            map[string]int           // Counts experimental feature usage across workflows in batch mode
 	permissionWarningShown  map[string]string        // Tracks markdown paths and last warning fingerprint (frontmatter hash when available, otherwise formatted warning text)
 	allowedDomainsCache     map[string]allowedDomain // Cached allowed-domains per markdown path with the frontmatter hash that produced it
+	wildcardAppTokenSteps   map[appTokenStepKey]bool // Job-scoped compiler-generated token steps with explicit repositories: ["*"].
 	// modelPricingResolver is an optional callback for resolving per-token pricing of models that
-	// are absent from the embedded models.json catalog. When non-nil it is called during
+	// are absent from workflow frontmatter. When non-nil it is called during
 	// buildInitialWorkflowData for the workflow's configured model; any returned pricing is merged
 	// into WorkflowData.ModelCosts so it is embedded in GH_AW_INFO_MODEL_COSTS in the lock.yml.
-	// Injected by the cli package (which has access to the embedded catalog and models.dev download).
+	// Injected by the cli package, which has access to the embedded pricing catalog.
 	modelPricingResolver     func(ctx context.Context, provider, model string) (map[string]float64, bool)
 	configuredModelValidator func(data *WorkflowData) []string
 }

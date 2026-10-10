@@ -129,7 +129,7 @@ func extractAPIBasePath(workflowData *WorkflowData, envVar string) string {
 // extractAPITargetAuthHeader extracts the authHeader value from the sandbox.agent.targets
 // frontmatter section for a given provider (e.g. "openai" or "anthropic"). It reads:
 //
-//	sandbox.agent.targets.<provider>.authHeader
+//	sandbox.agent.targets.<provider>.auth-header
 //
 // Returns the header name string (e.g. "api-key") or empty string if not configured.
 func extractAPITargetAuthHeader(workflowData *WorkflowData, provider string) string {
@@ -268,6 +268,11 @@ const DefaultGeminiAPITarget = "generativelanguage.googleapis.com"
 // Returns empty string if the engine is not Gemini and no custom GEMINI_API_BASE_URL is configured.
 func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
 	awfHelpersLog.Printf("Getting Gemini API target for engine: %s", engineName)
+	if engineName == string(constants.AgyEngine) {
+		if customTarget := extractAPITargetHost(workflowData, "GOOGLE_GEMINI_BASE_URL"); customTarget != "" {
+			return customTarget
+		}
+	}
 	// Check for custom GEMINI_API_BASE_URL in engine.env
 	if customTarget := extractAPITargetHost(workflowData, "GEMINI_API_BASE_URL"); customTarget != "" {
 		awfHelpersLog.Printf("Using custom Gemini API target from GEMINI_API_BASE_URL: %s", customTarget)
@@ -275,7 +280,7 @@ func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
 	}
 
 	// Default to the standard Gemini API endpoint when engine is Gemini
-	if engineName == "gemini" {
+	if engineName == "gemini" || engineName == string(constants.AgyEngine) {
 		awfHelpersLog.Printf("Using default Gemini API target: %s", DefaultGeminiAPITarget)
 		return DefaultGeminiAPITarget
 	}
@@ -303,7 +308,14 @@ func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
 		return []string{data.EngineConfig.APITarget}
 	}
 
-	switch engine.(type) {
+	switch typedEngine := engine.(type) {
+	case *BehaviorDefinedEngine:
+		if typedEngine.behavior().SecretStrategy == behaviorSecretStrategyGeminiAPIKey {
+			return []string{GetGeminiAPITarget(data, engine.GetID())}
+		}
+		// Preserve unknown-host behavior for other strategies: declarative network
+		// defaults include installation/infrastructure hosts, not just inference.
+		return nil
 	case *CopilotEngine:
 		// Return the full set of known Copilot inference endpoints so that any variant
 		// (enterprise, business, individual, or the routing hub) is covered.
@@ -314,9 +326,12 @@ func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
 			"api.individual.githubcopilot.com",
 		}
 	case *ClaudeEngine:
+		if NewClaudeEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
+			return getEngineAPIHosts(data, NewCopilotEngine())
+		}
 		return []string{"api.anthropic.com"}
 	case *CodexEngine:
-		if resolveEngineLLMProvider(data, LLMProviderOpenAI) == LLMProviderGitHub {
+		if NewCodexEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
 			return []string{
 				"api.enterprise.githubcopilot.com",
 				"api.githubcopilot.com",
@@ -324,9 +339,14 @@ func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
 				"api.individual.githubcopilot.com",
 			}
 		}
+		if target := extractAPITargetHost(data, "OPENAI_BASE_URL"); target != "" {
+			return []string{target}
+		}
 		return []string{"api.openai.com"}
 	case *GeminiEngine:
 		return []string{DefaultGeminiAPITarget}
+	case *AgyEngine:
+		return []string{GetGeminiAPITarget(data, engine.GetID())}
 	default:
 		// Custom or unknown engine — no known API hosts without explicit api-target.
 		return nil

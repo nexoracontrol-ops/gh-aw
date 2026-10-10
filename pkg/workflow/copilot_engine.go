@@ -46,10 +46,11 @@ func NewCopilotEngine() *CopilotEngine {
 				MCP:                  true,
 				MaxTurns:             true,  // AWF max-turns is supported for Copilot runs
 				MaxContinuations:     true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
-				WebSearch:            false, // Copilot CLI does not have built-in web-search support
+				WebSearch:            false, // Offline BYOK mode disables native web tools
 				BareMode:             true,  // Copilot CLI supports --no-custom-instructions
 				BashCommandAllowlist: true,  // Copilot enforces tools.bash allowlist via --allow-tool shell(cmd)
 				Plugins:              true,  // Copilot CLI supports Agent Plugins
+				DynamicWorkflows:     true,
 			},
 			dedicatedLLMGatewayPort: constants.CopilotLLMGatewayPort,
 		},
@@ -70,7 +71,7 @@ func (e *CopilotEngine) GetModelEnvVarName() string {
 // ResolveLLMProvider returns the effective provider for Copilot inference.
 // Default is github, overridable via engine.model-provider.
 func (e *CopilotEngine) ResolveLLMProvider(workflowData *WorkflowData) LLMProvider {
-	return resolveEngineLLMProvider(workflowData, LLMProviderGitHub)
+	return resolveEngineLLMProviderFromModel(workflowData, LLMProviderGitHub)
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Copilot engine.
@@ -122,7 +123,7 @@ func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []str
 	}
 
 	copilotLog.Printf("Total required secrets: %d", len(secrets))
-	return secrets
+	return append(secrets, fallbackProviderSecretNames(workflowData)...)
 }
 
 // GetSupportedEnvVarKeys returns the engine.env variable names that the Copilot engine
@@ -147,6 +148,7 @@ func (e *CopilotEngine) GetPluginInstallationSteps(workflowData *WorkflowData) [
 	return generatePluginInstallationSteps(workflowData, pluginInstallSpec{
 		Command:     commandName,
 		InstallArgs: []string{"plugin", "install"},
+		Diagnostics: true,
 	})
 }
 
@@ -225,5 +227,5 @@ func (e *CopilotEngine) GetCleanupStep(workflowData *WorkflowData) GitHubActionS
 
 // generateAWFInstallationStep is implemented in copilot_engine_installation.go
 
-// GenerateCopilotInstallerSteps is implemented in copilot_installer.go.
+// generateCopilotInstallerSteps is implemented in copilot_installer.go.
 // See that file for the full signature and priority documentation.

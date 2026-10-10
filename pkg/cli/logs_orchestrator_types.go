@@ -21,6 +21,8 @@ type LogsDownloadOptions struct {
 	Verbose            bool
 	ToolGraph          bool
 	NoStaged           bool
+	DryRun             bool
+	NoDryRun           bool
 	FirewallOnly       bool
 	NoFirewall         bool
 	Parse              bool
@@ -99,6 +101,8 @@ type StdinLogsOptions struct {
 	Verbose           bool
 	ToolGraph         bool
 	NoStaged          bool
+	DryRun            bool
+	NoDryRun          bool
 	FirewallOnly      bool
 	NoFirewall        bool
 	Parse             bool
@@ -129,6 +133,8 @@ type continuationOptions struct {
 	startDate             string
 	endDate               string
 	engine                string
+	dryRun                bool
+	noDryRun              bool
 	branch                string
 	afterRunID            int64
 	ignoreWorkflowRuns    []int64
@@ -153,21 +159,22 @@ type continuationOptions struct {
 
 // renderLogsOutputOptions holds configuration for renderLogsOutput.
 type renderLogsOutputOptions struct {
-	outputDir      string
-	summaryFile    string
-	format         string
-	reportFile     string
-	jsonOutput     bool
-	toolGraph      bool
-	train          bool
-	drain3Weights  string
-	audit          bool
-	continuation   *ContinuationData
-	message        string
-	verbose        bool
-	artifactFilter []string
-	startDate      string
-	endDate        string
+	outputDir        string
+	summaryFile      string
+	format           string
+	reportFile       string
+	jsonOutput       bool
+	toolGraph        bool
+	train            bool
+	drain3Weights    string
+	audit            bool
+	continuation     *ContinuationData
+	message          string
+	verbose          bool
+	artifactFilter   []string
+	includeWorkQueue bool
+	startDate        string
+	endDate          string
 	// checkStaleness enables the stale-data warning check. It is only meaningful
 	// for discovery-mode rendering (pagination walking backwards through time
 	// looking for runs); the stdin path processes explicit run IDs with no

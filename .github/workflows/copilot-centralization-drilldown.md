@@ -30,8 +30,8 @@ permissions:
   copilot-requests: write
 engine:
   id: codex
-  model-provider: github
-model: copilot/gpt-5.3-codex
+  model-provider: openai
+model: openai/gpt-6.1-sol
 strict: true
 max-ai-credits: 120
 max-daily-ai-credits: 500
@@ -160,9 +160,6 @@ steps:
             report_style: "Use issue sections with visible summary and one fenced draft block."
           }
         ' > /tmp/gh-aw/data/derived-plan.json
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 evals:
   - id: candidate_expanded
     question: Did the agent expand a centralization candidate into a concrete draft workflow or reusable prompt template?

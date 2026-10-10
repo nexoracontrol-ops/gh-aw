@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createRequire } from "module";
+import { createHash } from "crypto";
+import { execFileSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
 const {
@@ -59,6 +61,207 @@ describe("process_runner.cjs", () => {
   });
 
   describe("runProcess", () => {
+    it("does not signal a reaped process group after a successful close", async () => {
+      const kill = vi.spyOn(process, "kill");
+      try {
+        const result = await runProcess({
+          command: process.execPath,
+          args: ["-e", "process.stdout.write('completed')"],
+          attempt: 0,
+          log: () => {},
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe("completed");
+        expect(kill).not.toHaveBeenCalled();
+      } finally {
+        kill.mockRestore();
+      }
+    });
+    it("frames stdout independently from interleaved stderr and fragmented UTF-8", async () => {
+      const observed = [];
+      const result = await runProcess({
+        command: process.execPath,
+        args: [
+          "-e",
+          `const b=Buffer.from('{"type":"turn.failed","error":{"message":"🐙 invalid_request_error"}}\\n');const split=b.indexOf(Buffer.from('🐙'))+2;process.stdout.write(b.subarray(0,split));setTimeout(()=>process.stderr.write('progress\\n'),30);setTimeout(()=>process.stdout.write(b.subarray(split)),60);`,
+        ],
+        attempt: 0,
+        log: () => {},
+        onStdoutLine: line => observed.push(JSON.parse(line)),
+      });
+      expect(observed[0].error.message).toBe("🐙 invalid_request_error");
+      expect(result.stdout).toContain("🐙");
+      expect(result.stderr).toBe("progress\n");
+      expect(
+        result.output
+          .split("\n")
+          .filter(Boolean)
+          .map(line => (line.startsWith("{") ? JSON.parse(line).type : line))
+      ).toEqual(["turn.failed", "progress"]);
+    });
+
+    it("bounds collected classifier output without truncating forwarded output", async () => {
+      const writes = [];
+      const original = process.stdout.write;
+      process.stdout.write = chunk => {
+        writes.push(Buffer.from(chunk));
+        return true;
+      };
+      try {
+        const result = await runProcess({ command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(10000)+'tail')"], attempt: 0, log: () => {}, maxCollectedOutputBytes: 1024 });
+        expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1024);
+        expect(result.stdout.endsWith("tail")).toBe(true);
+        expect(Buffer.concat(writes).length).toBe(10004);
+      } finally {
+        process.stdout.write = original;
+      }
+    });
+
+    it("observes every stderr line independently of the bounded classifier tail", async () => {
+      const observed = [];
+      const original = process.stderr.write;
+      process.stderr.write = () => true;
+      try {
+        const result = await runProcess({
+          command: process.execPath,
+          args: ["-e", `process.stderr.write('startup failure\\r\\n'+'x'.repeat(2000)+'\\n');process.stdout.write('stdout\\n');setTimeout(()=>process.stderr.write('unterminated tail'),20);`],
+          attempt: 0,
+          log: () => {},
+          maxCollectedOutputBytes: 1024,
+          onStderrLine: line => observed.push(line),
+        });
+        expect(result.exitCode).toBe(0);
+        expect(observed).toEqual(["startup failure", "x".repeat(2000), "unterminated tail"]);
+        expect(result.stderr).not.toContain("startup failure");
+        expect(result.stdout).toBe("stdout\n");
+      } finally {
+        process.stderr.write = original;
+      }
+    });
+
+    it("preserves a bounded stdout prefix when dropping an oversized line", async () => {
+      const observedLines = [];
+      const observedPrefixes = [];
+      const original = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        const result = await runProcess({
+          command: process.execPath,
+          args: ["-e", `process.stdout.write(JSON.stringify({type:"item.completed",item:{id:"call-1",type:"mcp_tool_call",server:"github",result:"x".repeat(1048576)}})+"\\n")`],
+          attempt: 0,
+          log: () => {},
+          maxCollectedOutputBytes: 1024,
+          onStdoutLine: line => observedLines.push(line),
+          onStdoutLinePrefix: prefix => observedPrefixes.push(prefix),
+        });
+        expect(result.exitCode).toBe(0);
+        expect(observedLines).toEqual([]);
+        expect(observedPrefixes).toHaveLength(1);
+        expect(observedPrefixes[0]).toContain('"id":"call-1"');
+        expect(observedPrefixes[0]).toContain('"server":"github"');
+        expect(observedPrefixes[0]).toHaveLength(64 * 1024);
+      } finally {
+        process.stdout.write = original;
+      }
+    });
+
+    it("kills descendants holding inherited stdio when the runtime guard fires", async () => {
+      const result = await runProcess({
+        command: process.execPath,
+        args: ["-e", `require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});process.stdout.write('ready\\n');setInterval(()=>{},1000);`],
+        attempt: 0,
+        log: () => {},
+        runtimeGuard: { shouldTerminate: () => true, pollIntervalMs: 100, termGraceMs: 100 },
+        drainTimeoutMs: 100,
+      });
+      expect(result.runtimeGuardFired).toBe(true);
+      expect(result.durationMs).toBeLessThan(2000);
+    });
+
+    it.each(["guard", "watchdog", "cancellation"])("finishes %s escalation when the CLI exits before a TERM-resistant descendant", async mode => {
+      const priorHandlers = new Set(process.listeners("SIGTERM"));
+      const kill = vi.spyOn(process, "kill");
+      let parentPid;
+      let descendantPid;
+      const grandchild = "process.on('SIGTERM',()=>{});process.send('ready');setTimeout(()=>process.exit(0),4000);setInterval(()=>{},1000)";
+      try {
+        const result = await runProcess({
+          command: process.execPath,
+          args: [
+            "-e",
+            `const c=require('child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:['ignore','ignore','ignore','ipc']});c.on('message',()=>process.stdout.write(JSON.stringify({parent:process.pid,descendant:c.pid})+'\\n'));setInterval(()=>{},1000)`,
+          ],
+          attempt: 0,
+          log: () => {},
+          onStdoutLine: line => {
+            const ids = JSON.parse(line);
+            parentPid = ids.parent;
+            descendantPid = ids.descendant;
+            if (mode === "cancellation") process.listeners("SIGTERM").find(handler => !priorHandlers.has(handler))();
+          },
+          runtimeGuard: mode === "guard" ? { shouldTerminate: () => !!descendantPid, pollIntervalMs: 50, termGraceMs: 100 } : undefined,
+          postResultWatchdog: mode === "watchdog" ? { shouldArm: () => !!descendantPid, inactivityTimeoutMs: 50, pollIntervalMs: 50, termGraceMs: 100 } : undefined,
+          shutdownGraceMs: 100,
+          drainTimeoutMs: 100,
+        });
+        expect(kill.mock.calls).toContainEqual([-parentPid, "SIGKILL"]);
+        expect(result.durationMs).toBeLessThan(2500);
+        if (mode === "guard") expect(result.runtimeGuardFired).toBe(true);
+        if (mode === "watchdog") expect(result.watchdogFired).toBe(true);
+        if (mode === "cancellation") expect(result.cancelled).toBe(true);
+        let state;
+        try {
+          state = execFileSync("ps", ["-p", String(descendantPid), "-o", "stat="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+        } catch (error) {
+          if (error.status !== 1) throw error;
+          state = "";
+        }
+        expect(state === "" || state.startsWith("Z")).toBe(true);
+      } finally {
+        if (descendantPid) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        kill.mockRestore();
+      }
+    });
+
+    it("bounds stdio drain after the direct child exits but a descendant remains", async () => {
+      const result = await runProcess({
+        command: process.execPath,
+        args: ["-e", `const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});c.unref();`],
+        attempt: 0,
+        log: () => {},
+        drainTimeoutMs: 100,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.durationMs).toBeLessThan(2000);
+    });
+
+    it("preserves cancellation even when a child handles SIGTERM and exits zero", async () => {
+      let scheduled = false;
+      const originalHandlers = new Set(process.listeners("SIGTERM"));
+      const result = await runProcess({
+        command: process.execPath,
+        args: ["-e", "process.on('SIGTERM',()=>process.exit(0));process.stdout.write('ready\\n');setInterval(()=>{},1000);"],
+        attempt: 0,
+        log: () => {},
+        onStdoutLine: () => {
+          if (!scheduled) {
+            scheduled = true;
+            process.listeners("SIGTERM").find(handler => !originalHandlers.has(handler))();
+          }
+        },
+        shutdownGraceMs: 100,
+        drainTimeoutMs: 100,
+      });
+      expect(result.cancelled).toBe(true);
+      expect(result.exitCode).toBe(143);
+    });
+
     it("resolves with exitCode 0 for a successful command", async () => {
       const logs = [];
       const result = await runProcess({
@@ -69,6 +272,21 @@ describe("process_runner.cjs", () => {
       });
       expect(result.exitCode).toBe(0);
       expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("writes provided stdin to the child and closes the stream", async () => {
+      const logs = [];
+      const stdin = Buffer.concat([Buffer.from("prompt\n", "utf8"), Buffer.from([0, 0xff]), Buffer.alloc(128 * 1024, 0x42)]);
+      const expectedHash = createHash("sha256").update(stdin).digest("hex");
+      const result = await runProcess({
+        command: process.execPath,
+        args: ["-e", "const chunks=[]; process.stdin.on('data', chunk => chunks.push(chunk)); process.stdin.on('end', () => process.stdout.write(require('crypto').createHash('sha256').update(Buffer.concat(chunks)).digest('hex')));"],
+        attempt: 0,
+        log: msg => logs.push(msg),
+        stdin,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.output).toContain(expectedHash);
     });
 
     it("resolves with the actual non-zero exit code on failure", async () => {
@@ -293,6 +511,7 @@ describe("process_runner.cjs", () => {
 
     it("terminates a running process when runtime guard requests it", async () => {
       const logs = [];
+      const triggered = [];
       let checks = 0;
       const result = await runProcess({
         command: process.execPath,
@@ -303,8 +522,9 @@ describe("process_runner.cjs", () => {
           shouldTerminate: () => {
             checks += 1;
             if (checks < 3) return false;
-            return { terminate: true, reason: "test guard tripped" };
+            return { terminate: true, reason: "test guard tripped", event: { type: "agent.execution", data: { categories: ["test_guard"], errorCodes: [], errorTypes: [] } } };
           },
+          onTriggered: decision => triggered.push(decision),
           pollIntervalMs: 25,
           termGraceMs: 200,
         },
@@ -313,21 +533,26 @@ describe("process_runner.cjs", () => {
       expect(result.runtimeGuardFired).toBe(true);
       expect(result.runtimeGuardReason).toContain("test guard tripped");
       expect(result.watchdogFired).toBe(false);
+      expect(triggered).toEqual([{ terminate: true, reason: "test guard tripped", event: { type: "agent.execution", data: { categories: ["test_guard"], errorCodes: [], errorTypes: [] } } }]);
       expect(logs.some(line => line.includes("runtime guard requested termination"))).toBe(true);
     });
 
     it("escalates to SIGKILL after the grace period even when the poll interval is longer", async () => {
       const logs = [];
       const started = Date.now();
+      let ready = false;
       const result = await runProcess({
         command: process.execPath,
         // Ignores SIGTERM, so only SIGKILL can stop it.
-        args: ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 50);"],
+        args: ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 50);"],
         attempt: 0,
         log: msg => logs.push(msg),
+        onStdoutLine: () => {
+          ready = true;
+        },
         runtimeGuard: {
-          shouldTerminate: () => ({ terminate: true, reason: "kill escalation test" }),
-          pollIntervalMs: 50,
+          shouldTerminate: () => ({ terminate: ready, reason: "kill escalation test" }),
+          pollIntervalMs: 1000,
           // Grace period is far shorter than the poll interval below would allow.
           termGraceMs: 150,
         },

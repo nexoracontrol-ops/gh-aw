@@ -85,7 +85,7 @@ The `tools:` field configures which tools the coding agent may use.
 - `blocked-users:` - Usernames whose content is unconditionally blocked (array or GitHub Actions expression); these users receive integrity below `none` and are always denied
 - `approval-labels:` - Label names that elevate a content item's integrity to `approved` when present (array or GitHub Actions expression); does not override `blocked-users`
 - `trusted-users:` - Usernames elevated to `approved` integrity regardless of `author_association` (array or GitHub Actions expression); takes precedence over `min-integrity` but not over `blocked-users`; requires `min-integrity` to be set
-- `private-to-public-flows:` - Opt out of MCP Gateway cross-visibility protections (which block private-repo data from reaching public sinks). `allow` disables `forcePublicRepos` and sink-visibility enforcement for all servers (**not compatible with strict mode**); an array of MCP server IDs (e.g. `[github, my-server]`) exempts only those servers from sink-visibility enforcement (strict-mode compatible, keeps `forcePublicRepos`). Security-sensitive — only use when private→public flows are intended.
+- `private-to-public-flows:` - Opt out of MCP Gateway cross-visibility protections (which block private-repo data from reaching public sinks). `allow` disables `forcePublicRepos` and sink-visibility enforcement for all servers; an array of MCP server IDs (e.g. `[github, my-server]`) exempts only those servers from sink-visibility enforcement while keeping `forcePublicRepos`. Both forms are rejected in strict mode and warn in non-strict mode because action logs are public and agents may expose private data.
 - `toolsets:` - Enable specific GitHub toolset groups (single name string or array; a string is shorthand for a one-element array)
   - **Default toolsets** (when unspecified): `context`, `repos`, `issues`, `pull_requests` (excludes `users` as GitHub Actions tokens don't support user operations)
   - **Group aliases**: `default` (recommended action-friendly set), `action-friendly` (action-safe toolsets, excludes `users`), `all` (everything)
@@ -263,7 +263,7 @@ The following frontmatter fields in imported files are merged into the importing
 - `pre-agent-steps:` - Steps appended in import order
 - `post-steps:` - Steps appended in import order
 - `jobs.<job-id>.setup-steps`, `jobs.<job-id>.pre-steps`, and `jobs.activation.steps` - Merged per job with imported steps first, then main workflow steps. Execution order is `setup-steps` before `pre-steps`; `jobs.activation.steps` run later in the activation job before the activation artifact is staged.
-- `runtimes:`, `network:`, `permissions:`, `services:`, `cache:`, `features:`, `mcp-servers:`
+- `runtimes:`, `network:`, `permissions:`, `services:`, `cache:`, `features:`, `mcp-servers:`. Network allowlists and enabled `hosted-web` domain lists are combined; top-level hosted-web scalar configuration (such as `max-uses` or an explicit disablement) takes precedence.
 - `plugins:` - Union by plugin path; identical refs dedupe, compatible semantic versions select the highest, incompatible majors/non-semver conflicts fail compilation
 
 Example import file:

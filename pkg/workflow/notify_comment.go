@@ -20,7 +20,7 @@ var notifyCommentLog = logger.New("workflow:notify_comment")
 // This job runs when:
 // 1. always() - runs even if agent fails
 // 2. Agent job was not skipped
-// 3. NO add_comment output was produced by the agent (avoids duplicate updates)
+// 3. NO add_comment output was produced, or detection produced no verdict
 // This job depends on all safe output jobs to ensure it runs last
 func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, safeOutputJobNames []string) (*Job, error) {
 	notifyCommentLog.Printf("Building conclusion job: main_job=%s, safe_output_jobs_count=%d", mainJobName, len(safeOutputJobNames))
@@ -30,6 +30,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		notifyCommentLog.Printf("Skipping job: no safe-outputs configured")
 		return nil, nil // No safe-outputs configured, no need for conclusion job
 	}
+	data = c.dryRunConclusionData(data)
 	steps, err := c.buildConclusionJobSteps(data, mainJobName, safeOutputJobNames)
 	if err != nil {
 		return nil, err
@@ -66,6 +67,13 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 // failed-jobs reporting, the optional status-comment update, and the steering-issue step.
 func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName string, safeOutputJobNames []string) ([]string, error) {
 	steps := c.buildConclusionSetupSteps(data)
+	steps = append(steps, c.buildWorkQueueIssuesStep(data)...)
+	steps = append(steps, c.buildConclusionWorkQueueSummaryStep(data)...)
+	if isWorkQueueParticipant(data) {
+		// Queue outputs and failure reports are settled only in their trusted Claim pass.
+		// Native job failure is diagnostic, not authority for anonymous follow-up writes.
+		return append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...), nil
+	}
 	steps = append(steps, c.buildConclusionNoOpStep(data, mainJobName)...)
 	steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
 	steps = append(steps, c.buildConclusionMissingToolStep(data, mainJobName)...)
@@ -78,12 +86,20 @@ func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName strin
 		return nil, err
 	}
 	steps = append(steps, agentFailureSteps...)
-	steps = append(steps, c.buildConclusionReportFailedJobsStep(data, mainJobName)...)
+	failedJobsSteps, err := c.buildConclusionReportFailedJobsStep(data, mainJobName)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, failedJobsSteps...)
 	// Only add the conclusion update step if status comments are explicitly enabled
 	if data.StatusComment != nil && *data.StatusComment {
 		var token string
+		var stepCondition string
 		if data.SafeOutputs != nil && data.SafeOutputs.AddComments != nil {
 			token = data.SafeOutputs.AddComments.GitHubToken
+		}
+		if slices.Contains(safeOutputJobNames, "add_comment") {
+			stepCondition = "always() && !(needs.add_comment.outputs.comment_id)"
 		}
 		steps = append(steps, c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
 			StepName:      "Update reaction comment with completion status",
@@ -93,9 +109,11 @@ func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName strin
 			Script:        getNotifyCommentErrorScript(),
 			ScriptFile:    "notify_comment_error.cjs",
 			CustomToken:   token,
+			StepCondition: stepCondition,
 		})...)
 	}
 	steps = append(steps, c.buildConclusionSteeringIssueStep(data, mainJobName, steeringToken)...)
+	steps = append(steps, buildUsageArtifactPublishSteps(artifactPrefixExprForDownstreamJob(data), IsDetectionJobEnabled(data.SafeOutputs), c.getActionPin)...)
 	if c.actionMode.IsScript() {
 		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
@@ -108,6 +126,24 @@ func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName strin
 // conclusion mechanism.
 func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 	conclusionPerms := ComputePermissionsForSafeOutputs(data.SafeOutputs)
+	if isWorkQueueParticipant(data) {
+		conclusionPerms = NewPermissions()
+		conclusionPerms.Set(PermissionContents, PermissionRead)
+		conclusionPerms.Set(PermissionActions, PermissionRead)
+		if workQueueIssuesConfig(data) != nil {
+			conclusionPerms.Set(PermissionContents, PermissionWrite)
+			conclusionPerms.Set(PermissionIssues, PermissionWrite)
+		}
+		if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
+			conclusionPerms.Set(PermissionIdToken, PermissionWrite)
+		}
+		return conclusionPerms
+	}
+	if isWorkQueueEnabled(data) {
+		if level, ok := conclusionPerms.Get(PermissionContents); !ok || level == PermissionNone {
+			conclusionPerms.Set(PermissionContents, PermissionRead)
+		}
+	}
 	// When observability.otlp.github-app is configured without app-id/private-key
 	// credentials, id-token: write is needed so the conclusion job can mint the OTLP
 	// OIDC token via core.getIDToken(audience) (mirrors threat_detection_job.go).
@@ -119,6 +155,16 @@ func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 	if conclusionReportFailedJobsEnabled(data) {
 		if level, ok := conclusionPerms.Get(PermissionActions); !ok || level == PermissionNone {
 			conclusionPerms.Set(PermissionActions, PermissionRead)
+		}
+	}
+	// The agent-failure handler checks the PR state and agent job steps before
+	// reporting a failed PR merge-ref checkout.
+	if conclusionReportFailureAsIssueEnabled(data) {
+		if level, ok := conclusionPerms.Get(PermissionActions); !ok || level == PermissionNone {
+			conclusionPerms.Set(PermissionActions, PermissionRead)
+		}
+		if level, ok := conclusionPerms.Get(PermissionPullRequests); !ok || level == PermissionNone {
+			conclusionPerms.Set(PermissionPullRequests, PermissionRead)
 		}
 	}
 	// Only request issues: write when at least one conclusion-job mechanism can actually
@@ -140,7 +186,7 @@ func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 // conclusionReportFailedJobsEnabled returns true unless safe-outputs.report-failed-jobs is
 // explicitly set to false. Defaults to true.
 func conclusionReportFailedJobsEnabled(data *WorkflowData) bool {
-	return data.SafeOutputs == nil || data.SafeOutputs.ReportFailedJobs == nil || *data.SafeOutputs.ReportFailedJobs
+	return data.SafeOutputs == nil || data.SafeOutputs.ReportFailedJobs == nil || !strings.EqualFold(strings.TrimSpace(data.SafeOutputs.ReportFailedJobs.String()), "false")
 }
 
 // conclusionReportFailureAsIssueEnabled returns true unless safe-outputs.report-failure-as-issue
@@ -185,10 +231,11 @@ func conclusionMayCreateIssue(data *WorkflowData) bool {
 
 // buildUsageArtifactInputDownloadSteps creates the artifact download steps that feed the
 // usage artifact: the safe-outputs items manifest (used by
-// generate_usage_activity_summary.cjs) and, when the workflow declares evals, the evals
-// artifact. Grader results need no dedicated download because the conclusion job already
-// downloads the unified agent artifact, which contains them.
-func buildUsageArtifactInputDownloadSteps(prefix string, hasEvals bool, pinAction func(string) string) []string {
+// generate_usage_activity_summary.cjs), the experiment artifact when the workflow declares
+// experiments (experimentArtifactName is non-empty), and the evals artifact when the
+// workflow declares evals. Grader results need no dedicated download because the
+// conclusion job already downloads the unified agent artifact, which contains them.
+func buildUsageArtifactInputDownloadSteps(prefix string, hasEvals bool, experimentArtifactName string, pinAction func(string) string) []string {
 	safeOutputsItemsArtifactName := prefix + constants.SafeOutputItemsArtifactName.String()
 	safeOutputsDownloadAction := pinAction("actions/download-artifact")
 	steps := []string{
@@ -201,6 +248,19 @@ func buildUsageArtifactInputDownloadSteps(prefix string, hasEvals bool, pinActio
 	}
 	steps = append(steps, downloadArtifactInputLines(safeOutputsItemsArtifactName, safeOutputsDownloadAction)...)
 	steps = append(steps, "          path: /tmp/gh-aw/\n")
+	if experimentArtifactName != "" {
+		experimentDownloadAction := pinAction("actions/download-artifact")
+		steps = append(steps,
+			"      - name: Download experiment artifact\n",
+			"        id: download-experiment-artifact\n",
+			"        if: always()\n",
+			"        continue-on-error: true\n",
+			fmt.Sprintf("        uses: %s\n", experimentDownloadAction),
+			"        with:\n",
+		)
+		steps = append(steps, downloadArtifactInputLines(experimentArtifactName, experimentDownloadAction)...)
+		steps = append(steps, fmt.Sprintf("          path: %s/\n", experimentsCacheDir))
+	}
 	if !hasEvals {
 		return steps
 	}
@@ -220,24 +280,27 @@ func buildUsageArtifactInputDownloadSteps(prefix string, hasEvals bool, pinActio
 
 // buildUsageArtifactUploadSteps creates steps that collect and upload a compact usage artifact.
 // The artifact includes aw_info.json, aw-info.jsonl, agent_usage.json, agent_usage.jsonl, detection_usage.jsonl,
-// evals.jsonl, grader results, and agent/detection token usage JSONL files (when present).
+// evals.jsonl, evals token usage and execution evidence, A/B experiment state and assignments,
+// grader results, threat-detection outcome/verdict, and agent/detection token usage and
+// model-routing JSONL files
+// (when present), so the audit command can mine these results from the usage artifact alone.
 // It also downloads the safe-outputs-items artifact so that generate_usage_activity_summary.cjs
 // can include safe-output item counts in the activity summary without requiring a separate artifact download.
-func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, pinAction func(string) string) []string {
+func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, experimentArtifactName string, hasDetection bool, pinAction func(string) string) []string {
+	steps := buildUsageArtifactInputDownloadSteps(prefix, hasEvals, experimentArtifactName, pinAction)
+	return append(steps, buildUsageArtifactPublishSteps(prefix, hasDetection, pinAction)...)
+}
+
+func buildUsageArtifactPublishSteps(prefix string, hasDetection bool, pinAction func(string) string) []string {
 	usageArtifactName := prefix + "usage"
-	steps := buildUsageArtifactInputDownloadSteps(prefix, hasEvals, pinAction)
-	steps = append(steps,
-		"      - name: Collect usage artifact files\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        run: bash \"%s/collect_usage_artifact_files.sh\"\n", SetupActionDestinationShell),
-		"      - name: Upload usage artifact\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/upload-artifact")),
+	steps := buildUsageArtifactCollectionStep(hasDetection)
+	steps = append(steps, buildUsageActivityGenerationStep(pinAction)...)
+	usageArtifactUploadAction := pinAction("actions/upload-artifact")
+	usageArtifactUploadWithLines := []string{
 		"        with:\n",
 		fmt.Sprintf("          name: %s\n", usageArtifactName),
 		"          path: |\n",
+		"            /tmp/gh-aw/usage/aw_session.jsonl\n",
 		"            /tmp/gh-aw/usage/aw_info.json\n",
 		"            /tmp/gh-aw/usage/aw-info.jsonl\n",
 		"            /tmp/gh-aw/usage/agent_usage.json\n",
@@ -248,15 +311,88 @@ func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, pinAction func(
 		"            /tmp/gh-aw/usage/graders/grader_results.json\n",
 		"            /tmp/gh-aw/usage/github_rate_limits.jsonl\n",
 		"            /tmp/gh-aw/usage/agent/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/model-routing.jsonl\n",
 		"            /tmp/gh-aw/usage/agent/execution.json\n",
 		"            /tmp/gh-aw/usage/detection/token_usage.jsonl\n",
 		"            /tmp/gh-aw/usage/detection/execution.json\n",
+		"            /tmp/gh-aw/usage/detection/detection_result.json\n",
 		"            /tmp/gh-aw/usage/evals/token_usage.jsonl\n",
 		"            /tmp/gh-aw/usage/evals/execution.json\n",
+		"            /tmp/gh-aw/usage/experiment/state.jsonl\n",
+		"            /tmp/gh-aw/usage/experiment/state.json\n",
+		"            /tmp/gh-aw/usage/experiment/assignments.json\n",
 		"            /tmp/gh-aw/usage/activity/summary.json\n",
 		"          if-no-files-found: ignore\n",
+	}
+	retryUsageArtifactUploadWithLines := append([]string{}, usageArtifactUploadWithLines...)
+	retryUsageArtifactUploadWithLines = append(retryUsageArtifactUploadWithLines, "          overwrite: true\n")
+	steps = append(steps,
+		"      - name: Upload usage artifact\n",
+		"        id: upload-usage-artifact\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", usageArtifactUploadAction),
 	)
+	steps = append(steps, usageArtifactUploadWithLines...)
+	// The initial upload can fail transiently (e.g. a runner-side DNS blip while
+	// talking to blob storage). A missing usage artifact permanently blocks the
+	// daily AI Credits guardrail for this run, so wait briefly and retry once
+	// before giving up, so a short-lived network hiccup has time to clear.
+	steps = append(steps,
+		"      - name: Wait before retrying usage artifact upload\n",
+		"        if: always() && steps.upload-usage-artifact.outcome == 'failure'\n",
+		"        run: sleep 10\n",
+		"      - name: Retry upload usage artifact\n",
+		"        id: upload-usage-artifact-retry\n",
+		"        if: always() && steps.upload-usage-artifact.outcome == 'failure'\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", usageArtifactUploadAction),
+	)
+	steps = append(steps, retryUsageArtifactUploadWithLines...)
 	return steps
+}
+
+func buildUsageArtifactCollectionStep(hasDetection bool) []string {
+	collectionStep := []string{
+		"      - name: Collect usage artifact files\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+	}
+	var env []string
+	if hasDetection {
+		env = append(env,
+			"          GH_AW_DETECTION_JOB_RESULT: ${{ needs.detection.result }}\n",
+			"          GH_AW_DETECTION_CONCLUSION: ${{ needs.detection.outputs.detection_conclusion }}\n",
+			"          GH_AW_DETECTION_REASON: ${{ needs.detection.outputs.detection_reason }}\n",
+		)
+	}
+	if len(env) > 0 {
+		collectionStep = append(collectionStep, "        env:\n")
+		collectionStep = append(collectionStep, env...)
+	}
+	collectionStep = append(collectionStep, fmt.Sprintf("        run: bash \"%s/collect_usage_artifact_files.sh\"\n", SetupActionDestinationShell))
+	return collectionStep
+}
+
+func buildUsageActivityGenerationStep(pinAction func(string) string) []string {
+	return []string{
+		"      - name: Generate usage activity summary and unified session\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", pinAction("actions/github-script")),
+		"        env:\n",
+		"          GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS: ${{ needs.activation.outputs.daily_ai_credits_guardrail_status }}\n",
+		"          GH_AW_DAILY_AI_CREDITS_EXCEEDED: ${{ needs.activation.outputs.daily_ai_credits_exceeded }}\n",
+		"          GH_AW_DAILY_AI_CREDITS_TOTAL: ${{ needs.activation.outputs.daily_ai_credits_total }}\n",
+		"          GH_AW_DAILY_AI_CREDITS_ESTIMATED: ${{ needs.activation.outputs.daily_ai_credits_estimated }}\n",
+		"          GH_AW_DAILY_AI_CREDITS_THRESHOLD: ${{ needs.activation.outputs.daily_ai_credits_threshold }}\n",
+		"        with:\n",
+		"          script: |\n",
+		fmt.Sprintf("            const { setupGlobals } = require('%s/setup_globals.cjs');\n", SetupActionDestination),
+		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
+		fmt.Sprintf("            const { main } = require('%s/generate_usage_artifacts.cjs');\n", SetupActionDestination),
+		"            await main();\n",
+	}
 }
 
 // isGroupConcurrencyQueueEnabled reports whether compiler-generated concurrency groups

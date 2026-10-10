@@ -219,7 +219,7 @@ jobs:
 
       - name: Upload spellcheck artifact
         if: success()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: spellcheck-results
           path: |
@@ -247,7 +247,7 @@ safe-outputs:
 
 steps:
   - name: Download spellcheck artifact
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       name: spellcheck-results
       path: /tmp/gh-aw/agent/spellcheck
@@ -279,7 +279,6 @@ features:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 evals:
   - id: spellcheck_completed
     question: Did the agent run American English spellcheck on AstroStyleLite docs content?

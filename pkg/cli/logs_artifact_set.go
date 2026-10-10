@@ -3,7 +3,7 @@
 // for filtering artifact downloads in the logs and audit commands.
 //
 // Key responsibilities:
-//   - Defining known artifact set names (all, info, agent, mcp, firewall, detection, github-api, activation)
+//   - Defining known artifact set names (all, info, agent, mcp, firewall, detection, github-api, activation, work-queue)
 //   - Mapping sets to concrete artifact name patterns
 //   - Validating artifact set inputs from CLI flags and MCP arguments
 //   - Determining whether a given artifact name matches an active filter
@@ -69,7 +69,8 @@ const (
 	ArtifactSetGitHubAPI ArtifactSet = "github-api"
 
 	// ArtifactSetExperiment downloads the experiment artifact containing A/B experiment
-	// state (state.jsonl or state.json) uploaded by the activation job when experiments are declared.
+	// state (state.jsonl or state.json) uploaded by the activation job when experiments are declared,
+	// plus the usage artifact, which also carries the experiment state and assignments.
 	ArtifactSetExperiment ArtifactSet = "experiment"
 
 	// ArtifactSetUsage downloads the compact usage artifact produced by the
@@ -84,6 +85,10 @@ const (
 	// ArtifactSetEvals downloads the usage artifact, which now includes evals.jsonl
 	// produced by the evals job (copied into usage by the conclusion job).
 	ArtifactSetEvals ArtifactSet = "evals"
+
+	// ArtifactSetWorkQueue downloads queue snapshots, finish intents,
+	// and the workflow logs containing coordinator publication and reconciliation.
+	ArtifactSetWorkQueue ArtifactSet = "work-queue"
 )
 
 // artifactSetArtifacts maps each named set to the list of artifact base names it includes.
@@ -100,15 +105,17 @@ var artifactSetArtifacts = map[ArtifactSet][]string{
 	ArtifactSetDetection:  {constants.DetectionArtifactName.String()},
 	// github-api: both jobs upload github_rate_limits.jsonl; fetch both for a complete view.
 	ArtifactSetGitHubAPI: {constants.ActivationArtifactName.String(), constants.AgentArtifactName.String()},
-	// experiment: A/B experiment state uploaded by the activation job.
-	ArtifactSetExperiment: {constants.ExperimentArtifactName.String()},
+	// experiment: A/B experiment state uploaded by the activation job; the usage artifact
+	// also carries a copy of the state and assignments staged by the conclusion job.
+	ArtifactSetExperiment: {constants.ExperimentArtifactName.String(), constants.UsageArtifactName.String()},
 	// usage: compact conclusion artifact for lightweight reporting/forecasting.
 	ArtifactSetUsage: {constants.UsageArtifactName.String()},
 	// evals: evals results are now included in the usage artifact.
 	ArtifactSetEvals: {constants.UsageArtifactName.String()},
 	// graders: grader results are included in the usage artifact, remain part of
 	// the unified agent artifact, and are preserved in the fallback transport.
-	ArtifactSetGraders: {constants.UsageArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+	ArtifactSetGraders:   {constants.UsageArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+	ArtifactSetWorkQueue: {constants.ActivationArtifactName.String(), constants.AgentArtifactName.String()},
 }
 
 const maxArtifactHintExamples = 2
@@ -128,15 +135,19 @@ func ValidArtifactSetNames() []string {
 
 func usageOnlyArtifactHintMessage() string {
 	examples := artifactHintExampleSets()
+	firstExample := ""
+	if len(examples) > 0 {
+		firstExample = examples[0]
+	}
 	switch len(examples) {
 	case 0:
 		return "Only the usage artifact was downloaded. Use --artifacts all to download all artifacts."
 	case 1:
-		return fmt.Sprintf("Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s.", examples[0])
+		return fmt.Sprintf("Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s.", firstExample)
 	default:
 		return fmt.Sprintf(
 			"Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s, or combinations such as --artifacts %s.",
-			examples[0],
+			firstExample,
 			strings.Join(examples, ","),
 		)
 	}

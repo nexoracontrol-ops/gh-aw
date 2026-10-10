@@ -14,7 +14,26 @@ var consolidatedSafeOutputsEnvvarsLog = logger.New("workflow:compiler_safe_outpu
 // for the consolidated safe_outputs job. These are variables that are common to all safe output steps.
 func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID string) map[string]string {
 	envVars := make(map[string]string)
+	addJobLevelWorkQueueEnvVars(envVars, data)
+	c.addJobLevelWorkflowMetadata(envVars, data, workflowID)
+	addJobLevelEngineMetadata(envVars, data)
+	addJobLevelCommandMetadata(envVars, data)
+	c.addJobLevelSafeOutputConfig(envVars, data)
+	return envVars
+}
 
+func addJobLevelWorkQueueEnvVars(envVars map[string]string, data *WorkflowData) {
+	if isWorkQueueEnabled(data) {
+		envVars["GH_AW_WORK_QUEUE_ENABLED"] = `"true"`
+		envVars["GH_AW_WORK_QUEUE_ROLE"] = fmt.Sprintf("%q", workQueueRuntimeRole(data))
+		if isWorkQueueParticipant(data) {
+			envVars["GH_AW_WORK_QUEUE_INTENT_ORIGIN"] = `"${{ needs.agent.outputs.work_queue_origin }}"`
+		}
+		envVars["GH_AW_WORK_QUEUE_SNAPSHOT"] = fmt.Sprintf("%q", constants.WorkQueueSnapshotPath)
+	}
+}
+
+func (c *Compiler) addJobLevelWorkflowMetadata(envVars map[string]string, data *WorkflowData, workflowID string) {
 	// Set GH_AW_WORKFLOW_ID to the workflow ID (filename without extension)
 	// This is used for branch naming in create_pull_request and other operations
 	envVars["GH_AW_WORKFLOW_ID"] = fmt.Sprintf("%q", workflowID)
@@ -55,7 +74,9 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 	if utcOffset := c.getCompiledProjectUTCOffset(); utcOffset != "" {
 		envVars["GH_AW_PROJECT_UTC"] = fmt.Sprintf("%q", utcOffset)
 	}
+}
 
+func addJobLevelEngineMetadata(envVars map[string]string, data *WorkflowData) {
 	// Add engine metadata that's common to all steps
 	if data.EngineConfig != nil {
 		if data.EngineConfig.ID != "" {
@@ -66,17 +87,23 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 		}
 		// Prefer explicit compile-time model; fall back to the runtime model captured by the
 		// activation job so footers always show the actual model used for auditability.
-		if data.Model != "" {
+		if data.Model != "" && data.EngineConfig.ModelRouting == nil {
 			envVars["GH_AW_ENGINE_MODEL"] = fmt.Sprintf("%q", data.Model)
 		} else {
 			envVars["GH_AW_ENGINE_MODEL"] = fmt.Sprintf("${{ needs.%s.outputs.model }}", constants.AgentJobName)
+		}
+		if data.EngineConfig.ModelRouting != nil {
+			envVars["GH_AW_ENGINE_MODEL_EFFORT"] = fmt.Sprintf("${{ needs.%s.outputs.model_effort }}", constants.AgentJobName)
+			envVars["GH_AW_MODEL_ROUTING_STATUS"] = fmt.Sprintf("${{ needs.%s.outputs.model_routing_status }}", constants.AgentJobName)
 		}
 	}
 
 	envVars["GH_AW_AIC"] = fmt.Sprintf("${{ needs.%s.outputs.aic }}", constants.AgentJobName)
 	envVars["GH_AW_AMBIENT_CONTEXT"] = fmt.Sprintf("${{ needs.%s.outputs.ambient_context }}", constants.AgentJobName)
 	envVars["GH_AW_AGENT_AIC"] = fmt.Sprintf("${{ needs.%s.outputs.aic }}", constants.AgentJobName)
+}
 
+func addJobLevelCommandMetadata(envVars map[string]string, data *WorkflowData) {
 	// Add slash command metadata so safe output handlers can render run-again footer hints.
 	if len(data.Command) > 0 {
 		if commandsJSON, err := json.Marshal(data.Command); err == nil {
@@ -92,7 +119,9 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 			envVars["GH_AW_LABEL_COMMANDS"] = fmt.Sprintf("%q", string(labelCommandsJSON))
 		}
 	}
+}
 
+func (c *Compiler) addJobLevelSafeOutputConfig(envVars map[string]string, data *WorkflowData) {
 	// Add safe output job environment variables (staged/target repo)
 	if data.SafeOutputs != nil {
 		if value := resolveSafeOutputsStagedValue(c.trialMode, data.SafeOutputs.Staged); value != nil {
@@ -144,6 +173,4 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 	if headSHAExpr := headSHAExpressionForTrigger(data.RawFrontmatter["on"]); headSHAExpr != "" {
 		envVars["GH_AW_HEAD_SHA"] = headSHAExpr
 	}
-
-	return envVars
 }

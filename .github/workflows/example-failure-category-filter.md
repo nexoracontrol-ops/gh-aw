@@ -19,13 +19,10 @@ safe-outputs:
   create-issue:
 imports:
   - shared/reporting.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 engine:
   id: codex
   model-provider: openai
-model: openai/gpt-5.3-codex
+model: openai/gpt-5.6-sol
 ---
 
 # Example: Failure Category Filtering

@@ -15,7 +15,9 @@ var dailyAICWorkflowLog = logger.New("workflow:daily_ai_credits")
 
 const maxDailyAICreditsField = "max-daily-ai-credits"
 const maxDailyAICreditsEnvVar = "GH_AW_MAX_DAILY_AI_CREDITS"
+const maxDailyAICBackendEnvVar = "GH_AW_MAX_DAILY_AI_CREDITS_BACKEND"
 const maxDailyAICreditsConfiguredIfExpr = "${{ env.GH_AW_MAX_DAILY_AI_CREDITS != '' }}"
+const maxDailyAICBackendRepoMemory = "repo-memory"
 
 // extractMaxDailyAICObjectValue normalizes the max-daily-ai-credits frontmatter
 // value for scalar processing. When the value is in the object form
@@ -64,6 +66,81 @@ func extractMaxDailyAICGitHubApp(frontmatter map[string]any) *GitHubAppConfig {
 		return nil
 	}
 	return app
+}
+
+// extractMaxDailyAICContinueOnError reports whether failures to determine the
+// daily AI Credits total should be treated as warnings, reading the
+// continue-on-error key directly from an already-unwrapped max-daily-ai-credits
+// object (either the main workflow's raw frontmatter value or an imported one).
+func extractMaxDailyAICContinueOnError(raw any) (bool, bool) {
+	rawMap, ok := raw.(map[string]any)
+	if !ok {
+		return false, false
+	}
+	continueOnError, ok := rawMap["continue-on-error"].(bool)
+	if !ok {
+		return false, false
+	}
+	return continueOnError, true
+}
+
+// extractMaxDailyAICBackend reads the optional backend key from an
+// already-unwrapped max-daily-ai-credits object and reports whether it was
+// present.
+func extractMaxDailyAICBackend(raw any) (string, bool) {
+	rawMap, ok := raw.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	backend, ok := rawMap["backend"].(string)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(backend), true
+}
+
+// resolveMaxDailyAICContinueOnError resolves the effective continue-on-error
+// mode for the daily AI Credits guardrail. The main workflow frontmatter takes
+// precedence; when it does not set continue-on-error, the first-wins imported
+// max-daily-ai-credits object (MergedMaxDailyAICredits) is consulted so
+// imported warning-mode configuration is not silently dropped.
+func resolveMaxDailyAICContinueOnError(frontmatter map[string]any, importedJSON string) bool {
+	if continueOnError, ok := extractMaxDailyAICContinueOnError(frontmatter[maxDailyAICreditsField]); ok {
+		return continueOnError
+	}
+	if importedJSON == "" {
+		return false
+	}
+	var imported any
+	if err := json.Unmarshal([]byte(importedJSON), &imported); err != nil {
+		dailyAICWorkflowLog.Printf("Failed to unmarshal imported max-daily-ai-credits JSON for continue-on-error resolution: %v", err)
+		return false
+	}
+	continueOnError, _ := extractMaxDailyAICContinueOnError(imported)
+	return continueOnError
+}
+
+func resolveMaxDailyAICBackend(frontmatter map[string]any, importedJSON string) string {
+	if backend, ok := extractMaxDailyAICBackend(frontmatter[maxDailyAICreditsField]); ok {
+		return backend
+	}
+	if importedJSON == "" {
+		return ""
+	}
+	var imported any
+	if err := json.Unmarshal([]byte(importedJSON), &imported); err != nil {
+		dailyAICWorkflowLog.Printf("Failed to unmarshal imported max-daily-ai-credits JSON for backend resolution: %v", err)
+		return ""
+	}
+	backend, _ := extractMaxDailyAICBackend(imported)
+	return backend
+}
+
+func resolveMaxDailyAICBackendIntoWorkflowData(data *WorkflowData, frontmatter map[string]any, importedJSON string) {
+	if data == nil {
+		return
+	}
+	data.MaxDailyAICBackend = resolveMaxDailyAICBackend(frontmatter, importedJSON)
 }
 
 // parseMaxDailyAICValue normalizes max-daily-ai-credits
@@ -129,33 +206,41 @@ func resolveMaxDailyAICFromRaw(raw any) (*string, bool) {
 }
 
 func resolveMaxDailyAIC(frontmatter map[string]any, importedJSON string) *string {
+	value, _ := resolveMaxDailyAICWithSource(frontmatter, importedJSON)
+	return value
+}
+
+func resolveMaxDailyAICWithSource(frontmatter map[string]any, importedJSON string) (*string, bool) {
 	if value, found := resolveMaxDailyAICFromRaw(frontmatter[maxDailyAICreditsField]); found {
 		dailyAICWorkflowLog.Print("Resolved max-daily-ai-credits from workflow frontmatter")
-		return value
+		return value, true
 	}
 	if importedJSON == "" {
 		dailyAICWorkflowLog.Print("No frontmatter value and no imported config; falling back to default max-daily-ai-credits")
 		expr := compilerenv.BuildDefaultMaxDailyAICreditsExpression(constants.DefaultMaxDailyAICredits)
-		return parseMaxDailyAICValue(expr)
+		return parseMaxDailyAICValue(expr), false
 	}
 	var imported any
 	if err := json.Unmarshal([]byte(importedJSON), &imported); err != nil {
 		dailyAICWorkflowLog.Printf("Failed to unmarshal imported max-daily-ai-credits JSON, using default: %v", err)
 		expr := compilerenv.BuildDefaultMaxDailyAICreditsExpression(constants.DefaultMaxDailyAICredits)
-		return parseMaxDailyAICValue(expr)
+		return parseMaxDailyAICValue(expr), false
 	}
 	if value, found := resolveMaxDailyAICFromRaw(imported); found {
 		dailyAICWorkflowLog.Print("Resolved max-daily-ai-credits from imported config")
-		return value
+		return value, true
 	}
 	dailyAICWorkflowLog.Print("Imported config did not provide a usable value; falling back to default max-daily-ai-credits")
 	expr := compilerenv.BuildDefaultMaxDailyAICreditsExpression(constants.DefaultMaxDailyAICredits)
-	return parseMaxDailyAICValue(expr)
+	return parseMaxDailyAICValue(expr), false
 }
 
 // hasMaxDailyAICGuardrail reports whether compiler should emit the
 // daily AI Credits guardrail wiring. The guardrail is enabled by default.
 func hasMaxDailyAICGuardrail(data *WorkflowData) bool {
+	if data != nil && data.DryRun {
+		return false
+	}
 	return !hasWorkflowExplicitMaxDailyAICDisable(data)
 }
 
@@ -180,22 +265,32 @@ func hasMaxDailyAICFrontmatterConfig(data *WorkflowData) bool {
 // are accepted; GitHub Actions expressions are passed through unchanged for
 // runtime evaluation.
 func validateMaxDailyAICFrontmatter(data *WorkflowData) error {
-	if data == nil || data.RawFrontmatter == nil {
+	if data == nil {
 		return nil
 	}
 	raw, ok := data.RawFrontmatter[maxDailyAICreditsField]
-	if !ok {
-		return nil
-	}
-	// Object form: require a "value" key and validate the value.
-	if m, ok := raw.(map[string]any); ok {
-		if _, hasValue := m["value"]; !hasValue {
-			return fmt.Errorf("%s object form requires a 'value' field", maxDailyAICreditsField)
+	if ok {
+		backend, hasBackend := extractMaxDailyAICBackend(raw)
+		// Object form: require a "value" key and validate the value.
+		if m, ok := raw.(map[string]any); ok {
+			if _, hasValue := m["value"]; !hasValue {
+				return fmt.Errorf("%s object form requires a 'value' field", maxDailyAICreditsField)
+			}
+		}
+		effective := extractMaxDailyAICObjectValue(raw)
+		if val, ok := typeutil.ParseIntValue(effective); ok && val < -1 {
+			return fmt.Errorf("%s must be -1 (disable) or a positive integer, got %d", maxDailyAICreditsField, val)
+		}
+		if hasBackend {
+			switch backend {
+			case "", maxDailyAICBackendRepoMemory:
+			default:
+				return fmt.Errorf("%s backend must be %q, got %q", maxDailyAICreditsField, maxDailyAICBackendRepoMemory, backend)
+			}
 		}
 	}
-	effective := extractMaxDailyAICObjectValue(raw)
-	if val, ok := typeutil.ParseIntValue(effective); ok && val < -1 {
-		return fmt.Errorf("%s must be -1 (disable) or a positive integer, got %d", maxDailyAICreditsField, val)
+	if data.MaxDailyAICBackend == maxDailyAICBackendRepoMemory && (data.RepoMemoryConfig == nil || len(data.RepoMemoryConfig.Memories) == 0) {
+		return fmt.Errorf("%s backend %q requires tools.repo-memory", maxDailyAICreditsField, maxDailyAICBackendRepoMemory)
 	}
 	return nil
 }

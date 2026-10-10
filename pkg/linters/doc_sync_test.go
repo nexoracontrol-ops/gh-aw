@@ -26,19 +26,24 @@ var notYetEnforced = map[string]string{
 	"blankassigncomma":            "existing production violations need remediation before enforcement; nolint suppression already works",
 	"bufferresetbeforereuse":      "new correctness analyzer needs an enforcement-readiness audit before native CI enables it",
 	"bufioscannererunchecked":     "existing scanner loops need Err handling before native CI enables it",
+	"closeerrorunchecked":         "existing production violations need remediation before enforcement; nolint suppression already works",
 	"errorfwrapv":                 "requires an enforcement audit after the recent false-positive fix (#51928)",
 	"errormessage":                "dedicated lint-error-messages CI job is intentionally advisory (continue-on-error per #54800)",
 	"excessivefuncparams":         "existing production violations need remediation before enforcement; nolint suppression already works",
+	"fprintferrorunchecked":       "existing production violations need remediation before enforcement; nolint suppression already works",
 	"hardcodedfilepath":           "requires an enforcement audit after the same-package constant fix (#52428)",
 	"largefunc":                   "existing production violations need remediation before enforcement; nolint suppression already works",
 	"lenstringzero":               "requires an enforcement audit after the diagnostic-message fix (#54717)",
 	"manualpathconcat":            "existing production violations need remediation",
 	"packagelevelmutableslicemap": "existing production violations need remediation",
+	"reflectdeepequalusage":       "existing reflect.DeepEqual uses need case-by-case review before CI enforcement",
 	"seenmapbool":                 "existing production violations need remediation",
 	"sprintferrdot":               "has not yet completed an enforcement-readiness audit",
 	"ssljson":                     "has not yet completed an enforcement-readiness audit",
 	"stringsconcatloop":           "has not yet completed an enforcement-readiness audit",
+	"typeassertionnil":            "needs a cross-platform enforcement-readiness audit before CI enables it",
 	"typeassertionokdiscarded":    "existing production violations need remediation before enforcement; nolint suppression already works",
+	"uncheckedsliceindex":         "existing production violations need remediation before enforcement; nolint suppression already works",
 }
 
 // TestDocGo_CountMatchesBullets validates that the "All N active analyzers:"
@@ -116,7 +121,7 @@ func TestCIEnforcedLintersMatchRegistry(t *testing.T) {
 	require.NoError(t, err, "cgo.yml must be present")
 
 	flagMatches := linterFlagsRe.FindAllStringSubmatch(string(workflowBytes), -1)
-	require.Len(t, flagMatches, 2, "cgo.yml must define native and wasm LINTER_FLAGS values")
+	require.Len(t, flagMatches, 3, "cgo.yml must define native, console-stream, and wasm LINTER_FLAGS values")
 
 	enforced := make(map[string]struct{})
 	for _, match := range flagMatches {

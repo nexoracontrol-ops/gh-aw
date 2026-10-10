@@ -5,7 +5,9 @@ description: Tracks and visualizes daily code metrics and trends to monitor repo
 on:
   schedule: daily
   workflow_dispatch:
-max-daily-ai-credits: 10000
+max-daily-ai-credits:
+  value: 10000
+  backend: repo-memory
 permissions:
   contents: read
   issues: read
@@ -13,11 +15,10 @@ permissions:
   copilot-requests: write
 tracker-id: daily-code-metrics
 engine: copilot
-model: claude-sonnet-4.5
+model: copilot/auto
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:

@@ -15,6 +15,8 @@ type activeModelInventory struct {
 	aliases map[string]struct{}
 }
 
+var compileBuildModelsReport = buildModelsReport
+
 func buildActiveModelInventory(report modelsReport) *activeModelInventory {
 	if len(report.Observed) == 0 {
 		return nil
@@ -121,15 +123,20 @@ func findUnknownConfiguredModels(data *workflow.WorkflowData, inventory *activeM
 
 // PrepareCompileModelValidation builds the active model inventory used by compile --models.
 func PrepareCompileModelValidation(ctx context.Context, config *CompileConfig) {
+	config.modelValidationWarnings = nil
+	if config.DryRun {
+		config.Models = true
+	}
 	if !config.Models {
 		return
 	}
-	report := buildModelsReport(ctx, modelsReportOptions{
+	report := compileBuildModelsReport(ctx, modelsReportOptions{
 		logsDir:         defaultLogsOutputDir,
 		refreshObserved: true,
 		refreshCount:    defaultModelsRefreshCount,
 	})
 	config.activeModels = buildActiveModelInventory(report)
+	config.modelValidationWarnings = slices.Clone(report.Warnings)
 }
 
 func unknownConfiguredModelMessages(data *workflow.WorkflowData, inventory *activeModelInventory) []string {
@@ -139,6 +146,22 @@ func unknownConfiguredModelMessages(data *workflow.WorkflowData, inventory *acti
 		messages = append(messages, issue.Message)
 	}
 	return messages
+}
+
+func configuredModelValidationMessages(data *workflow.WorkflowData, inventory *activeModelInventory, requireInventory bool) []string {
+	if requireInventory && inventory == nil && data != nil {
+		hasConfiguredModels := len(data.ModelPolicyAllowed) > 0 || len(data.ModelPolicyBlocked) > 0
+		if engine, ok := data.RawFrontmatter["engine"].(map[string]any); ok {
+			if models, ok := engine["models"].(map[string]any); ok {
+				defaultModel, hasDefaultModel := models["default"].(string)
+				hasConfiguredModels = hasConfiguredModels || (hasDefaultModel && defaultModel != "") || len(stringSlice(models["supported"])) > 0
+			}
+		}
+		if hasConfiguredModels {
+			return []string{"development mode cannot check configured models: the observed active model inventory is unavailable"}
+		}
+	}
+	return unknownConfiguredModelMessages(data, inventory)
 }
 
 func stringSlice(value any) []string {

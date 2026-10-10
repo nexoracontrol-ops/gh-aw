@@ -17,9 +17,6 @@ imports:
   - shared/otlp.md
   - shared/reporting.md
   - shared/graders.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
@@ -839,7 +836,7 @@ timeout-minutes: 10
 engine:
   id: codex
   model-provider: openai
-model: openai/gpt-5.3-codex
+model: openai/gpt-5.6-sol
 strict: true
 
 evals:

@@ -35,10 +35,6 @@ type sandboxRuntimeProfile struct {
 	// AWFCommand is the command prefix used to invoke AWF.
 	AWFCommand string
 
-	// SupportsRuntimeInstall is true when sandbox.agent.runtime-install is
-	// meaningful, i.e. the compiler generates runtime provisioning steps.
-	SupportsRuntimeInstall bool
-
 	// SupportsHostAccess is true when sandbox.agent.allow-host-ports and
 	// automatic connectivity to GitHub Actions services: are available.
 	SupportsHostAccess bool
@@ -59,20 +55,6 @@ var sandboxRuntimeProfiles = map[AgentRuntime]sandboxRuntimeProfile{
 		AWFCommand:         constants.AWFLegacySecurityCommand,
 		SupportsHostAccess: true,
 	},
-	AgentRuntimeGVisor: {
-		Runtime:                AgentRuntimeGVisor,
-		NetworkIsolation:       true,
-		Rootless:               true,
-		AWFCommand:             constants.AWFDefaultCommand.String(),
-		SupportsRuntimeInstall: true,
-	},
-	AgentRuntimeDockerSbx: {
-		Runtime:                AgentRuntimeDockerSbx,
-		NetworkIsolation:       true,
-		Rootless:               true,
-		AWFCommand:             constants.AWFDefaultCommand.String(),
-		SupportsRuntimeInstall: true,
-	},
 	AgentRuntimeCloudHypervisor: {
 		Runtime:          AgentRuntimeCloudHypervisor,
 		NetworkIsolation: true,
@@ -81,6 +63,11 @@ var sandboxRuntimeProfiles = map[AgentRuntime]sandboxRuntimeProfile{
 		// legacy-security or host-access flags are implied by the sudo prefix.
 		AWFCommand: constants.AWFCloudHypervisorCommand,
 	},
+	AgentRuntimeNVX: {
+		Runtime:          AgentRuntimeNVX,
+		NetworkIsolation: true,
+		AWFCommand:       constants.AWFNVXCommand,
+	},
 }
 
 // supportedAgentRuntimes lists the runtime values accepted in frontmatter, in
@@ -88,9 +75,8 @@ var sandboxRuntimeProfiles = map[AgentRuntime]sandboxRuntimeProfile{
 var supportedAgentRuntimes = []AgentRuntime{
 	AgentRuntimeDocker,
 	AgentRuntimeDockerSudoIptables,
-	AgentRuntimeGVisor,
-	AgentRuntimeDockerSbx,
 	AgentRuntimeCloudHypervisor,
+	AgentRuntimeNVX,
 }
 
 // supportedAgentRuntimeNames returns the supported runtime values as strings.

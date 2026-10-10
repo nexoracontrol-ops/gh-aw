@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -51,7 +52,7 @@ func (e *ClaudeEngine) expandNeutralToolsToClaudeTools(tools map[string]any) map
 	claudeAllowed := getOrCreateToolMap(claudeSection, "allowed")
 
 	// Convert neutral tools to Claude tools
-	if bashTool, hasBash := tools["bash"]; hasBash {
+	if bashTool, hasBash := tools["bash"]; hasBash && !isExplicitlyDisabledTool(bashTool) {
 		// bash -> Bash, KillBash, BashOutput
 		if bashCommands, ok := bashTool.([]any); ok {
 			claudeAllowed["Bash"] = bashCommands
@@ -60,12 +61,12 @@ func (e *ClaudeEngine) expandNeutralToolsToClaudeTools(tools map[string]any) map
 		}
 	}
 
-	if _, hasWebFetch := tools["web-fetch"]; hasWebFetch {
+	if webFetch, hasWebFetch := tools["web-fetch"]; hasWebFetch && !isExplicitlyDisabledTool(webFetch) {
 		// web-fetch -> WebFetch
 		claudeAllowed["WebFetch"] = nil
 	}
 
-	if _, hasWebSearch := tools["web-search"]; hasWebSearch {
+	if webSearch, hasWebSearch := tools["web-search"]; hasWebSearch && !isExplicitlyDisabledTool(webSearch) {
 		// web-search -> WebSearch
 		claudeAllowed["WebSearch"] = nil
 	}
@@ -111,9 +112,13 @@ func isExplicitlyDisabledTool(tool any) bool {
 // allowlist (unlike bypassPermissions which silently ignores it).
 // Panics if callers pass a Claude-specific tools section instead of neutral tools.
 func (e *ClaudeEngine) computeAllowedClaudeToolsString(tools map[string]any, safeOutputs *SafeOutputsConfig, cacheMemoryConfig *CacheMemoryConfig, driveMemoryConfig *DriveMemoryConfig, mcpScripts *MCPScriptsConfig, sandboxConfig *SandboxConfig) string {
+	return e.computeAllowedClaudeToolsStringWithDynamicWorkflows(tools, safeOutputs, cacheMemoryConfig, driveMemoryConfig, mcpScripts, sandboxConfig, false)
+}
+
+func (e *ClaudeEngine) computeAllowedClaudeToolsStringWithDynamicWorkflows(tools map[string]any, safeOutputs *SafeOutputsConfig, cacheMemoryConfig *CacheMemoryConfig, driveMemoryConfig *DriveMemoryConfig, mcpScripts *MCPScriptsConfig, sandboxConfig *SandboxConfig, dynamicWorkflows bool) string {
 	claudeToolsLog.Print("Computing allowed Claude tools string")
 
-	tools = e.prepareClaudeToolsForAllowedList(tools)
+	tools = e.prepareClaudeToolsForAllowedList(tools, dynamicWorkflows)
 	allowedTools := collectClaudeAllowedTools(tools)
 	allowedTools = appendTopLevelClaudeTools(allowedTools, tools, cacheMemoryConfig, driveMemoryConfig)
 	allowedTools = appendSandboxWritableTools(allowedTools, sandboxConfig)
@@ -132,7 +137,7 @@ func (e *ClaudeEngine) computeAllowedClaudeToolsString(tools map[string]any, saf
 // prepareClaudeToolsForAllowedList expands neutral tool definitions into Claude-specific
 // format. Panics if tools already contains a "claude" section key, since callers must only
 // ever pass neutral tool definitions at this stage (an internal invariant violation).
-func (e *ClaudeEngine) prepareClaudeToolsForAllowedList(tools map[string]any) map[string]any {
+func (e *ClaudeEngine) prepareClaudeToolsForAllowedList(tools map[string]any, dynamicWorkflows bool) map[string]any {
 	if tools == nil {
 		tools = make(map[string]any)
 	}
@@ -142,7 +147,15 @@ func (e *ClaudeEngine) prepareClaudeToolsForAllowedList(tools map[string]any) ma
 	}
 	claudeToolsLog.Print("Converting neutral tools to Claude-specific format")
 	tools = e.expandNeutralToolsToClaudeTools(tools)
-	defaultClaudeTools := []string{"Task", "Glob", "Grep", "ExitPlanMode", "TodoWrite", "LS", "Read", "NotebookRead"}
+	// Skill is included by default so that skills available to the CLI — repository
+	// skills under .claude/skills/, frontmatter `skills:`, and skills installed by
+	// workflow steps such as the APM package restore — can be invoked without
+	// requiring permission-mode: bypassPermissions. Claude only exposes the Skill
+	// tool when at least one skill is registered, so allowing it is a no-op otherwise.
+	defaultClaudeTools := []string{"Task", "Glob", "Grep", "ExitPlanMode", "TodoWrite", "LS", "Read", "NotebookRead", "Skill"}
+	if dynamicWorkflows {
+		defaultClaudeTools = append(defaultClaudeTools, "Workflow")
+	}
 	ensureDefaultClaudeAllowedTools(tools, defaultClaudeTools)
 	claudeToolsLog.Printf("Added %d default Claude tools to allowed list", len(defaultClaudeTools))
 	return tools
@@ -228,7 +241,8 @@ func hasBashWildcard(commands []any) bool {
 // isClaudeToolName uses the existing Claude naming convention heuristic:
 // valid Claude tool keys are expected to start with an uppercase ASCII letter.
 func isClaudeToolName(toolName string) bool {
-	return toolName != "" && toolName[0] >= 'A' && toolName[0] <= 'Z'
+	first, _ := utf8.DecodeRuneInString(toolName)
+	return first >= 'A' && first <= 'Z'
 }
 
 func appendTopLevelClaudeTools(allowedTools []string, tools map[string]any, cacheMemoryConfig *CacheMemoryConfig, driveMemoryConfig *DriveMemoryConfig) []string {
@@ -257,12 +271,10 @@ func appendDriveMemoryTools(allowedTools []string, config *DriveMemoryConfig) []
 	}
 	for _, drive := range config.Drives {
 		memoryDir := driveMemoryDirFor(drive.ID)
-		pattern := memoryDir + "/*" //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
+		pattern, _ := normalizeSandboxWritablePattern(memoryDir)
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Read(%s)", pattern))
 		if !drive.RestoreOnly {
-			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Write(%s)", pattern))
 			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Edit(%s)", pattern))
-			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("MultiEdit(%s)", pattern))
 		}
 		allowedTools = appendCacheMemoryBashTools(allowedTools, memoryDir)
 	}
@@ -275,11 +287,9 @@ func appendCacheMemoryTools(allowedTools []string, cacheMemoryConfig *CacheMemor
 	}
 	for _, cache := range cacheMemoryConfig.Caches {
 		cacheDir := cacheMemoryDirFor(cache.ID)
-		cacheDirPattern := cacheDir + "/*" //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
+		cacheDirPattern, _ := normalizeSandboxWritablePattern(cacheDir)
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Read(%s)", cacheDirPattern))
-		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Write(%s)", cacheDirPattern))
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Edit(%s)", cacheDirPattern))
-		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("MultiEdit(%s)", cacheDirPattern))
 		allowedTools = appendCacheMemoryBashTools(allowedTools, cacheDir)
 	}
 	return allowedTools
@@ -393,9 +403,7 @@ func appendSandboxWritableTools(allowedTools []string, sandboxConfig *SandboxCon
 		}
 		seenPatterns[pattern] = struct{}{}
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Read(%s)", pattern))
-		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Write(%s)", pattern))
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Edit(%s)", pattern))
-		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("MultiEdit(%s)", pattern))
 	}
 	return allowedTools
 }
@@ -406,9 +414,12 @@ func normalizeSandboxWritablePattern(writablePath string) (string, bool) {
 		return "", false
 	}
 	if strings.ContainsAny(path, "*?[]{}") {
-		return path, true
+		return "//" + strings.TrimLeft(path, "/"), true
 	}
-	return strings.TrimRight(path, "/") + "/*", true //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
+	if strings.Trim(path, "/") == "" {
+		return "//**", true
+	}
+	return "//" + strings.Trim(path, "/") + "/**", true //nolint:manualpathconcat // Claude absolute permission patterns start with two slashes.
 }
 
 func appendSafeOutputsTools(allowedTools []string, safeOutputs *SafeOutputsConfig) []string {
@@ -416,12 +427,6 @@ func appendSafeOutputsTools(allowedTools []string, safeOutputs *SafeOutputsConfi
 		return allowedTools
 	}
 	allowedTools = append(allowedTools, "mcp__"+string(constants.SafeOutputsMCPServerID))
-	if !slices.Contains(allowedTools, "Write") {
-		// Ideally we would grant Write only for the exact safe outputs file, but Claude
-		// doesn't currently honor that scoped grant reliably.
-		// See: https://github.com/github/gh-aw/issues/244#issuecomment-3240319103
-		allowedTools = append(allowedTools, "Write")
-	}
 	return allowedTools
 }
 

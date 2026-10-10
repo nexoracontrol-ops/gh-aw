@@ -9,6 +9,7 @@
 //		{
 //		  "ghes": true,               // enables GHES-compatible v3 artifact pins
 //		  "help_command": false,      // disables builtin centralized /help comment handler
+//		  "require_self_hosted_runners": true, // requires self-hosted runners for every generated job
 //		  "utc": "-08:00", // project home UTC offset for rendered local times
 //		  "auto_upgrade": true, // set to true to generate agentic-auto-upgrade.yml with weekly schedule
 //		  "auto_upgrade": { "cron": "0 9 * * 1", "options": ["--pre-releases"] }, // or object form: configure schedule and upgrade options
@@ -49,10 +50,12 @@ import (
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/workqueue"
 )
 
 var repoConfigLog = logger.New("workflow:repo_config")
 var repoConfigSecretNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var errWorkQueueConfig = errors.New("invalid global work_queue configuration")
 
 // RepoConfigFileName is the path of the repository-level configuration file
 // relative to the git root.
@@ -108,6 +111,14 @@ var validDisabledMaintenanceJobs = map[string]string{
 	normalizeMaintenanceJobName("apply_safe_outputs"):             "apply_safe_outputs",
 	normalizeMaintenanceJobName("label_disable_agentic_workflow"): "label_disable_agentic_workflow",
 	normalizeMaintenanceJobName("label_apply_safe_outputs"):       "label_apply_safe_outputs",
+	normalizeMaintenanceJobName("run_operation"):                  "run_operation",
+	normalizeMaintenanceJobName("update_pull_request_branches"):   "update_pull_request_branches",
+	normalizeMaintenanceJobName("validate_workflows"):             "validate_workflows",
+	normalizeMaintenanceJobName("activity_report"):                "activity_report",
+	normalizeMaintenanceJobName("forecast_report"):                "forecast_report",
+	normalizeMaintenanceJobName("close_agentic_workflows_issues"): "close_agentic_workflows_issues",
+	normalizeMaintenanceJobName("create_labels"):                  "create_labels",
+	normalizeMaintenanceJobName("cleanup-cache-memory"):           "cleanup-cache-memory",
 }
 
 // IsLabelTriggerEnabled returns true only when label_triggers is explicitly set to true.
@@ -143,6 +154,9 @@ func (m *MaintenanceConfig) IsJobDisabled(jobName string) bool {
 
 // RepoConfig is the parsed representation of aw.json.
 type RepoConfig struct {
+	// WorkQueue holds optional scheduling overrides, never identities or credentials.
+	WorkQueue json.RawMessage
+
 	// Strict enforces strict mode for every workflow compiled in the repository.
 	// The schema only permits true when this field is present.
 	Strict bool
@@ -150,6 +164,13 @@ type RepoConfig struct {
 	// GHES enables GitHub Enterprise Server compatibility mode.
 	// When true, the compiler uses artifact action versions supported by GHES.
 	GHES bool
+
+	// RequireSelfHostedRunners requires every generated workflow job to select a
+	// self-hosted runner.
+	RequireSelfHostedRunners bool
+
+	// ArtifactRetentionDays overrides retention for all workflow artifacts.
+	ArtifactRetentionDays *TemplatableInt32
 
 	// UTC is the project's home UTC offset used for rendering local times in CLI output.
 	// The value must be a numeric UTC offset such as "+00:00" or "-08:00".
@@ -190,6 +211,9 @@ type RepoConfig struct {
 	// can use this to redirect actions to internal mirrors. Keys and values
 	// must use the format "owner/repo@ref".
 	ActionPins map[string]string
+	// ActionPinPrefixes maps source repository prefixes to mirror prefixes.
+	// Matching is performed after resolving the original action's SHA.
+	ActionPinPrefixes map[string]string
 
 	// ContainerPins maps container image references to replacement image
 	// targets. Enterprises running in a private cloud can use this to
@@ -229,25 +253,36 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error { //nolint:largefunc // Po
 	// Use an intermediate struct with json.RawMessage to defer maintenance and
 	// auto_upgrade parsing.
 	var raw struct {
-		Strict        bool                          `json:"strict,omitempty"`
-		GHES          bool                          `json:"ghes,omitempty"`
-		HelpCommand   *bool                         `json:"help_command,omitempty"` // nil = use default (enabled)
-		UTC           string                        `json:"utc,omitempty"`
-		AutoUpgrade   json.RawMessage               `json:"auto_upgrade,omitempty"`
-		Maintenance   json.RawMessage               `json:"maintenance,omitempty"`
-		ActionPins    map[string]string             `json:"action_pins,omitempty"`
-		ContainerPins map[string]ContainerPinTarget `json:"container_pins,omitempty"`
+		Strict                   bool                          `json:"strict,omitempty"`
+		GHES                     bool                          `json:"ghes,omitempty"`
+		RequireSelfHostedRunners bool                          `json:"require_self_hosted_runners,omitempty"`
+		ArtifactRetentionDays    *TemplatableInt32             `json:"artifact_retention_days,omitempty"`
+		HelpCommand              *bool                         `json:"help_command,omitempty"` // nil = use default (enabled)
+		UTC                      string                        `json:"utc,omitempty"`
+		AutoUpgrade              json.RawMessage               `json:"auto_upgrade,omitempty"`
+		Maintenance              json.RawMessage               `json:"maintenance,omitempty"`
+		ActionPins               map[string]string             `json:"action_pins,omitempty"`
+		ActionPinPrefixes        map[string]string             `json:"action_pin_prefixes,omitempty"`
+		ContainerPins            map[string]ContainerPinTarget `json:"container_pins,omitempty"`
+		WorkQueue                json.RawMessage               `json:"work_queue,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+	if _, err := workqueue.ParseSettings(raw.WorkQueue); err != nil {
+		return fmt.Errorf("%w: %w", errWorkQueueConfig, err)
+	}
 
 	r.Strict = raw.Strict
 	r.GHES = raw.GHES
+	r.RequireSelfHostedRunners = raw.RequireSelfHostedRunners
+	r.ArtifactRetentionDays = raw.ArtifactRetentionDays
 	r.HelpCommand = raw.HelpCommand
 	r.UTC = strings.TrimSpace(raw.UTC)
 	r.ActionPins = raw.ActionPins
+	r.ActionPinPrefixes = raw.ActionPinPrefixes
 	r.ContainerPins = raw.ContainerPins
+	r.WorkQueue = raw.WorkQueue
 
 	// Parse polymorphic auto_upgrade: boolean or { "cron": "..." } object.
 	if len(raw.AutoUpgrade) > 0 && string(raw.AutoUpgrade) != "null" {
@@ -327,6 +362,15 @@ func LoadRepoConfig(gitRoot string) (*RepoConfig, error) {
 		return nil, fmt.Errorf("could not read %s: %w. Check that the file exists and is readable", RepoConfigFileName, err)
 	}
 
+	var sections map[string]json.RawMessage
+	if json.Unmarshal(data, &sections) == nil {
+		if settings, configured := sections["work_queue"]; configured {
+			if _, err := workqueue.ParseSettings(settings); err != nil {
+				return nil, fmt.Errorf("%s: %w: %w", RepoConfigFileName, errWorkQueueConfig, err)
+			}
+		}
+	}
+
 	// Validate against the embedded JSON schema before deserialising.
 	if err := validateRepoConfigJSON(data, configPath); err != nil {
 		return nil, err
@@ -390,7 +434,7 @@ func validateRepoConfigValues(cfg *RepoConfig) error {
 				return fmt.Errorf("%s has a blank entry in maintenance.disabled_jobs. Expected a non-empty job name, for example: \"stale-issue-cleanup\"", RepoConfigFileName)
 			}
 			if _, ok := validDisabledMaintenanceJobs[normalizedJobName]; !ok {
-				return fmt.Errorf("%s references unrecognized maintenance.disabled_jobs entry %q. Valid values are: close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, label_apply_safe_outputs. Example:\nmaintenance:\n  disabled_jobs:\n    - close-expired-entities", RepoConfigFileName, jobName)
+				return fmt.Errorf("%s references unrecognized maintenance.disabled_jobs entry %q. Valid values are: close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, label_apply_safe_outputs, run_operation, update_pull_request_branches, validate_workflows, activity_report, forecast_report, close_agentic_workflows_issues, create_labels, cleanup-cache-memory. Example:\nmaintenance:\n  disabled_jobs:\n    - close-expired-entities", RepoConfigFileName, jobName)
 			}
 			if previous, exists := seenDisabledJobs[normalizedJobName]; exists {
 				return fmt.Errorf("%s has duplicate maintenance.disabled_jobs entries %q and %q after normalization. Expected each job to be listed once. Example:\nmaintenance:\n  disabled_jobs:\n    - close-expired-entities", RepoConfigFileName, previous, jobName)
@@ -451,7 +495,7 @@ func validateCronExpression(expr string) error {
 		return fmt.Errorf("cron expression should have exactly 5 fields, got %d. Example: \"0 9 * * 1\"", len(fields))
 	}
 	for i, field := range fields {
-		r := cronFieldRanges[i]
+		r := cronFieldRanges[i] //nolint:uncheckedsliceindex // Five input fields and five field ranges.
 		if err := validateCronField(field, r.min, r.max); err != nil {
 			return fmt.Errorf("field %d (%s): %w", i+1, r.name, err)
 		}

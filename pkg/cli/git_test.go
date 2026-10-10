@@ -48,6 +48,52 @@ func TestIsSafeGitRevisionArg(t *testing.T) {
 	}
 }
 
+func TestValidateGitBranchArg(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		branchName  string
+		label       string
+		wantErr     bool
+		errContains string
+	}{
+		{"empty", "", "branch name", true, "must not be empty"},
+		{"leading dash", "-oops", "branch name", true, "must not start with '-' or contain control characters"},
+		{"option-like", "--upload-pack=evil", "branch name", true, "must not start with '-' or contain control characters"},
+		{"control character", "origin/main\n--help", "branch name", true, "must not start with '-' or contain control characters"},
+		{"valid branch", "main", "branch name", false, ""},
+		{"custom label", "", "default branch name", true, "invalid default branch name"},
+		{"custom label option-like", "--upload-pack=evil", "default branch name", true, "invalid default branch name \"--upload-pack=evil\": must not start with '-' or contain control characters"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateGitBranchArg(tt.branchName, tt.label)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.errContains)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestBranchOperationsRejectUnsafeRevisionArgs(t *testing.T) {
+	t.Parallel()
+
+	for name, operation := range map[string]func(string, bool) error{
+		"create and switch": createAndSwitchBranch,
+		"switch":            switchBranch,
+		"push":              pushBranch,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.ErrorContains(t, operation("--upload-pack=evil", false), "invalid branch name")
+		})
+	}
+}
+
 func TestValidateRelPathForGit(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -81,13 +127,7 @@ func TestValidateRelPathForGit(t *testing.T) {
 func TestGetCurrentBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -121,29 +161,17 @@ func TestGetCurrentBranch(t *testing.T) {
 func TestGetCurrentBranchNotInRepo(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Don't initialize git - should error
-	_, err = getCurrentBranch()
+	_, err := getCurrentBranch()
 	assert.Error(t, err, "getCurrentBranch should return an error when not in a git repository")
 }
 
 func TestCheckCleanWorkingDirectoryIgnoring(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.Chdir(originalDir))
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir))
+	t.Chdir(tmpDir)
 	require.NoError(t, exec.Command("git", "init").Run())
 	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run())
 	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run())
@@ -181,13 +209,7 @@ func TestCheckCleanWorkingDirectoryIgnoring(t *testing.T) {
 func TestCheckCleanWorkingDirectoryIgnoringAbsolutePaths(t *testing.T) {
 	repoDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, os.Chdir(originalDir))
-	}()
-
-	require.NoError(t, os.Chdir(repoDir))
+	t.Chdir(repoDir)
 	require.NoError(t, exec.Command("git", "init").Run())
 	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run())
 	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run())
@@ -201,7 +223,7 @@ func TestCheckCleanWorkingDirectoryIgnoringAbsolutePaths(t *testing.T) {
 	// Create a subdirectory and cd into it to simulate a nested invocation.
 	subDir := filepath.Join(repoDir, "subdir")
 	require.NoError(t, os.MkdirAll(subDir, 0755))
-	require.NoError(t, os.Chdir(subDir))
+	t.Chdir(subDir)
 
 	// Passing the absolute path from a nested CWD should still exclude the file.
 	require.NoError(t, checkCleanWorkingDirectoryIgnoring(false, []string{absGenerated}))
@@ -219,13 +241,7 @@ func TestCheckCleanWorkingDirectoryIgnoringAbsolutePaths(t *testing.T) {
 func TestCreateAndSwitchBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -245,7 +261,7 @@ func TestCreateAndSwitchBranch(t *testing.T) {
 
 	// Create and switch to new branch
 	branchName := "test-branch"
-	err = createAndSwitchBranch(branchName, false)
+	err := createAndSwitchBranch(branchName, false)
 	require.NoError(t, err, "create and switch to new branch")
 
 	// Verify we're on the new branch
@@ -257,13 +273,7 @@ func TestCreateAndSwitchBranch(t *testing.T) {
 func TestSwitchBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -302,13 +312,7 @@ func TestSwitchBranch(t *testing.T) {
 func TestCommitChanges(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -325,7 +329,7 @@ func TestCommitChanges(t *testing.T) {
 
 	// Commit changes
 	commitMessage := "Test commit"
-	err = commitChanges(commitMessage, false)
+	err := commitChanges(commitMessage, false)
 	require.NoError(t, err, "commit staged changes")
 
 	// Verify commit was created
@@ -343,13 +347,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 	// We skip actual push testing as it requires remote repository setup
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -357,7 +355,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 	}
 
 	// pushBranch will fail without a remote, which is expected
-	err = pushBranch("test-branch", false)
+	err := pushBranch("test-branch", false)
 	if err == nil {
 		t.Log("pushBranch() succeeded unexpectedly (might have remote configured)")
 	}
@@ -367,13 +365,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 func TestCheckWorkflowFileStatus(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -492,13 +484,7 @@ func TestCheckWorkflowFileStatus(t *testing.T) {
 func TestCheckWorkflowFileStatusNotInRepo(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Don't initialize git - should return empty status without error
 	status, err := checkWorkflowFileStatus("test.md")
@@ -633,15 +619,7 @@ func TestExtractHostFromRemoteURL(t *testing.T) {
 func TestGetHostFromOriginRemote(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-get-host-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -691,15 +669,7 @@ func TestGetHostFromOriginRemote(t *testing.T) {
 func TestResolveRemoteURL(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-resolve-remote-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -757,15 +727,7 @@ func TestResolveRemoteURL(t *testing.T) {
 func TestGetRepositorySlugFromRemotePreferringUpstream(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-upstream-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	if err := exec.Command("git", "init").Run(); err != nil {
 		t.Skip("Git not available")
@@ -812,15 +774,7 @@ func TestGetRepositorySlugFromRemoteForPathPreferringUpstream(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-upstream-path-*")
 	testFilePath := filepath.Join(tmpDir, "workflow.md")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	if err := exec.Command("git", "init").Run(); err != nil {
 		t.Skip("Git not available")
@@ -851,15 +805,7 @@ func TestGetRepositorySlugFromRemoteForPathPreferringUpstream(t *testing.T) {
 func TestGetRepositorySlugFromRemoteFallback(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-fallback-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {

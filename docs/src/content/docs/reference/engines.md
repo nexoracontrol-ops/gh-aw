@@ -1,6 +1,6 @@
 ---
 title: AI Engines
-description: Compare the built-in AI engines for GitHub Agentic Workflows, including selection, authentication, capabilities, limitations, and examples for Copilot, Claude Code, Codex, Gemini, and Pi.
+description: Compare the built-in AI engines for GitHub Agentic Workflows, including selection, authentication, capabilities, limitations, and examples for Copilot, Claude Code, Codex, Gemini, Pi, and experimental Agy.
 sidebar:
   order: 600
 ---
@@ -16,14 +16,79 @@ Set `engine:` in workflow frontmatter and configure the corresponding authentica
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli) (default) | `copilot` | [`copilot-requests: write`](/gh-aw/reference/auth/#copilot-requests-write-permission) or [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) | [Using GitHub Copilot with GitHub Agentic Workflows](/gh-aw/engines/copilot/) |
 | [Claude Code](https://www.anthropic.com/index/claude) | `claude` | [`ANTHROPIC_API_KEY`](/gh-aw/reference/auth/#anthropic_api_key) or [Anthropic WIF](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif) | [Using Claude Code with GitHub Agentic Workflows](/gh-aw/engines/claude/) |
 | [OpenAI Codex](https://openai.com/blog/openai-codex) | `codex` | `CODEX_API_KEY` or [`OPENAI_API_KEY`](/gh-aw/reference/auth/#openai_api_key) | [Using OpenAI Codex with GitHub Agentic Workflows](/gh-aw/engines/codex/) |
-| [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key) or [Google WIF](/gh-aw/reference/auth/#google-workload-identity-federation-wif) | [Using Google Gemini with GitHub Agentic Workflows](/gh-aw/engines/gemini/) |
+| [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) (deprecated in favor of `agy`) | `gemini` | [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key) or [Google WIF](/gh-aw/reference/auth/#google-workload-identity-federation-wif) | [Using Google Gemini with GitHub Agentic Workflows](/gh-aw/engines/gemini/) |
+| [Google Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) (experimental) | `agy` | [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key) only; no ADC/WIF | [Using experimental Agy](/gh-aw/engines/agy/) |
 | [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | `pi` | Copilot authentication by default; Anthropic or OpenAI/Codex key for a provider-prefixed `model:` | [Using Pi with GitHub Agentic Workflows](/gh-aw/engines/pi/) |
 
 Copilot CLI is the default, so `engine:` can be omitted when using Copilot. Copilot SDK mode is an execution mode of the Copilot engine, not a separate engine; enable it with `engine: copilot` and `copilot-sdk: true`. See [Copilot SDK support](#copilot-sdk-support).
 
+Gemini remains selectable and emits an informational deprecation notice after effective engine resolution, including imports and CLI overrides. The notice does not count as a warning or affect strict-mode success. Evaluate experimental Agy for compatible API-key workflows; retain Gemini for Google WIF or unsupported capabilities. See [migration guidance](/gh-aw/engines/agy/#evaluating-a-gemini-api-key-workflow).
+
+Copilot also supports experimental per-run model and reasoning-effort selection through `engine.model-routing`. See [Model Routing](/gh-aw/reference/model-routing/) for configuration, requirements, known limitations, and troubleshooting.
+
+## Configuration conformance workflows
+
+This repository provides manual-only `engine-conformance-<engine-id>.md`
+workflows for the built-in engines and the eight runnable imported engines:
+Aider, Crush, Cursor, DeepSeek Harness, Goose, Kiro, OpenCode, and Pydantic AI.
+Each imports `shared/engine-conformance.md` and uses its normal engine installer,
+configuration renderer, and execution harness. No additional CLI command is
+required.
+
+The shared JavaScript setup creates a fresh file nonce and arithmetic fixture.
+The agent reads the fixture, runs a shell probe that checks `engine.env`, obtains
+a second nonce through the mounted `mcpscripts` CLI, and writes a typed JSON
+result. A JavaScript post-step compares that result with host-side expectations
+and the tool's recorded receipt. Missing or malformed results, mismatched
+values, and unsuccessful agent execution fail the job even if the agent claims
+success. Aider's single-turn profile implements the probes in a JavaScript file
+before executing them.
+
+Results appear in the Actions step summary and the two-day
+`engine-conformance-<engine-id>` artifact as `report.json`. The workflows have
+a ten-minute agent timeout and a five-credit budget; engines that advertise
+`max-turns` additionally cap inference at 30 turns. Safe outputs are staged,
+so the suite does not publish GitHub issues or comments. Copilot-backed profiles
+use `copilot-requests: write` with `${{ github.token }}` and require no PAT.
+Claude, Codex, Gemini, Cursor, and Kiro use their normal engine credentials.
+Missing credentials fail activation rather than passing or skipping the suite.
+
+This is a configuration smoke test, not a security or model-quality evaluation.
+The tool probe checks the production MCP gateway/CLI path, not native MCP client
+support. It does not test SDK/driver profiles, plugins, permission-denial
+enforcement, or prove that a provider honored the requested model.
+
+### Experimental Agy authentication gate
+
+The manual `credentials-check.yml` workflow has an opt-in `agy-only` input and
+an `agy-model` native model slug. Its default behavior still runs the existing
+credential checks. The Agy job verifies the native Linux x64 v1.3.1 archive's
+SHA-256 checksum and runs with a fresh settings home and empty workspace.
+It requires `GEMINI_API_KEY` with `modelProvider: gemini`, verifies a fresh
+inference challenge and reported usage, checks missing/invalid credentials
+and unknown-model failures, and tests `GOOGLE_GEMINI_BASE_URL` against a
+controlled Gemini endpoint.
+
+The two-day `agy-native-authentication` artifact contains allowlisted event
+metadata, not API keys, prompts, tool payloads, or raw diagnostics. This is a
+native authentication feasibility gate, not an AWF, MCP, permissions, or
+production-engine conformance test. The separate built-in `engine: agy`
+integration remains experimental. Its production gate additionally requires
+native MCP transport, inference usage and requested-model evidence through AWF.
+
+The `agy-conformance` input calls `agy-conformance-reusable.lock.yml` from the
+selected branch; it does not run the legacy credential jobs. The canonical
+`engine-conformance-agy.md` remains dispatch-only. Both entry points import the
+same probes and prompt from `shared/agy-conformance.md`; trigger-bearing
+workflows cannot be imported as shared Markdown. Both Agy selectors
+have isolated, ref-specific concurrency. The production gate has a ten-minute
+job timeout, five-credit budget, and staged safe outputs. Native authentication
+has passed; production conformance remains pending. Gemini is soft-deprecated,
+but this does not promote Agy to stable or establish feature equivalence.
+
 ## Unsupported engine samples
 
-The OpenCode, Aider, Crush, Cursor, DeepSeek Harness, Kiro, and Pydantic AI integrations in this repository are **samples only**. They are not officially supported by gh-aw and have no compatibility or maintenance commitment.
+The OpenCode, Aider, Crush, Cursor, DeepSeek Harness, Goose, Kiro, and Pydantic AI integrations in this repository are **samples only**. They are not officially supported by gh-aw and have no compatibility or maintenance commitment.
 
 | Sample engine | Sample definition |
 |---------------|-------------------|
@@ -32,14 +97,72 @@ The OpenCode, Aider, Crush, Cursor, DeepSeek Harness, Kiro, and Pydantic AI inte
 | [Crush](https://github.com/charmbracelet/crush) | `.github/workflows/shared/crush.md` |
 | [Cursor](https://cursor.com/docs/cli) | `.github/workflows/shared/cursor.md` |
 | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `.github/workflows/shared/deepseek-harness.md` |
+| [Goose](https://github.com/aaif-goose/goose) | `.github/workflows/shared/goose.md` |
 | [Kiro](https://kiro.dev/) | `.github/workflows/shared/kiro.md` |
-| [Pydantic AI](https://ai.pydantic.dev/) | `pydantic/pydantic-ai-harness/gh-aw/pydantic.md@main` |
+| [Pydantic AI](https://ai.pydantic.dev/) | `pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md@main` |
 
 Engine owners should publish and maintain their own Markdown integration definition. Users should import the definition from that owner-maintained source, pinned to a tag or commit SHA. The in-repository files are examples for authors, not supported engine integrations.
 
+The DeepSeek Harness sample pins `dsh` v0.2.0-rc.2 and runs its headless profile
+with stdin prompts and a private per-run Cordis configuration patch. It routes
+Copilot, Anthropic, and OpenAI/Codex through matching configured AWF endpoints;
+Copilot requires AWF. Direct Anthropic/OpenAI API keys and base URLs are used
+only when AWF is disabled. Repository `.dsh` settings are preserved, telemetry
+is disabled, and native MCP is not enabled; configured tools use gh-aw's CLI proxy.
+GitHub toolsets, cache memory, and custom MCP servers remain configured on that
+transport. This does not enable restrictions on dsh's native shell/file tools;
+restricted bash command allowlists are rejected at compilation.
+
+DeepSeek headless session parsing retains the configured provider/model in
+`logEntries` and `agent-session.jsonl` even when execution fails or stdout is
+truncated. The essential `aw_session.jsonl` projection retains engine/model but
+omits duplicated provider metadata. Completed, unambiguous stdout
+becomes `assistant.message`; attributed Node startup errors and harness failures
+become `session.error`, with observed failure exits in `agent.execution`.
+Unattributed partial output and wrapper diagnostics are omitted. This profile
+does not expose native reasoning, tool arguments/results, refusals, or session
+accounting, so those observations are not inferred from answer text or firewall
+usage. A configured model such as `auto` is not a resolved model observation,
+and process exit zero does not establish task success. Shared session readers
+handle canonical artifacts; the stdout parser does not accept an additional
+native dsh JSON transcript format.
+
+The OpenCode sample routes `copilot`, `anthropic`, and `openai`/`codex` models
+through the selected AWF endpoint, retains configured MCP tools, and uses native
+JSONL session events for summaries and unified session artifacts. Copilot routing
+requires AWF; direct Anthropic/OpenAI BYOK is available with the sandbox disabled.
+Runtime configuration overlays preserve repository JSON/JSONC settings; OpenCode
+may add a missing `$schema` field. Runtime overrides disable
+automatic updates, sharing, default plugins, and LSP downloads; native npm plugins
+are not gh-aw Agent Plugins. The shared definition documents these limitations.
+
+The Goose sample pins CLI v1.53.0 and verifies its Linux archive checksum. It
+uses Goose's OpenAI-compatible provider through AWF endpoint discovery, native
+authenticated MCP extensions, file-based headless prompts, and JSONL tool and
+usage events. Configuration and session state are temporary and keyring access
+is disabled. Goose has no native gh-aw `web-fetch` tool; supply an MCP tool or
+use the shell explicitly.
+Its parser emits canonical unified-session events, merges streaming text
+deltas without reordering intervening observations, correlates tool calls and
+results with native MCP server identities, and retains native token/cache usage.
+Structured tool results retain observed exit codes and explicit error flags; simultaneous
+text and structured output remain available in the canonical agent trace.
+Completion accounting is cumulative, not additive. Partial logs do not invent
+completion or usage, and terminal errors remain distinct from tool failures.
+The same parser handles Actions artifacts and CLI session reconstruction.
+Copilot inference uses `${{ github.token }}` with
+`permissions: { copilot-requests: write }`; no PAT or `COPILOT_GITHUB_TOKEN`
+secret is required.
+
 ## Which engine should I choose?
 
-Choose the engine that matches the required capabilities, identity mechanism, and existing provider access. Copilot supports the broadest engine-specific feature set, including native agent selection, custom harnesses, and continuation mode. Claude Code and Codex provide native web search when enabled. Gemini supports Google WIF and per-command bash restrictions. Pi supports multiple providers but requires proxy-specific tool configuration.
+Choose the engine that matches the required capabilities, identity mechanism, and existing provider access. Copilot supports native agent selection, custom harnesses, and continuation mode. Claude Code and Codex provide native web search when enabled. Gemini supports Google WIF and per-command bash restrictions. Pi supports multiple providers, native MCP, codemode, and SDK/RPC execution.
+
+Agy is experimental, Linux x64 only, and supports the verified native v1.3.1
+Gemini API-key profile. It is not a Gemini alias or feature-equivalent replacement.
+Retain Gemini for WIF or native shell restrictions. See the
+[Agy capability and configuration limits](/gh-aw/engines/agy/#tools-configuration-and-limits)
+before considering a migration.
 
 Changing engines requires updating `engine:` and may also require different authentication, tools, model names, or network access. Review the setup guide and comparison before switching.
 
@@ -47,22 +170,22 @@ Changing engines requires updating `engine:` and may also require different auth
 
 Not all features are available across all engines. The table below summarizes per-engine support for commonly used workflow options:
 
-| Feature | Copilot | Claude | Codex | Gemini | Pi |
-|---------|:-------:|:------:|:-----:|:------:|:--:|
-| `max-turns` (top-level AWF invocation cap; `max-runs` deprecated) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `engine.max-turns` (deprecated nested alias) | ❌ | ✅ | ❌ | ❌ | ❌ |
-| `max-continuations` | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `tools.web-fetch` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `tools.web-search` | via MCP | ✅ (native) | ✅ (native, opt-in) | via MCP | ❌ |
-| `engine.agent` (native custom-agent selection) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `engine.bare` (disable context loading) | ✅ | ✅ | ❌ | ❌ | ✅ (no-op; already bare) |
-| `engine.harness` (custom harness script) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Per-command `tools.bash` allowlist | ✅ | ✅ | ❌ (disable only) | ✅ | ❌ |
-| Native MCP server integration | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Agent Plugins (`plugins`) | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Feature | Copilot | Claude | Codex | Gemini | Pi | Agy (experimental) |
+|---------|:-------:|:------:|:-----:|:------:|:--:|:------------------:|
+| `max-turns` (top-level AWF invocation cap; `max-runs` deprecated) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `engine.max-turns` (deprecated nested alias) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `max-continuations` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `tools.web-fetch` | SDK custom tool only | ✅ | ✅ | ✅ | ✅ | Native profile; disabling rejected |
+| `tools.web-search` | via MCP only | ✅ (native) | ✅ (native, opt-in) | via MCP | ❌ | Native profile; disabling rejected |
+| `engine.agent` (native custom-agent selection) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `engine.bare` (disable context loading) | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `engine.harness` (custom harness script) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Per-command `tools.bash` allowlist | ✅ | ✅ | ❌ (disable only) | ✅ | ✅ (restricted shell syntax) | ❌ (restrictions rejected) |
+| Native MCP server integration | ✅ | ✅ | ✅ | ✅ | ✅ | Release gated on production conformance |
+| Agent Plugins (`plugins`) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 
-`max-turns` (default `500`, legacy alias `max-runs`) and `max-ai-credits` (default `1000`) are top-level frontmatter fields supported by all engines. `engine.max-turns` is a deprecated nested alias that still limits Claude iterations when present; `max-continuations` enables Copilot continuation mode. Claude and Codex have native web search support; Codex requires explicit `tools: web-search:` configuration. Copilot and Gemini can use a third-party MCP server for search. Top-level `plugins` is experimental, uses the [Agent Plugins](https://agent-plugins.org) format, and is supported by Copilot, Claude, Codex, and any imported engine definition that declares a `behaviors.plugins` block (such as the shared Cursor and Kiro engines). See [Using Web Search](/gh-aw/reference/web-search/) and [Agent Plugins](/gh-aw/reference/frontmatter/#agent-plugins-plugins).
+`max-turns` (default `500`, legacy alias `max-runs`) and `max-ai-credits` (default `1000`) are top-level frontmatter fields supported by the stable built-in engines. Experimental Agy supports credit and cache-miss limits, but rejects `max-turns` and uses a fixed native timeout. `engine.max-turns` is a deprecated nested alias that still limits Claude iterations when present; `max-continuations` enables Copilot continuation mode. Claude and Codex have native web search support. Copilot's offline BYOK mode disables native web tools: use an MCP server for search, or `engine.copilot-sdk: true` for the custom proxy-aware `tools.web-fetch` implementation. Codex enables shared search/browsing through either `tools.web-search` or `tools.web-fetch`. Gemini can use a third-party MCP server for search. Top-level `plugins` is experimental, uses the [Agent Plugins](https://agent-plugins.org) format, and is supported by Copilot, Claude, Codex, and any imported engine definition that declares a `behaviors.plugins` block (such as the shared Cursor and Kiro engines). See [Using Web Search](/gh-aw/reference/web-search/) and [Agent Plugins](/gh-aw/reference/frontmatter/#agent-plugins-plugins).
 
 ## Shared imported engines
 
@@ -81,7 +204,7 @@ imports:
 Do not treat imported definitions as supported unless their engine owner explicitly supports them. The OpenCode, Aider, Crush, Cursor, and Kiro files listed above remain samples; copy or adapt them only under the maintenance and support terms provided by their respective owners.
 
 > [!NOTE]
-> There is no flat `engine: custom` value. `engine:` in string form only accepts a built-in engine ID (`copilot`, `claude`, `codex`, `gemini`, `pi`); any other value fails compilation. Third-party and self-defined engines always use the nested object form with `engine.id` set to the ID declared by an imported engine definition, as shown above.
+> There is no flat `engine: custom` value. `engine:` in string form only accepts a built-in engine ID (`copilot`, `claude`, `codex`, `gemini`, `pi`, `agy`); any other value fails compilation. Third-party and self-defined engines always use the nested object form with `engine.id` set to the ID declared by an imported engine definition, as shown above.
 
 ## Extended Coding Agent Configuration
 
@@ -90,7 +213,7 @@ Workflows can specify extended configuration for the coding agent:
 ```yaml wrap
 engine:
   id: copilot
-  version: latest                       # defaults to latest
+  version: latest                      # optional; defaults to a compiler-pinned version
   model: gpt-5                          # example override; omit to use engine default
   command: /usr/local/bin/copilot       # custom executable path
   args: ["--add-dir", "/workspace"]     # custom CLI arguments
@@ -100,7 +223,7 @@ engine:
 
 ### Pinning a Specific Engine Version
 
-By default, workflows install the latest available version of each engine CLI. To pin to a specific version, set `version` to the desired release:
+By default, workflows install a compiler-pinned version of each engine CLI. To override the pin, set `version` to the desired release:
 
 | Engine | `id` | Example `version` |
 |--------|------|-------------------|
@@ -108,7 +231,7 @@ By default, workflows install the latest available version of each engine CLI. T
 | Claude Code | `claude` | `"2.1.70"` |
 | Codex | `codex` | `"0.111.0"` |
 | Gemini CLI | `gemini` | `"0.31.0"` |
-| Pi | `pi` | `"0.72.1"` |
+| Pi | `pi` | `"1.0.0"` |
 
 ```yaml wrap
 engine:
@@ -346,7 +469,7 @@ engine:
 
 ### Custom Harness Script (`harness`)
 
-The `harness` field lets you replace the built-in Node.js harness wrapper that the Copilot engine uses to launch the CLI. Use this when you need to customize startup behavior, inject pre/post hooks, or test an alternative harness implementation.
+The `harness` field lets you replace the built-in Node.js harness wrapper used by Copilot, Claude, or Codex. Use this to customize startup behavior, inject pre/post hooks, or test an alternative harness implementation. Custom harnesses are responsible for their own retry, timeout, prompt-delivery, and tool-policy behavior.
 
 ```yaml wrap
 engine:
@@ -358,7 +481,7 @@ engine:
 The `use` value must be a bare filename — no directory separators, no `..`, and no shell metacharacters. It must end with `.js`, `.cjs`, or `.mjs`. When `harness.use` is set, AWF automatically ensures Node 24 is available in the runner environment.
 
 > [!NOTE]
-> `engine.harness` is currently only applied during Copilot engine execution. Setting it on other engines has no effect.
+> Custom harness scripts are supported by Copilot, Claude, and Codex. Provision the replacement script in `${RUNNER_TEMP}/gh-aw/actions/` before execution, for example through `pre-agent-steps`. Selecting a filename does not copy a script from the repository.
 
 **Validation rules for `harness.use`:**
 
@@ -398,9 +521,39 @@ When an expression is used, it must already be in milliseconds (GitHub Actions e
 
 The post-result watchdog is dormant until the harness observes a terminal safe output. `noop` and ordinary task outputs such as comments, labels, pushes, and pull request creation are terminal; diagnostics such as `missing_tool`, `missing_data`, and `report_incomplete` are not. Once armed, any stdout or stderr activity resets the inactivity clock. A quiet child process can still be terminated while it is doing useful work, and the harness may treat that termination as successful when a terminal safe output already exists.
 
+Claude arms the watchdog only for terminal outputs added during the current attempt. Its soft deadline also stops an active attempt before the Actions hard timeout. Resumable retries use the captured session ID and a short continuation prompt, not the original task. Empty-input resume requires a deferred tool marker and cannot recover ordinary API-error terminations. Fresh restarts after partial work are refused unless `engine.env.GH_AW_CLAUDE_ALLOW_FRESH_RESTART: "true"` explicitly declares the workflow replay-safe.
+
 You can also set the underlying `GH_AW_HARNESS_*` env vars directly via `engine.env` when you need expression-level control, including `GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS` for the post-result watchdog and `GH_AW_HARNESS_STARTUP_RETRIES` for fresh startup retries. Explicit `engine.env` values take precedence over `engine.harness` sub-key values. See [Harness Settings and Runtime Tuning Variables](/gh-aw/reference/environment-variables/#harness-settings-and-runtime-tuning-variables) for supported env vars, units, and clamping behavior.
 
 Threat detection runs default `max-retries` to **0** instead of inheriting the harness default of 3, since detection is a bounded scan of already-completed agent output rather than the primary task — a failed attempt should not silently retry the whole detection run and burn extra time and model spend. Set `engine.harness.max-retries` (or `safe-outputs.threat-detection.engine.harness.max-retries`) explicitly to opt back into retries for detection.
+
+### Ordered model fallback (`fallback-models`)
+
+All built-in engines accept an ordered list of alternative models. With AWF v0.28.31 or newer and a compatible API-proxy image, concrete same-provider chains compile to `apiProxy.fallbackModels`. AWF retries the failed inference request with the next model without restarting the agent or replaying its task, and applies the same model-policy and budget guards to each alternative. An explicit chain disables AWF's automatic middle-power model substitution so only configured alternatives are tried.
+
+Fallback is handled entirely by AWF, not by a harness that restarts the agent or replays its task. `engine.harness.max-retries` still controls ordinary engine execution retries; it does not configure AWF's per-request fallback policy. Configurations without a compatible AWF sandbox fail compilation rather than switching to a harness recovery path.
+
+```aw wrap
+engine:
+  id: copilot
+  model: grok-4.7
+  fallback-models:
+    - gpt-5.6-luna
+    - mai-code-1.1-flash
+```
+
+Fallback applies to provider server errors, request timeouts, unsupported models, and HTTP 400 errors explicitly tied to model availability. Authentication failures, HTTP 429, MCP policy failures, proxy guardrails, cancellation, and job timeouts do not switch models. If every configured model fails, the job fails normally. Workflows without `fallback-models` retain their existing retry behavior.
+
+Unqualified models use the primary provider. Provider prefixes such as `copilot/`, `github/`, `github-copilot/`, `openai/`, `anthropic/`, `gemini/`, and `google/` must match that provider. The compiler provisions credentials for referenced providers, honors `engine.env` overrides, and excludes raw provider credentials from the agent container. GitHub inference can use `permissions.copilot-requests: write`; otherwise it requires `COPILOT_GITHUB_TOKEN`. OpenAI uses `CODEX_API_KEY` or `OPENAI_API_KEY`, Anthropic uses `ANTHROPIC_API_KEY` or configured Anthropic WIF, and Gemini uses `GEMINI_API_KEY`.
+
+AWF v0.28.44 supports concrete same-provider chains only. Cross-provider chains and fallback model aliases fail compilation; cross-provider support is tracked in [github/gh-aw-firewall#9548](https://github.com/github/gh-aw-firewall/issues/9548). Custom drivers and harnesses can use AWF request recovery without implementing model switching. `engine.model-routing` cannot be combined with `fallback-models`.
+
+AWF's `token-usage.jsonl` records the actual serving model and `model_fallback` evidence; gh-aw uses that evidence for `aw_info.json`, telemetry, and generated output attribution.
+This post-run attribution does not change harness model selection or execution retries.
+
+The repository's smoke workflows configure fallback chains across Copilot, Claude, Codex, Gemini, and Pi. Additional coverage includes Copilot SDK (`smoke-copilot-sdk`), ARM64 (`smoke-copilot-arm`), Claude on GitHub inference (`smoke-github-claude`), published service ports with `docker-sudo-iptables` (`smoke-service-ports`), and Cloud Hypervisor (`smoke-work-queue`). These workflows exercise their existing tasks with fallback enabled; they do not force provider failures or prove that a model switch occurred.
+
+Codex has no gh-aw-supplied default model. Set `engine.model`, a phase-specific `GH_AW_MODEL_*_CODEX` repository variable, or `GH_AW_DEFAULT_MODEL_CODEX` explicitly; an empty model selection never introduces an implicit `gpt-5.4` recovery model.
 
 ### Copilot SDK Support
 
@@ -413,6 +566,20 @@ tool requests are repeatedly denied. The default is `5`.
 This field is only supported when `engine.id: copilot` and
 `engine.copilot-sdk: true`.
 
+Use top-level `max-tool-calls` to configure a positive run-wide limit on
+tool dispatches. The built-in Copilot SDK driver's pre-tool hook reserves the
+budget before execution, so failed and permission-denied calls count, concurrent
+calls cannot overspend it, and calls made by SDK subagents share the same count.
+When exhausted, further calls are rejected with an explanatory reason and
+`guard.tool_call_budget_exceeded` run event.
+
+Aggregate `max-tool-calls` is currently enforceable only with
+`engine.id: copilot`, `engine.copilot-sdk: true`, and the built-in SDK driver
+and harness. It is rejected for the Copilot CLI mode, other engines, and custom
+`engine.driver` or `engine.harness` overrides. It is distinct from
+`tools.github.allowed[].max-calls`, which remains a per-tool MCP Gateway limit
+and does not cover local tools such as bash.
+
 Use `engine.driver` to replace the built-in
 `copilot_sdk_driver.cjs` implementation. On the Copilot engine,
 setting `engine.driver` also enables `engine.copilot-sdk: true`:
@@ -422,6 +589,13 @@ engine:
   id: copilot
   driver: .github/drivers/custom-copilot-driver.js
 max-tool-denials: 8
+```
+
+```yaml wrap
+engine:
+  id: copilot
+  copilot-sdk: true
+max-tool-calls: 100
 ```
 
 `engine.driver` must be a **relative path from the workspace root**
@@ -492,7 +666,7 @@ engine:
 
 ### Bare Mode (`bare`)
 
-Set `engine.bare: true` with Copilot or Claude to disable automatic loading of context and custom instructions by the engine. Use this when the workflow prompt is fully self-contained and you want to prevent the engine from reading memory files, `AGENTS.md`, or built-in system prompts that would otherwise be loaded automatically. Pi also accepts `engine.bare: true`, but the setting is a no-op because Pi already runs in bare mode. Codex and Gemini do not support this field.
+Set `engine.bare: true` with Copilot, Claude, or Pi to disable automatic loading of context and custom instructions by the engine. Use this when the workflow prompt is fully self-contained and you want to prevent automatic instruction or resource discovery. Codex and Gemini do not support this field.
 
 ```yaml wrap
 engine:
@@ -505,24 +679,25 @@ The underlying mechanism is engine-specific:
 | Engine | Effect |
 |--------|--------|
 | Copilot | Passes `--no-custom-instructions` — suppresses `.github/AGENTS.md` and user-level custom instructions |
-| Claude | Passes `--bare` — suppresses CLAUDE.md memory files |
-| Pi | No effect — Pi already runs in bare mode |
+| Claude | Passes `--bare` — skips ambient discovery; explicit workflow skills/pinned plugins load, but automatic Skill-tool invocation and subagent delegation are unavailable in the minimal tool set |
+| Pi | Disables automatic context, skill, prompt-template, extension, and theme discovery; explicit infrastructure extensions remain loaded |
 
 Defaults to `false`.
 
 ### Pi Extensions (`extensions`)
 
-The Pi engine supports loading additional plugins via `engine.extensions`. Each entry is an npm package name installed with `pi install <extension>` before the agent runs. Only the Pi engine reads this field; other engines ignore it. Pi extensions are distinct from the top-level Agent Plugins `plugins` field.
+The Pi engine supports packages via `engine.extensions`. Each npm, pinned git, or local package source is installed with `pi install <source>` into the same managed agent directory used at execution. Packages can contain extensions, skills, and prompt templates. Only Pi reads this field; other engines ignore it. Pi packages are distinct from the top-level Agent Plugins `plugins` field.
 
 ```yaml wrap
 engine:
   id: pi
   extensions:
-    - "@pi/web-search"
-    - "@pi/file-browser"
+    - "npm:@example/pi-tools@1.0.0"
 ```
 
 Each listed extension produces one additional install step in the compiled workflow. If `engine.command` is set, the same executable is used to install the extensions.
+
+Pi v1 also enables codemode and tool search, supports native MCP tools and resources through the policy gateway, and provides built-in coding-agent SDK and RPC drivers. Use JSON in `engine.config` to configure settings, model metadata, MCP exposure, and persistent sessions. See [Pi runtime configuration](/gh-aw/engines/pi/#pi-runtime-configuration).
 
 ## Timeout Configuration
 
@@ -540,14 +715,14 @@ See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) in the Sandbo
 
 ### Per-Tool-Call Timeout (`tools.timeout`)
 
-`tools.timeout` limits how long any single tool invocation may run, in seconds. Useful when individual `bash` commands (builds, test suites) take longer than an engine's default:
+`tools.timeout` sets the per-operation limit in seconds where supported. For Codex, it limits native MCP calls rather than shell commands:
 
 ```yaml wrap
 tools:
   timeout: 300   # 5 minutes per tool call
 ```
 
-Defaults: Claude `60s`, Codex `120s`. Other engines (Copilot, Gemini) are engine-managed and not enforced by gh-aw. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for full documentation including `tools.startup-timeout`.
+Claude and Codex default to `60s` for tool calls. Codex's MCP startup timeout separately defaults to `120s`. Other engines (Copilot, Gemini) manage their own native tool limits. Codex resolves timeout expressions at runtime, with explicit per-server `engine.config` settings taking precedence. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration).
 
 ### Per-Engine Timeout Controls
 
@@ -576,28 +751,28 @@ When `max-turns` is set in frontmatter, gh-aw passes it to Claude automatically 
 
 ## Claude Tool Enforcement Security Model
 
-Claude Code accepts a `--permission-mode` flag that determines whether the declared `tools:` allowlist is enforced. Set `engine.permission-mode` to one of `auto`, `acceptEdits`, `plan`, or `bypassPermissions`:
+Claude's `--allowed-tools` flag pre-approves actions; it does not remove every other tool. The default `engine.permission-mode: dontAsk` denies actions that would require approval. Supported overrides are `default`, `dontAsk`, `auto`, `acceptEdits`, `plan`, and `bypassPermissions`:
 
 ```yaml wrap
 engine:
   id: claude
-  permission-mode: auto
+  permission-mode: dontAsk
 ```
 
-`engine.permission-mode` takes precedence over any `--permission-mode` flag supplied through `engine.args`. When unset, the default is `acceptEdits` (or `auto` when `tools.edit: false`). gh-aw **does not** derive `bypassPermissions` implicitly from unrestricted bash — set it explicitly.
+`engine.permission-mode` takes precedence over any `--permission-mode` flag supplied through `engine.args`. When unset, the default is `dontAsk`. Disabled Bash/web tools are removed, and `tools.edit: false` denies repository edits. Safe outputs grant MCP access, not unrestricted file writes. Memory and sandbox paths use absolute recursive `Read`/`Edit` grants. gh-aw does not derive `bypassPermissions` from unrestricted bash.
 
-| `engine.permission-mode` | Effective mode | `--allowed-tools` enforced? | Gateway `allowed:` enforced? |
+| `engine.permission-mode` | Effective mode | Actions beyond pre-approved rules | Gateway `allowed:` enforced? |
 |---|---|:---:|:---:|
-| unset (default) | `acceptEdits` | ✅ Yes | ✅ Yes |
-| unset, with `tools.edit: false` | `auto` | ✅ Yes | ✅ Yes |
-| `auto` | `auto` | ✅ Yes | ✅ Yes |
-| `acceptEdits` | `acceptEdits` | ✅ Yes | ✅ Yes |
-| `plan` | `plan` | ✅ Yes | ✅ Yes |
-| `bypassPermissions` | `bypassPermissions` | ❌ No | ✅ Yes |
+| unset / `dontAsk` | `dontAsk` | Actions requiring approval are denied; built-in read-only actions remain | ✅ Yes |
+| `default` | `default` | Uses Claude's normal approval policy | ✅ Yes |
+| `auto` | `auto` | Classifier may approve additional actions | ✅ Yes |
+| `acceptEdits` | `acceptEdits` | Automatically approves edits and some filesystem commands | ✅ Yes |
+| `plan` | `plan` | Uses Claude's plan-mode policy | ✅ Yes |
+| `bypassPermissions` | `bypassPermissions` | Skips approval checks except explicit deny rules | ✅ Yes |
 
 ### Gateway-side enforcement
 
-The MCP gateway's `allowed:` filter is the sole effective tool boundary in `bypassPermissions` mode (and a second layer of enforcement otherwise). Always specify `allowed:` on each `mcp-servers:` entry to restrict which MCP tools are reachable:
+The MCP gateway's `allowed:` filter constrains MCP access independently of Claude's permission mode. Always specify `allowed:` on each `mcp-servers:` entry to restrict which MCP tools are reachable:
 
 ```yaml wrap
 mcp-servers:
@@ -607,7 +782,7 @@ mcp-servers:
 ```
 
 > [!WARNING]
-> Do not rely on `tools:` or `mcp-servers: allowed:` for security guarantees in `bypassPermissions` mode. The agent can already run arbitrary shell commands when unrestricted bash is granted, so `--allowed-tools` provides no meaningful additional boundary.
+> Pre-approval rules are not OS-level isolation. Use the sandbox for filesystem/network boundaries and the gateway for MCP access. Explicit `auto`, `acceptEdits`, or `bypassPermissions` can approve more than the pre-approved actions.
 
 ## Learn More
 

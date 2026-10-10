@@ -141,17 +141,21 @@ The following fields previously existed in schema but were missed in spec CLI ma
 | `apiProxy.models` | config-only (model alias rewriting) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.modelMultipliers` | config-only (AI Credits accounting) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.modelFallback` | config-only (model fallback policy; set `sandbox.agent.model-fallback: false` to prevent deployment-name rewriting for BYOK Azure) | `pkg/workflow/awf_config_test.go` (`TestAWFConfig_ModelFallback*`) |
+| `apiProxy.fallbackModels` | config-only (AWF v0.28.31+ ordered request-level fallback; `engine.fallback-models` uses this for concrete same-provider chains, with model-policy and budget guards unchanged) | `pkg/workflow/engine_fallback_awf_test.go` |
 | `apiProxy.enableTokenSteering` | config-only (set `sandbox.agent.token-steering: false` to preserve the explicitly configured provider and model) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.maxRuns` | config-only (LLM invocation hard cap) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.auth.*` | config-only (maps to `AWF_AUTH_*` env vars) | `pkg/workflow/awf_config_test.go` |
-| `apiProxy.targets.openai.authHeader` | `--openai-api-auth-header` (frontmatter: `sandbox.agent.targets.openai.authHeader`) | `pkg/workflow/awf_config_test.go` |
-| `apiProxy.targets.anthropic.authHeader` | `--anthropic-api-auth-header` (frontmatter: `sandbox.agent.targets.anthropic.authHeader`) | `pkg/workflow/awf_config_test.go` |
-| `apiProxy.targets.copilot.extraHeaders` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraHeaders`; maps to `AWF_BYOK_EXTRA_HEADERS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
-| `apiProxy.targets.copilot.extraBodyFields` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraBodyFields`; maps to `AWF_BYOK_EXTRA_BODY_FIELDS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
-| `apiProxy.targets.copilot.sessionId` | config-only (frontmatter: `sandbox.agent.targets.copilot.sessionId`; maps to `AWF_PROVIDER_SESSION_ID`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.targets.openai.authHeader` | `--openai-api-auth-header` (frontmatter: `sandbox.agent.targets.openai.auth-header`) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.targets.anthropic.authHeader` | `--anthropic-api-auth-header` (frontmatter: `sandbox.agent.targets.anthropic.auth-header`) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.targets.copilot.extraHeaders` | config-only (frontmatter: `sandbox.agent.targets.copilot.extra-headers`; maps to `AWF_BYOK_EXTRA_HEADERS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.targets.copilot.extraBodyFields` | config-only (frontmatter: `sandbox.agent.targets.copilot.extra-body-fields`; maps to `AWF_BYOK_EXTRA_BODY_FIELDS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.targets.copilot.sessionId` | config-only (frontmatter: `sandbox.agent.targets.copilot.session-id`; maps to `AWF_PROVIDER_SESSION_ID`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
 | `apiProxy.caCert` | config-only (frontmatter: `sandbox.agent.ca-cert`; gated to AWF v0.28.10+ via `AWFAPIProxyCACertMinVersion`) | `pkg/workflow/awf_config_test.go` |
 | `container.dockerHostPathPrefix` | `--docker-host-path-prefix` | `pkg/workflow/awf_config_test.go` |
 | `enclaves[].agent.tools.github` | config-only (frontmatter: `enclaves[].agent.tools.github`; gated to AWF v0.28.20+ via `AWFEnclaveAgentToolsMinVersion`) | `pkg/workflow/enclaves_test.go` |
+| `rateLimiting.maxGithubApiPointsRest` | `--max-github-api-points-rest` (requires `security.difcProxy.host`; AWF enforces this dependency at runtime rather than in JSON Schema) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_GitHubAPIPointBudgets`) |
+| `rateLimiting.maxGithubApiPointsGraphql` | `--max-github-api-points-graphql` (requires `security.difcProxy.host`; AWF enforces this dependency at runtime rather than in JSON Schema) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_GitHubAPIPointBudgets`) |
+| `experimental.modelRouting` | config-only (required and `true` when `apiProxy.routing` is present) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_ModelRoutingGate`) |
 
 Agents SHOULD treat this class of mismatch as a regression signal and open a corrective PR when detected.
 

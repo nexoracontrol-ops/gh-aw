@@ -161,7 +161,10 @@ func RenderJSONMCPConfig( //nolint:largefunc // Existing renderer keeps MCP JSON
 
 		switch toolName {
 		case "github":
-			githubTool, _ := tools["github"].(map[string]any)
+			githubTool, ok := tools["github"].(map[string]any)
+			if !ok {
+				githubTool = nil
+			}
 			options.Renderers.RenderGitHub(&configBuilder, githubTool, isLast, workflowData)
 		case "cache-memory":
 			options.Renderers.RenderCacheMemory(&configBuilder, isLast, workflowData)
@@ -169,6 +172,14 @@ func RenderJSONMCPConfig( //nolint:largefunc // Existing renderer keeps MCP JSON
 			options.Renderers.RenderAgenticWorkflows(&configBuilder, isLast)
 		case "safe-outputs":
 			options.Renderers.RenderSafeOutputs(&configBuilder, isLast, workflowData)
+		case "ledger":
+			if options.Renderers.RenderLedger != nil {
+				options.Renderers.RenderLedger(&configBuilder, isLast, workflowData)
+			}
+		case "work-queue":
+			if options.Renderers.RenderWorkQueue != nil {
+				options.Renderers.RenderWorkQueue(&configBuilder, isLast, workflowData)
+			}
 		case "mcp-scripts":
 			if options.Renderers.RenderMCPScripts != nil {
 				options.Renderers.RenderMCPScripts(&configBuilder, workflowData.MCPScripts, isLast)

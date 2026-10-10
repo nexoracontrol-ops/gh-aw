@@ -346,7 +346,7 @@ YAML error that demonstrates column position handling.`,
 				// For schema validation errors, check for filename:line:column: format
 				expectedPattern := fmt.Sprintf(".md:%d:%d:", tt.expectedErrorLine, tt.expectedErrorColumn)
 				if !strings.Contains(errorStr, expectedPattern) {
-					t.Errorf("%s: error should contain console.FormatError 'filename:line:column:' format '%s', got: %s", tt.description, expectedPattern, errorStr)
+					t.Errorf("%s: error should contain console.FormatErrorStdout 'filename:line:column:' format '%s', got: %s", tt.description, expectedPattern, errorStr)
 				}
 			}
 
@@ -1008,6 +1008,7 @@ engine:
   id: copilot
   env:
     ANTHROPIC_CUSTOM_HEADERS: "x-aw-gw-github-repo: ${{ github.repository }}"
+    OTEL_SERVICE_NAME: test
 strict: false
 ---
 
@@ -1021,24 +1022,24 @@ Test content.`
 	}
 
 	compiler := NewCompiler()
-	if err := compiler.CompileWorkflow(testFile); err != nil {
-		t.Fatalf("CompileWorkflow() error: %v", err)
-	}
-
-	lockFile := filepath.Join(tmpDir, "test.lock.yml")
-	content, err := os.ReadFile(lockFile)
-	if err != nil {
-		t.Fatalf("Failed to read lock file: %v", err)
-	}
-	yamlStr := string(content)
-
-	if !strings.Contains(yamlStr, `ANTHROPIC_CUSTOM_HEADERS: "x-aw-gw-github-repo: ${{ github.repository }}"`) {
-		t.Fatalf("Expected quoted env value in generated YAML, got:\n%s", yamlStr)
-	}
-
-	var parsed map[string]any
-	if err := yaml.Unmarshal(content, &parsed); err != nil {
-		t.Fatalf("Generated lock file should be valid YAML: %v\nYAML:\n%s", err, yamlStr)
+	for _, dryRun := range []bool{false, true} {
+		compiler.SetDryRun(dryRun)
+		if err := compiler.CompileWorkflow(testFile); err != nil {
+			t.Fatalf("CompileWorkflow() error (dry-run=%t): %v", dryRun, err)
+		}
+		lockFile := filepath.Join(tmpDir, "test.lock.yml")
+		content, err := os.ReadFile(lockFile)
+		if err != nil {
+			t.Fatalf("Failed to read lock file: %v", err)
+		}
+		yamlStr := string(content)
+		if !strings.Contains(yamlStr, `ANTHROPIC_CUSTOM_HEADERS: "x-aw-gw-github-repo: ${{ github.repository }}"`) {
+			t.Fatalf("Expected quoted env value in generated YAML (dry-run=%t), got:\n%s", dryRun, yamlStr)
+		}
+		var parsed map[string]any
+		if err := yaml.Unmarshal(content, &parsed); err != nil {
+			t.Fatalf("Generated lock file should be valid YAML: %v\nYAML:\n%s", err, yamlStr)
+		}
 	}
 }
 

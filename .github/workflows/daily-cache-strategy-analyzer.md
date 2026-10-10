@@ -14,7 +14,7 @@ permissions:
   pull-requests: read
   discussions: read
 tracker-id: daily-cache-strategy-analyzer
-model: openai/gpt-5.3-codex
+model: openai/gpt-6-luna
 engine:
   id: codex
   model-provider: openai
@@ -41,7 +41,6 @@ network:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 tools:
   cache-memory: true
   cli-proxy: true

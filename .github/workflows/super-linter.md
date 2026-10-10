@@ -18,7 +18,7 @@ safe-outputs:
     title-prefix: "[linter] "
     labels: [automation, code-quality, cookie]
 engine: pi
-model: copilot/auto
+model: copilot/mai-code-1.1-flash
 name: Super Linter Report
 timeout-minutes: 15
 imports:
@@ -43,7 +43,7 @@ jobs:
       
       - name: Run super-linter
         # zizmor: ignore[github_action_from_unverified_creator_used]
-        uses: super-linter/super-linter@v8.7.0 # x-release-please-version
+        uses: super-linter/super-linter@v9 # x-release-please-version
         id: super-linter
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,7 +88,7 @@ jobs:
       
       - name: Upload super-linter log
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: super-linter-log
           path: /tmp/super-linter.log
@@ -96,7 +96,7 @@ jobs:
           retention-days: 7
 steps:
   - name: Download super-linter log
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       name: super-linter-log
       path: /tmp/gh-aw/agent/

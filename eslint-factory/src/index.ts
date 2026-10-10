@@ -61,6 +61,11 @@ import { preferActionsExecOverChildProcessRule } from "./rules/prefer-actions-ex
 import { noMisplacedErrorCodeDefinitionRule } from "./rules/no-misplaced-error-code-definition";
 import { requireFsChmodTryCatchRule } from "./rules/require-fs-chmod-try-catch";
 
+import { noSingleCharStringReplaceRule } from "./rules/no-single-char-string-replace";
+import { noAsyncForEachCallbackRule } from "./rules/no-async-foreach-callback";
+import { noUnguardedAsyncTimerCallbackRule } from "./rules/no-unguarded-async-timer-callback";
+import { requireFiniteCheckBeforeDateToIsoStringRule } from "./rules/require-finite-check-before-date-toisostring";
+
 const plugin = {
   meta: {
     name: "@github/gh-aw-eslint-factory",
@@ -129,6 +134,10 @@ const plugin = {
     "prefer-actions-exec-over-child-process": preferActionsExecOverChildProcessRule,
     "no-misplaced-error-code-definition": noMisplacedErrorCodeDefinitionRule,
     "require-fs-chmod-try-catch": requireFsChmodTryCatchRule,
+    "no-single-char-string-replace": noSingleCharStringReplaceRule,
+    "no-unguarded-async-timer-callback": noUnguardedAsyncTimerCallbackRule,
+    "no-async-foreach-callback": noAsyncForEachCallbackRule,
+    "require-finite-check-before-date-toisostring": requireFiniteCheckBeforeDateToIsoStringRule,
   },
 };
 

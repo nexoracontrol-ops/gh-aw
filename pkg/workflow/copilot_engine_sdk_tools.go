@@ -10,12 +10,13 @@ import (
 const copilotSDKToolConfigVersion = 1
 
 type copilotSDKToolCapabilities struct {
-	Bash      bool `json:"bash"`
-	Edit      bool `json:"edit"`
-	WebFetch  bool `json:"webFetch"`
-	WebSearch bool `json:"webSearch"`
-	MCP       bool `json:"mcp"`
-	CLIProxy  bool `json:"cliProxy"`
+	Bash             bool `json:"bash"`
+	Edit             bool `json:"edit"`
+	WebFetch         bool `json:"webFetch"`
+	WebSearch        bool `json:"webSearch"`
+	DynamicWorkflows bool `json:"dynamicWorkflows"`
+	MCP              bool `json:"mcp"`
+	CLIProxy         bool `json:"cliProxy"`
 }
 
 type copilotSDKPermissionConfig struct {
@@ -26,6 +27,7 @@ type copilotSDKToolConfig struct {
 	Version                 int                        `json:"version"`
 	Capabilities            copilotSDKToolCapabilities `json:"capabilities"`
 	Permissions             copilotSDKPermissionConfig `json:"permissions"`
+	MaxToolCalls            string                     `json:"maxToolCalls,omitempty"`
 	ExplicitlyDisabledTools []string                   `json:"explicitlyDisabledTools,omitempty"`
 }
 
@@ -136,15 +138,17 @@ func hasCopilotSDKMCPTools(workflowData *WorkflowData) bool {
 
 func extractCopilotAllowedTools(args []string) []string {
 	allowed := map[string]struct{}{"read": {}}
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] != "--allow-tool" {
+	expectTool := false
+	for _, arg := range args {
+		if !expectTool {
+			expectTool = arg == "--allow-tool"
 			continue
 		}
-		value := strings.TrimSpace(args[i+1])
+		value := strings.TrimSpace(arg)
 		if value != "" && !strings.HasPrefix(value, "--") {
 			allowed[value] = struct{}{}
 		}
-		i++
+		expectTool = false
 	}
 	result := make([]string, 0, len(allowed))
 	for value := range allowed {
@@ -158,22 +162,30 @@ func buildCopilotSDKToolConfig(workflowData *WorkflowData, toolArgs []string) co
 	if workflowData == nil {
 		workflowData = &WorkflowData{}
 	}
+	maxToolCalls := ""
+	if workflowData.EngineConfig != nil {
+		maxToolCalls = workflowData.EngineConfig.MaxToolCalls
+	}
+	dynamicWorkflows := dynamicWorkflowsEnabled(NewCopilotEngine(), workflowData.EngineConfig)
+	sdkToolArgs := append([]string(nil), toolArgs...)
+	if dynamicWorkflows {
+		sdkToolArgs = append(sdkToolArgs, "--allow-tool", "workflow")
+	}
 	tools := workflowData.Tools
 	config := copilotSDKToolConfig{
-		Version: copilotSDKToolConfigVersion,
+		Version:      copilotSDKToolConfigVersion,
+		MaxToolCalls: maxToolCalls,
 		Capabilities: copilotSDKToolCapabilities{
-			Bash:     isCopilotBashToolEnabled(workflowData),
-			Edit:     isCopilotEditToolEnabled(tools, workflowData),
-			WebFetch: isCopilotToolValueEnabled(tools, "web-fetch"),
-			// The Copilot SDK runtime cannot authorize or execute web-search (see
-			// WebSearch: false in copilot_engine.go), so never advertise it as SDK-visible
-			// even if the workflow declares tools.web-search.
-			WebSearch: false,
-			MCP:       hasCopilotSDKMCPTools(workflowData),
-			CLIProxy:  workflowData.ParsedTools != nil && workflowData.ParsedTools.CLIProxy,
+			Bash:             isCopilotBashToolEnabled(workflowData),
+			Edit:             isCopilotEditToolEnabled(tools, workflowData),
+			WebFetch:         isCopilotToolValueEnabled(tools, "web-fetch"),
+			WebSearch:        false,
+			DynamicWorkflows: dynamicWorkflows,
+			MCP:              hasCopilotSDKMCPTools(workflowData),
+			CLIProxy:         workflowData.ParsedTools != nil && workflowData.ParsedTools.CLIProxy,
 		},
 		Permissions: copilotSDKPermissionConfig{
-			AllowedTools: extractCopilotAllowedTools(toolArgs),
+			AllowedTools: extractCopilotAllowedTools(sdkToolArgs),
 		},
 	}
 	for name := range workflowData.ExplicitlyDisabledTools {

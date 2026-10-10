@@ -14,7 +14,7 @@ var secretLog = logger.New("workflow:secret_extraction")
 // Pre-compiled regex patterns for ExtractSecretsFromValue (performance optimization)
 var (
 	// secretsNamePattern extracts the secret variable name from an expression
-	secretsNamePattern = regexp.MustCompile(`secrets\.([A-Z_][A-Z0-9_]*)`)
+	secretsNamePattern = regexp.MustCompile(`(?i)secrets\.([a-z_][a-z0-9_]*)`)
 
 	// jobOutputBodyDotPattern matches needs.JOB.outputs.OUTPUT anywhere within an expression body
 	// using dot notation. The word boundary ensures we don't match partial identifiers.
@@ -145,14 +145,6 @@ func ExtractEnvExpressionsFromMap(values map[string]string) map[string]string {
 
 	secretLog.Printf("Extracted total of %d unique env expressions from map", len(allEnvVars))
 	return allEnvVars
-}
-
-// ReplaceSecretsWithEnvVars replaces secret expressions in a value with environment variable references
-// Example: "${{ secrets.DD_API_KEY }}" -> "\${DD_API_KEY}"
-// The backslash is used to escape the ${} for proper JSON rendering in Copilot configs
-func ReplaceSecretsWithEnvVars(value string, secrets map[string]string) string {
-	// Replace ${{ secrets.VAR }} with \${VAR} (backslash-escaped for copilot JSON config)
-	return replaceSecretsWithPrefixedEnvVars(value, secrets, "\\${")
 }
 
 // ReplaceSecretsWithShellEnvVars replaces secret expressions in a value with plain shell

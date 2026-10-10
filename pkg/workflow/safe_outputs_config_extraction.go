@@ -53,7 +53,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 		if outputMap, ok := output.(map[string]any); ok {
 			safeOutputsConfigLog.Printf("Processing safe-outputs configuration with %d top-level keys", len(outputMap))
 			config = &SafeOutputsConfig{}
-
+			if adapters, supplied := outputMap["claim-adapters"]; supplied {
+				config.ClaimAdapters, config.claimAdaptersParseError = parseWorkQueueClaimAdapters(adapters)
+			}
 			config.CreateWorkItems = c.parseCreateWorkItemConfig(outputMap)
 			config.UpdateWorkItems = c.parseUpdateWorkItemConfig(outputMap)
 			config.CommentOnWorkItems = c.parseCommentOnWorkItemConfig(outputMap)
@@ -379,7 +381,7 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				// This ensures there's always a fallback for transparency
 				if _, exists := outputMap["noop"]; !exists {
 					config.NoOp = &NoOpConfig{}
-					config.NoOp.Max = defaultIntStr(1) // Default max
+					config.NoOp.Max = defaultIntStr(2) // Default max
 					// Implicit noop is for transparency logging only; it must not create
 					// issues without a maintenance workflow to expire them, so report-as-issue
 					// defaults to false here (users can opt in with an explicit noop: block).

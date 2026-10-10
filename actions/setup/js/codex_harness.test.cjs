@@ -1,13 +1,14 @@
-import { describe, it, expect } from "vitest";
-import { spawnSync } from "child_process";
+import { describe, it, expect, afterAll } from "vitest";
+import { spawnSync as spawnProcessSync } from "child_process";
 import { createRequire } from "module";
 import fs from "fs";
-import os from "os";
 import path from "path";
 
 const require = createRequire(import.meta.url);
 const {
   resolveCodexPromptFileArgs,
+  resolveCodexPromptInput,
+  buildCodexResumeArgs,
   injectJsonFlag,
   isRateLimitError,
   isTokenPerMinuteRateLimitError,
@@ -17,6 +18,7 @@ const {
   isInvalidModelError,
   isUnsupportedModelToolsError,
   isInvalidRequestError,
+  extractInvalidRequestErrorCode,
   isReconnectExhaustedError,
   countPermissionDeniedIssues,
   hasNumerousPermissionDeniedIssues,
@@ -40,23 +42,402 @@ const {
   DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS,
   DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS,
   resolvePostResultWatchdogIdleTimeoutMs,
+  createMCPCallWatchdog,
+  resolveMCPServerToolTimeouts,
   DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS,
   MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS,
   MAX_POST_RESULT_WATCHDOG_TIMEOUT_MS,
+  removeCodexRoutingOverrides,
+  applyCodexRoutingEffort,
+  resolveCodexModelRouting,
 } = require("./codex_harness.cjs");
 const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
 
-const agentTempDir = "/tmp/gh-aw/agent";
+const agentTempDir = fs.mkdtempSync(path.join(process.cwd(), "codex-harness-tests-"));
+afterAll(() => fs.rmSync(agentTempDir, { recursive: true, force: true }));
+const preloadPath = path.join(agentTempDir, "isolated-audit.cjs");
+fs.writeFileSync(
+  preloadPath,
+  `
+const path=require("path");
+const context=require(${JSON.stringify(require.resolve("./ai_credits_context.cjs"))});
+const original=context.parseMaxAICreditsExceededFromAuditLog;
+context.parseMaxAICreditsExceededFromAuditLog=()=>original(path.join(path.dirname(process.env.GH_AW_AGENT_OUTPUT),"sandbox","firewall","audit","log.jsonl"));
+`
+);
 
 function makeHarnessTempDir(name) {
   fs.mkdirSync(agentTempDir, { recursive: true });
   return fs.mkdtempSync(path.join(agentTempDir, name));
 }
 
+function spawnSync(command, args, options) {
+  const env = { ...options.env, HOME: path.join(agentTempDir, "home"), AWF_REFLECT_ENABLED: "0" };
+  if (!env.CODEX_HOME || env.CODEX_HOME === process.env.CODEX_HOME) env.CODEX_HOME = path.join(agentTempDir, "codex-home");
+  if (!env.RUNNER_TEMP || env.RUNNER_TEMP === process.env.RUNNER_TEMP) env.RUNNER_TEMP = agentTempDir;
+  if (!env.GH_AW_AGENT_OUTPUT || env.GH_AW_AGENT_OUTPUT === process.env.GH_AW_AGENT_OUTPUT) env.GH_AW_AGENT_OUTPUT = path.join(agentTempDir, "agent-output.json");
+  env.GH_AW_CODEX_CONTEXT_REBUILD_CIRCUIT_BREAKER = env.GH_AW_CODEX_TOKEN_USAGE_PATH ? "true" : "false";
+  env.NODE_OPTIONS = `${env.NODE_OPTIONS || ""} --require ${JSON.stringify(preloadPath)}`.trim();
+  return spawnProcessSync(command, args, { ...options, env });
+}
+
+function runHarnessFixture(script, { prompt = "fix the bug", args = [], env = {}, reflectData } = {}) {
+  const dir = makeHarnessTempDir("runtime-");
+  const executable = path.join(dir, "codex-stub.cjs");
+  const promptPath = path.join(dir, "prompt.txt");
+  const callsPath = path.join(dir, "calls.jsonl");
+  fs.writeFileSync(
+    executable,
+    `#!${process.execPath}\nconst fs=require("fs");let input="";process.stdin.setEncoding("utf8");process.stdin.on("data",s=>input+=s);process.stdin.on("end",()=>{fs.appendFileSync(process.env.CODEX_HARNESS_STUB_CALLS,JSON.stringify({args:process.argv.slice(2),stdin:input})+"\\n");${script}\n});`
+  );
+  fs.chmodSync(executable, 0o700);
+  fs.writeFileSync(promptPath, prompt);
+  const childEnv = {
+    ...process.env,
+    CODEX_API_KEY: "fake-key",
+    AWF_REFLECT_ENABLED: "0",
+    RUNNER_TEMP: dir,
+    CODEX_HOME: path.join(dir, "codex-home"),
+    GH_AW_CODEX_CONTEXT_REBUILD_CIRCUIT_BREAKER: "false",
+    GH_AW_HARNESS_MAX_RETRIES: "1",
+    GH_AW_HARNESS_INITIAL_DELAY_MS: "1",
+    GH_AW_LLM_PROVIDER_EXPLICIT: "0",
+    GH_AW_SAFE_OUTPUTS: "",
+    CODEX_HARNESS_STUB_CALLS: callsPath,
+    ...env,
+  };
+  if (reflectData) {
+    const reflectPreload = path.join(dir, "reflect-fixture.cjs");
+    fs.writeFileSync(
+      reflectPreload,
+      `const fs=require("fs");const path=require("path");const reflect=require(${JSON.stringify(require.resolve("./awf_reflect.cjs"))});const data=${JSON.stringify(reflectData)};reflect.fetchAWFReflect=async()=>{fs.mkdirSync(path.dirname(reflect.AWF_REFLECT_OUTPUT_PATH),{recursive:true});fs.writeFileSync(reflect.AWF_REFLECT_OUTPUT_PATH,JSON.stringify(data));return {ok:true,reflectData:data};};`
+    );
+    childEnv.NODE_OPTIONS = `${childEnv.NODE_OPTIONS || ""} --require=${JSON.stringify(reflectPreload)}`;
+  }
+  const result = spawnSync(process.execPath, ["codex_harness.cjs", executable, "exec", ...args, "--prompt-file", promptPath], {
+    cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+    env: childEnv,
+    encoding: "utf8",
+    timeout: 15000,
+    maxBuffer: 12 * 1024 * 1024,
+  });
+  const calls = fs.existsSync(callsPath)
+    ? fs
+        .readFileSync(callsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line))
+    : [];
+  return { result, calls };
+}
+
 describe("codex_harness.cjs", () => {
+  describe("AWF model routing", () => {
+    const reflectData = {
+      endpoints: [{ provider: "github", configured: true, models: ["gpt-5.6-sol"] }],
+      routing: {
+        status: "selected",
+        selection: { provider: "github", model: "github-copilot/gpt-5.6-sol", wire_model: "gpt-5.6-sol", effort: "xhigh", endpoint: "/responses" },
+      },
+    };
+
+    it("applies the routed model and reasoning effort over fixed args", () => {
+      const result = resolveCodexModelRouting(reflectData, ["exec", "--model", "fixed-model", "-c", 'model_reasoning_effort="low"', "--json", "-"]);
+      expect(result.error).toBeNull();
+      expect(result.model).toBe("gpt-5.6-sol");
+      expect(result.args).toEqual(["exec", "-c", 'model_reasoning_effort="xhigh"', "--model", "gpt-5.6-sol", "--json", "-"]);
+    });
+
+    it.each([
+      [null, "required model-routing selection"],
+      [{ endpoints: reflectData.endpoints, routing: { status: "pending" } }, "pending"],
+      [
+        {
+          ...reflectData,
+          endpoints: [{ ...reflectData.endpoints[0], routing_models: [{ model_id: "gpt-5.6-sol", candidate_metadata_complete: true, supported_endpoints: ["/v1/messages"] }] }],
+          routing: { ...reflectData.routing, selection: { ...reflectData.routing.selection, endpoint: "/v1/messages" } },
+        },
+        "advertises endpoints [/v1/messages]",
+      ],
+      [{ ...reflectData, endpoints: [{ provider: "github", configured: true, models: [] }] }, "unavailable Copilot wire model"],
+    ])("fails closed when routing data is invalid: %s", (reflect, error) => {
+      expect(resolveCodexModelRouting(reflect, ["exec", "--model", "fixed"]).error).toContain(error);
+    });
+
+    it("uses the Responses endpoint for a routed GPT model selected on Chat Completions", () => {
+      const reflect = {
+        ...reflectData,
+        endpoints: [{ ...reflectData.endpoints[0], routing_models: [{ model_id: "gpt-5.6-sol", candidate_metadata_complete: true, supported_endpoints: ["/chat/completions", "/responses"] }] }],
+        routing: { ...reflectData.routing, selection: { ...reflectData.routing.selection, endpoint: "/chat/completions" } },
+      };
+      const result = resolveCodexModelRouting(reflect, ["exec"]);
+      expect(result.error).toBeNull();
+      expect(result.selection).toMatchObject({ endpoint: "/responses", selected_endpoint: "/chat/completions" });
+    });
+
+    it("drops fixed model and reasoning-effort configuration", () => {
+      const args = removeCodexRoutingOverrides(["exec", "-m", "fixed", "-c", 'model_reasoning_effort="low"', "--json"]);
+      expect(args).toEqual(["exec", "--json"]);
+      expect(applyCodexRoutingEffort(["exec", "--json"], "high")).toEqual(["exec", "-c", 'model_reasoning_effort="high"', "--json"]);
+    });
+
+    it("rejects an effort that Codex does not support", () => {
+      const reflect = {
+        ...reflectData,
+        routing: { ...reflectData.routing, selection: { ...reflectData.routing.selection, effort: "max" } },
+      };
+      expect(resolveCodexModelRouting(reflect, ["exec"]).error).toContain('"max"');
+    });
+
+    it("starts Codex with the routed model and effort from AWF reflection", () => {
+      const reflect = {
+        ...reflectData,
+        endpoints: [{ provider: "github", configured: true, port: 10002, base_url: "http://api-proxy:10002", models: ["gpt-5.6-sol"] }],
+      };
+      const { result, calls } = runHarnessFixture("process.exit(0);", {
+        args: ["--model", "fixed-model", "-c", 'model_reasoning_effort="low"'],
+        env: { GH_AW_MODEL_ROUTING: "1", GH_AW_MODEL_AGENT_CODEX: "fixed-model", GH_AW_LLM_PROVIDER: "github" },
+        reflectData: reflect,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toContain("--model");
+      expect(calls[0].args).toContain("gpt-5.6-sol");
+      expect(calls[0].args).toContain('model_reasoning_effort="xhigh"');
+      expect(calls[0].args).not.toContain("fixed-model");
+      expect(result.stderr).toContain("inference routing: mode=awf-routed model=gpt-5.6-sol effort=xhigh endpoint=/responses");
+    });
+  });
+
+  describe("MCP call watchdog", () => {
+    it("times out only an outstanding MCP call, not other output or completed calls", () => {
+      let time = 0;
+      const watchdog = createMCPCallWatchdog(120_000, () => time);
+      watchdog.observe(JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call", id: "1", name: "search_repositories" } }));
+      time = 119_999;
+      watchdog.observe(JSON.stringify({ type: "item.completed", item: { type: "agent_message", id: "other" } }));
+      expect(watchdog.expired()).toBe(false);
+      time = 120_000;
+      expect(watchdog.expired()).toBe(true);
+      watchdog.observe(JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", id: "1" } }));
+      expect(watchdog.expired()).toBe(false);
+    });
+
+    it("clears failed calls and ignores malformed events", () => {
+      let time = 0;
+      const watchdog = createMCPCallWatchdog(100, () => time);
+      watchdog.observe("{");
+      watchdog.observe(JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call", id: "2" } }));
+      watchdog.observe(JSON.stringify({ type: "item.failed", item: { type: "mcp_tool_call", id: "2" } }));
+      time = 200;
+      expect(watchdog.expired()).toBe(false);
+    });
+
+    it("uses per-server timeouts after the global timeout override", () => {
+      const timeouts = resolveMCPServerToolTimeouts(
+        {
+          defaults: { mcp_servers: { github: { tool_timeout_sec: 60 }, search: { tool_timeout_sec: 30 } } },
+          overrides: { mcp_servers: { github: { tool_timeout_sec: 180 } } },
+        },
+        90
+      );
+      expect(timeouts).toEqual({ github: 180, search: 90 });
+
+      let time = 0;
+      const watchdog = createMCPCallWatchdog(
+        item => timeouts[item.server] * 1000 + 60_000,
+        () => time
+      );
+      watchdog.observe(JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call", id: "1", server: "github" } }));
+      time = 239_999;
+      expect(watchdog.expired()).toBe(false);
+      time = 240_000;
+      expect(watchdog.expiredTimeoutMs()).toBe(240_000);
+    });
+
+    it("clears an oversized completion from its bounded lifecycle prefix", () => {
+      let time = 0;
+      const watchdog = createMCPCallWatchdog(100, () => time);
+      watchdog.observe(JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call", id: "large" } }));
+      time = 100;
+      watchdog.observePrefix('{"type":"item.com\\u0070leted","item":{"\\u0069d":"large","type":"mcp_tool_call","server":"github","result":"');
+      expect(watchdog.expired()).toBe(false);
+    });
+  });
+  describe("native exec orchestration", () => {
+    it("preserves a native argument-parse exit without retrying a deterministic startup error", () => {
+      const { result, calls } = runHarnessFixture(`process.stderr.write("error: unexpected argument '--invalid' found\\n\\nUsage: codex exec [OPTIONS] [PROMPT]\\n");process.exit(2);`);
+      expect(result.status).toBe(2);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("startup configuration error");
+    });
+
+    it("delivers a large leading-hyphen prompt through stdin, not argv or logs", () => {
+      const prompt = "--private-task\n" + "x".repeat(2 * 1024 * 1024);
+      const { result, calls } = runHarnessFixture("process.exit(0);", { prompt });
+      expect(result.status).toBe(0);
+      expect(calls[0].stdin).toBe(prompt);
+      expect(calls[0].args).toEqual(["exec", "--json", "-"]);
+      expect(result.stderr).not.toContain("--private-task");
+    });
+
+    it("resumes the exact observed thread without replaying the original instructions", () => {
+      const id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+      const { result, calls } = runHarnessFixture(
+        `
+const n=fs.readFileSync(process.env.CODEX_HARNESS_STUB_CALLS,"utf8").trim().split("\\n").length;
+if(n===1){process.stdout.write(JSON.stringify({type:"thread.started",thread_id:"${id}"})+"\\n");process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"connection reset"}})+"\\n");process.exit(1);}
+process.stdout.write(JSON.stringify({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}})+"\\n");process.exit(0);`,
+        { args: ["--sandbox", "workspace-write"] }
+      );
+      expect(result.status).toBe(0);
+      expect(calls).toHaveLength(2);
+      expect(calls[1].args).toEqual(["exec", "--json", "--sandbox", "workspace-write", "resume", id, "-"]);
+      expect(calls[1].args).not.toContain("--last");
+      expect(calls[1].stdin).toContain("Complete only unfinished work");
+      expect(calls[1].stdin).not.toBe(calls[0].stdin);
+    });
+
+    it.each(["stdout", "stderr"])("stops after an invalid_request_body resume rejection on %s and reports the cause", stream => {
+      const id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+      const dir = makeHarnessTempDir("invalid-request-body-");
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      const safeOutputsCLI = path.join(dir, "safeoutputs.cjs");
+      fs.writeFileSync(
+        safeOutputsCLI,
+        `#!${process.execPath}
+const fs = require("fs");
+const args = process.argv.slice(2);
+const item = { type: args[0] };
+for (let i = 1; i < args.length; i += 2) item[args[i].slice(2)] = args[i + 1];
+fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify(item) + "\\n");
+`
+      );
+      fs.chmodSync(safeOutputsCLI, 0o700);
+      const { result, calls } = runHarnessFixture(
+        `
+process.stdout.write(JSON.stringify({type:"thread.started",thread_id:"${id}"})+"\\n");
+const resumed = process.argv.includes("resume");
+const message = resumed ? JSON.stringify({error:{message:"Invalid 'input[13].id': 'ctco_example'. Expected an ID that begins with 'fc'.",code:"invalid_request_body"}}) : "connection reset";
+process.${stream}.write(JSON.stringify({type:"turn.failed",error:{message}})+"\\n");
+process.exit(1);`,
+        { env: { GH_AW_HARNESS_MAX_RETRIES: "3", GH_AW_SAFE_OUTPUTS: safeOutputsPath, GH_AW_SAFEOUTPUTS_CLI: safeOutputsCLI } }
+      );
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(2);
+      expect(calls[1].args).toEqual(["exec", "--json", "resume", id, "-"]);
+      expect(result.stderr).toContain("invalid_request_body (HTTP 400) — not retrying");
+      const items = fs
+        .readFileSync(safeOutputsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({ type: "report_incomplete", reason: "infrastructure_error" });
+      expect(items[0].details).toContain("request-body rejection (invalid_request_body)");
+      expect(items[0].details).toContain("not retrying");
+    });
+
+    it("does not select a session when ephemeral mode prevents persistence", () => {
+      expect(buildCodexResumeArgs(["exec", "--ephemeral", "-"], "0199a213-81c0-7800-8aa1-bbab2a035a53")).toBeNull();
+      expect(buildCodexResumeArgs(["exec", "-"], "not-an-id")).toBeNull();
+      expect(buildCodexResumeArgs(["exec", "resume", "--last", "-"], "0199a213-81c0-7800-8aa1-bbab2a035a53")).toBeNull();
+    });
+
+    it.each([false, true])("preserves actual compiled execution flags on resume (detection=%s)", detection => {
+      const id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+      const flags = [
+        "--model",
+        "gpt-5.3-codex",
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        "features.shell_tool=false",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        ...(detection ? ["--output-schema", "schema file.json", "-o", "result file.json"] : []),
+      ];
+      expect(buildCodexResumeArgs(["exec", "--json", ...flags, "-"], id)).toEqual(["exec", "--json", ...flags, "resume", id, "-"]);
+      const { result, calls } = runHarnessFixture(
+        `
+const n=fs.readFileSync(process.env.CODEX_HARNESS_STUB_CALLS,"utf8").trim().split("\\n").length;
+if(n===1){process.stdout.write(JSON.stringify({type:"thread.started",thread_id:"${id}"})+"\\n");process.stderr.write("connection reset\\n");process.exit(1);}
+process.exit(0);`,
+        { args: flags }
+      );
+      expect(result.status).toBe(0);
+      expect(calls).toHaveLength(2);
+      expect(calls[1].args).toEqual(["exec", "--json", ...flags, "resume", id, "-"]);
+    });
+
+    it.each(["--model", "-m", "--model="])("normalizes the runtime prefix in explicit %s model flags", flag => {
+      const args = flag.endsWith("=") ? [flag + "copilot/gpt-5"] : [flag, "copilot/gpt-5"];
+      const { result, calls } = runHarnessFixture("process.exit(0);", { args, env: { GH_AW_LLM_PROVIDER: "github", GH_AW_MODEL_AGENT_CODEX: "copilot/gpt-5" } });
+      expect(result.status).toBe(0);
+      expect(calls[0].args.join(" ")).toContain("gpt-5");
+      expect(calls[0].args.join(" ")).not.toContain("copilot/");
+      expect(calls[0].args.filter(arg => arg === "--model" || arg === "-m" || arg.startsWith("--model="))).toHaveLength(1);
+    });
+
+    it.each(["auto", "copilot/auto"])("starts Codex with the %s gateway picker in environment and CLI model inputs", model => {
+      for (const args of [[], ["--model", model], [`--model=${model}`]]) {
+        const { result, calls } = runHarnessFixture("process.exit(0);", { args, env: { GH_AW_LLM_PROVIDER: "github", GH_AW_MODEL_AGENT_CODEX: model } });
+        expect(result.status, result.stderr).toBe(0);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].args.join(" ")).toMatch(/--model(?:=| )auto/);
+        expect(calls[0].args.join(" ")).not.toContain("copilot/");
+      }
+    });
+
+    it("fails startup rather than switching credentials for a conflicting runtime prefix", () => {
+      const { result, calls } = runHarnessFixture("process.exit(0);", { env: { GH_AW_LLM_PROVIDER: "openai", GH_AW_MODEL_AGENT_CODEX: "copilot/gpt-5" } });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(0);
+      expect(result.stderr).toContain("does not match configured provider");
+    });
+
+    it.each(["max_cache_misses_exceeded", "effective_tokens_limit_exceeded", "permission_denied_limit_exceeded", "model_policy_violation"])("stops on the terminal proxy guard %s", guard => {
+      const { result, calls } = runHarnessFixture(`process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"403 ${guard}"}})+"\\n");process.exit(1);`);
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("terminal proxy guard");
+    });
+
+    it("recognizes native budget errors even when verbose output exceeds the collection bound", () => {
+      const { result, calls } = runHarnessFixture(
+        `process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"403 Maximum AI credits exceeded (301 / 300)."}})+"\\n");process.stdout.write("x".repeat(5*1024*1024)+"\\n",()=>process.exit(1));`
+      );
+      expect(result.status).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("trusted budget-abort evidence");
+    });
+
+    it("preempts an active attempt at the soft deadline even when it handles SIGTERM cleanly", () => {
+      const { result, calls } = runHarnessFixture(`process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000);`, { env: { GH_AW_TIMEOUT_MINUTES: "0.04" } });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("soft execution deadline");
+    });
+
+    it("requires a path for stdin prompt delivery", () => {
+      expect(() => resolveCodexPromptInput(["exec", "--prompt-file"])).toThrow("requires a readable file path");
+    });
+
+    it("repairs a provider section without corrupting the next TOML header", () => {
+      const dir = makeHarnessTempDir("toml-repair-");
+      const config = path.join(dir, "config.toml");
+      const reflect = path.join(dir, "reflect.json");
+      fs.writeFileSync(config, '[model_providers.openai-proxy]\nname = "proxy"\n[features]\nplugins = false\n');
+      fs.writeFileSync(reflect, JSON.stringify({ endpoints: [{ provider: "openai", configured: true, port: 10000 }] }));
+      expect(configureCodexProviderFromReflect({ codexConfigPath: config, reflectPath: reflect, provider: "openai" }).configured).toBe(true);
+      const text = fs.readFileSync(config, "utf8");
+      expect(text).toMatch(/\nbase_url = "http:\/\/api-proxy:10000"\n+\[features\]/);
+    });
+  });
+
   describe("resolveCodexPromptFileArgs", () => {
     it("replaces --prompt-file with the file's content as the last positional arg", () => {
-      const promptFile = path.join(os.tmpdir(), `codex-harness-prompt-${Date.now()}.txt`);
+      const promptFile = path.join(agentTempDir, `codex-harness-prompt-${Date.now()}.txt`);
       fs.writeFileSync(promptFile, "fix the bug", "utf8");
       try {
         const result = resolveCodexPromptFileArgs(["exec", "--dangerously-bypass-approvals-and-sandbox", "--prompt-file", promptFile]);
@@ -67,7 +448,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("appends prompt content as the last arg when only --prompt-file is provided", () => {
-      const promptFile = path.join(os.tmpdir(), `codex-harness-prompt-${Date.now()}.txt`);
+      const promptFile = path.join(agentTempDir, `codex-harness-prompt-${Date.now()}.txt`);
       fs.writeFileSync(promptFile, "my task", "utf8");
       try {
         const result = resolveCodexPromptFileArgs(["--prompt-file", promptFile]);
@@ -89,12 +470,12 @@ describe("codex_harness.cjs", () => {
     });
 
     it("throws when the prompt file does not exist", () => {
-      const missingFile = path.join(os.tmpdir(), `codex-harness-missing-${Date.now()}.txt`);
+      const missingFile = path.join(agentTempDir, `codex-harness-missing-${Date.now()}.txt`);
       expect(() => resolveCodexPromptFileArgs(["--prompt-file", missingFile])).toThrow(`--prompt-file '${missingFile}' is not readable`);
     });
 
     it("throws when the prompt file cannot be read (directory)", () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-harness-dir-"));
+      const dir = makeHarnessTempDir("codex-harness-dir-");
       try {
         expect(() => resolveCodexPromptFileArgs(["--prompt-file", dir])).toThrow(`--prompt-file '${dir}' is not readable`);
       } finally {
@@ -285,7 +666,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("does not trip after a terminal safe-output was produced in the current attempt", () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-safe-output-"));
+      const dir = makeHarnessTempDir("codex-rebuild-safe-output-");
       const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
       fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"done"}\n', "utf8");
       const logs = [];
@@ -303,7 +684,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("does not trip after a report_incomplete safe-output was produced in the current attempt", () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-report-incomplete-"));
+      const dir = makeHarnessTempDir("codex-rebuild-report-incomplete-");
       const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
       fs.writeFileSync(safeOutputsPath, '{"type":"report_incomplete","reason":"blocked"}\n', "utf8");
       try {
@@ -315,7 +696,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("still trips when terminal safe-output predates the current attempt", () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-stale-safe-output-"));
+      const dir = makeHarnessTempDir("codex-rebuild-stale-safe-output-");
       const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
       fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"old"}\n', "utf8");
       const byteOffset = fs.statSync(safeOutputsPath).size;
@@ -341,7 +722,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("skips token-usage candidates whose measurements are unavailable", async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const dir = makeHarnessTempDir("codex-token-usage-");
       const malformed = path.join(dir, "malformed.jsonl");
       const valid = path.join(dir, "valid.jsonl");
       fs.writeFileSync(malformed, "not json\n{oops\n");
@@ -357,7 +738,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("prefers the most recently written token-usage candidate", async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const dir = makeHarnessTempDir("codex-token-usage-");
       const stale = path.join(dir, "stale.jsonl");
       const fresh = path.join(dir, "fresh.jsonl");
       fs.writeFileSync(stale, `${JSON.stringify({ input_tokens: 7 })}\n`);
@@ -375,7 +756,7 @@ describe("codex_harness.cjs", () => {
     });
 
     it("returns null when no candidate yields usable measurements", async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const dir = makeHarnessTempDir("codex-token-usage-");
       const malformed = path.join(dir, "malformed.jsonl");
       fs.writeFileSync(malformed, "not json\n");
       try {
@@ -601,11 +982,26 @@ env_key = "OPENAI_API_KEY"
       expect(isInvalidRequestError('{"type":"turn.failed","error":{"type":"invalid_request_error"}}')).toBe(true);
     });
 
+    it("extracts the invalid request error code", () => {
+      expect(extractInvalidRequestErrorCode('{"type":"turn.failed","error":{"type":"invalid_request_error"}}')).toBe("invalid_request_error");
+      expect(extractInvalidRequestErrorCode('{"type":"turn.failed","error":{"code":"invalid_request_body"}}')).toBe("invalid_request_body");
+      expect(extractInvalidRequestErrorCode('{"type":"item.completed","item":{"text":"invalid_request_body"}}')).toBeNull();
+    });
+
+    it("returns true for the observed nested invalid_request_body item-ID rejection", () => {
+      const output = String.raw`{"type":"turn.failed","error":{"message":"{\"error\":{\"message\":\"Invalid 'input[13].id': 'ctco_example'. Expected an ID that begins with 'fc'.\",\"code\":\"invalid_request_body\"}}\n"}}`;
+      expect(isInvalidRequestError(output)).toBe(true);
+      expect(isInvalidRequestError('{"type":"turn.failed","error":{"code":"invalid_request_body"}}')).toBe(true);
+    });
+
     it("returns false for unrelated errors and tool transcript content", () => {
       expect(isInvalidRequestError("rate_limit_exceeded")).toBe(false);
       expect(isInvalidRequestError("500 Internal Server Error")).toBe(false);
       expect(isInvalidRequestError("GitHub API responded with 400 Bad Request")).toBe(false);
       expect(isInvalidRequestError('{"type":"item.completed","item":{"type":"tool_call_output","output":"invalid_request_error"}}')).toBe(false);
+      expect(isInvalidRequestError('{"type":"item.completed","item":{"type":"agent_message","text":"invalid_request_body"}}')).toBe(false);
+      expect(isInvalidRequestError('{"type":"item.completed","item":{"type":"tool_call_output","output":"invalid_request_body"}}')).toBe(false);
+      expect(isInvalidRequestError("invalid_request_body")).toBe(false);
       expect(isInvalidRequestError("")).toBe(false);
     });
   });
@@ -1256,10 +1652,7 @@ process.exit(1);`,
       expect(result.stderr).not.toContain("late-activity exit suppressed");
     });
 
-    it("does not arm watchdog on retry from terminal output left by a previous attempt", () => {
-      // Attempt 0 writes a terminal safe-output and exits non-zero quickly (no hang).
-      // Attempt 1 should NOT have its watchdog armed by attempt 0's output, and
-      // should NOT be suppressed as a success.
+    it("never replays an attempt that already staged task output", () => {
       const tempDir = makeHarnessTempDir("codex-watchdog-baseline-");
       const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
       const stubPath = path.join(tempDir, "stub.cjs");
@@ -1301,10 +1694,18 @@ process.exit(1);`,
         timeout: 15000,
       });
       const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
-      // Should retry: attempt 0's output does not suppress attempt 1
-      expect(callCount).toBeGreaterThan(1);
-      // Harness exits 1: attempt 1 produced no new terminal safe-output
+      // Preserve the staged output without replaying the original task.
+      expect(callCount).toBe(1);
       expect(result.status).toBe(1);
+      expect(
+        fs
+          .readFileSync(safeOutputsPath, "utf8")
+          .trim()
+          .split("\n")
+          .map(line => JSON.parse(line))
+          .filter(record => record.type === "add-labels")
+      ).toHaveLength(1);
+      expect(result.stderr).toContain("task output already staged");
       // The watchdog-suppression path must not have fired
       expect(result.stderr).not.toContain("late-activity exit suppressed");
     });
@@ -1317,7 +1718,7 @@ process.exit(1);`,
       const stubPath = path.join(tempDir, "stub.cjs");
       const promptPath = path.join(tempDir, "prompt.txt");
       const callsPath = path.join(tempDir, "calls.jsonl");
-      const tokenUsagePath = TOKEN_USAGE_PATHS[0];
+      const tokenUsagePath = path.join(tempDir, "token-usage.jsonl");
       // Preserve any pre-existing token-usage log so the test never destroys real data,
       // while still always executing its assertions.
       const previousTokenUsage = fs.existsSync(tokenUsagePath) ? fs.readFileSync(tokenUsagePath) : null;
@@ -1351,6 +1752,7 @@ setInterval(() => {}, 1000);`,
             GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "10",
             GH_AW_CODEX_REBUILD_GUARD_POLL_MS: "1000",
             GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS: "250",
+            GH_AW_CODEX_TOKEN_USAGE_PATH: tokenUsagePath,
           },
           encoding: "utf8",
           timeout: 20000,
@@ -1377,7 +1779,7 @@ setInterval(() => {}, 1000);`,
       const stubPath = path.join(tempDir, "stub.cjs");
       const promptPath = path.join(tempDir, "prompt.txt");
       const callsPath = path.join(tempDir, "calls.jsonl");
-      const tokenUsagePath = TOKEN_USAGE_PATHS[0];
+      const tokenUsagePath = path.join(tempDir, "token-usage.jsonl");
       const previousTokenUsage = fs.existsSync(tokenUsagePath) ? fs.readFileSync(tokenUsagePath) : null;
       fs.mkdirSync(path.dirname(tokenUsagePath), { recursive: true });
       fs.writeFileSync(tokenUsagePath, [100, 100, 100].map(t => JSON.stringify({ input_tokens: t })).join("\n") + "\n", "utf8");
@@ -1410,6 +1812,7 @@ setInterval(() => {}, 1000);`,
             GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "10",
             GH_AW_CODEX_REBUILD_GUARD_POLL_MS: "1000",
             GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS: "250",
+            GH_AW_CODEX_TOKEN_USAGE_PATH: tokenUsagePath,
           },
           encoding: "utf8",
           timeout: 20000,

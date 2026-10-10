@@ -13,6 +13,8 @@ import (
 
 type auditCacheSource string
 
+const auditSchemaVersion = 5
+
 const (
 	auditCacheSourceFull auditCacheSource = "full"
 	auditCacheSourceLogs auditCacheSource = "logs"
@@ -39,7 +41,8 @@ func loadCachedAuditData(runOutputDir string, run WorkflowRun, source auditCache
 	if err := json.Unmarshal(data, &auditData); err != nil {
 		return AuditData{}, false
 	}
-	if auditData.Overview.RunID != run.DatabaseID ||
+	if auditData.SchemaVersion != auditSchemaVersion ||
+		auditData.Overview.RunID != run.DatabaseID ||
 		auditData.Overview.Status != run.Status ||
 		auditData.Overview.Conclusion != run.Conclusion ||
 		!auditData.Overview.UpdatedAt.Equal(run.UpdatedAt) ||
@@ -50,6 +53,7 @@ func loadCachedAuditData(runOutputDir string, run WorkflowRun, source auditCache
 }
 
 func writeAuditData(runOutputDir string, auditData AuditData) error {
+	auditData.SchemaVersion = auditSchemaVersion
 	data, err := json.MarshalIndent(auditData, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal audit data: %w", err)
@@ -95,6 +99,9 @@ func writeLogsAuditFile(processedRun ProcessedRun, processedRuns []ProcessedRun,
 		auditData, _ = buildLocalAuditData(processedRun, metrics, processedRun.MCPToolUsage)
 		auditData.CacheSource = auditCacheSourceLogs
 	}
+	if processedRun.WorkQueue != nil {
+		auditData.WorkQueue = processedRun.WorkQueue
+	}
 	hydratedProcessedRuns := hydrateProcessedRunsWithCachedAudit(processedRuns)
 	auditData.Comparison = buildAuditComparisonForProcessedRuns(hydrateProcessedRunWithCachedAudit(processedRun), hydratedProcessedRuns)
 	if err := writeAuditData(runOutputDir, auditData); err != nil {
@@ -107,9 +114,9 @@ func writeLogsAuditFile(processedRun ProcessedRun, processedRuns []ProcessedRun,
 }
 
 func hydrateProcessedRunsWithCachedAudit(processedRuns []ProcessedRun) []ProcessedRun {
-	hydrated := make([]ProcessedRun, len(processedRuns))
-	for i, processedRun := range processedRuns {
-		hydrated[i] = hydrateProcessedRunWithCachedAudit(processedRun)
+	hydrated := make([]ProcessedRun, 0, len(processedRuns))
+	for _, processedRun := range processedRuns {
+		hydrated = append(hydrated, hydrateProcessedRunWithCachedAudit(processedRun))
 	}
 	return hydrated
 }
@@ -122,6 +129,9 @@ func hydrateProcessedRunWithCachedAudit(processedRun ProcessedRun) ProcessedRun 
 	if processedRun.Run.Turns == 0 {
 		processedRun.Run.Turns = audit.Metrics.Turns
 	}
+	if processedRun.Ledger == nil {
+		processedRun.Ledger = audit.Ledger
+	}
 	if len(processedRun.SafeOutputs) == 0 {
 		processedRun.SafeOutputs = audit.CreatedItems
 	}
@@ -130,6 +140,12 @@ func hydrateProcessedRunWithCachedAudit(processedRun ProcessedRun) ProcessedRun 
 	}
 	if len(processedRun.MCPFailures) == 0 {
 		processedRun.MCPFailures = audit.MCPFailures
+	}
+	if len(processedRun.GatewaySteeringEvents) == 0 {
+		processedRun.GatewaySteeringEvents = audit.GatewaySteeringEvents
+	}
+	if processedRun.WorkQueue == nil {
+		processedRun.WorkQueue = audit.WorkQueue
 	}
 	return processedRun
 }

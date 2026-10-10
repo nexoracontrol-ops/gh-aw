@@ -8,15 +8,22 @@ import (
 
 var addLabelsLog = logger.New("workflow:add_labels")
 
+const defaultMaxAddLabelsCalls = 5
+
+// Keep in sync with MAX_LABELS in actions/setup/js/constants.cjs.
+const defaultMaxLabelsPerAddLabelsCall = 10
+
 // AddLabelsConfig holds configuration for adding labels to issues/PRs from agent output
 type AddLabelsConfig struct {
 	BaseSafeOutputConfig       `yaml:",inline"`
 	SafeOutputTargetConfig     `yaml:",inline"`
 	SafeOutputFilterConfig     `yaml:",inline"`
 	SafeOutputAllowBlockConfig `yaml:",inline"`
-	Issues                     *bool `yaml:"issues,omitempty"`            // When false, excludes issues:write permission. Default (nil or true) includes issues:write.
-	PullRequests               *bool `yaml:"pull-requests,omitempty"`     // When false, excludes pull-requests:write permission. Default (nil or true) includes pull-requests:write.
-	CreateIfMissing            *bool `yaml:"create-if-missing,omitempty"` // When true, automatically creates labels that don't already exist in the target repository. Default (nil or false) does not create missing labels.
+	MaxLabels                  *string        `yaml:"max-labels,omitempty"`        // Maximum labels per add_labels call (default: 10).
+	Issues                     *bool          `yaml:"issues,omitempty"`            // When false, excludes issues:write permission. Default (nil or true) includes issues:write.
+	PullRequests               *bool          `yaml:"pull-requests,omitempty"`     // When false, excludes pull-requests:write permission. Default (nil or true) includes pull-requests:write.
+	CreateIfMissing            *bool          `yaml:"create-if-missing,omitempty"` // When true, automatically creates labels that don't already exist in the target repository. Default (nil or false) does not create missing labels.
+	ItemSchema                 map[string]any `yaml:"item-schema,omitempty"`
 }
 
 // parseAddLabelsConfig handles add-labels configuration

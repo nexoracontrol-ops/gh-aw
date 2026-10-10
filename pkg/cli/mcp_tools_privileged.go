@@ -103,7 +103,7 @@ type logsArgs struct {
 	StartDate             string   `json:"start_date,omitempty" jsonschema:"Filter runs created after this date (YYYY-MM-DD or delta like -1d, -1w, -1mo)"`
 	EndDate               string   `json:"end_date,omitempty" jsonschema:"Filter runs created before this date (YYYY-MM-DD or delta like -1d, -1w, -1mo)"`
 	Engine                string   `json:"engine,omitempty" jsonschema:"Filter logs by agentic engine type (claude, codex, copilot)"`
-	Runtime               string   `json:"runtime,omitempty" jsonschema:"Filter logs by sandbox agent runtime (gvisor, docker-sbx)"`
+	Runtime               string   `json:"runtime,omitempty" jsonschema:"Filter logs by sandbox agent runtime (cloud-hypervisor)"`
 	Firewall              bool     `json:"firewall,omitempty" jsonschema:"Filter to only runs with firewall enabled"`
 	NoFirewall            bool     `json:"no_firewall,omitempty" jsonschema:"Filter to only runs without firewall enabled"`
 	FilteredIntegrity     bool     `json:"filtered_integrity,omitempty" jsonschema:"Filter to only runs that contain DIFC integrity-filtered events in gateway logs"`
@@ -117,7 +117,7 @@ type logsArgs struct {
 	MaxStorageMB          int      `json:"max_storage,omitempty" jsonschema:"Maximum logs storage in MB after pruning non-essential cache data (0 means unlimited)."`
 	PruneOlderRuns        bool     `json:"prune_older_runs,omitempty" jsonschema:"Remove oldest completed runs when non-essential cache pruning cannot satisfy max_storage."`
 	MaxTokens             int      `json:"max_tokens,omitempty" jsonschema:"Deprecated: accepted for backward compatibility but ignored. Output is always written to a file."`
-	Artifacts             []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: info,usage). Valid sets: all, activation, agent, detection, evals, experiment, firewall, github-api, graders, info, mcp, usage. The compact usage set is always added so per-run token_usage is populated."`
+	Artifacts             []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: info,usage). Valid sets: all, activation, agent, detection, evals, experiment, firewall, github-api, graders, info, mcp, usage, work-queue. The compact usage set is always added so per-run token_usage is populated."`
 }
 
 // defaultMCPLogsToolArtifacts is the artifact selection used when the caller does
@@ -458,11 +458,11 @@ type auditArgs struct {
 	RunID        any      `json:"run_id,omitempty"          jsonschema:"Alias for run_id_or_url. Accepts run ID or run/job URL (including step anchors). String or number."`
 	RunIDOrURL   any      `json:"run_id_or_url,omitempty"   jsonschema:"Deprecated: use run_ids_or_urls instead. Accepts run ID or run/job URL (including step anchors). String or number."`
 	RunIDsOrURLs []string `json:"run_ids_or_urls,omitempty" jsonschema:"One or more workflow run IDs or URLs. Single item: detailed audit report. Multiple items: diff mode with first as base (see tool description for accepted formats)."`
-	Artifacts    []string `json:"artifacts,omitempty"        jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage"`
+	Artifacts    []string `json:"artifacts,omitempty"        jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage, work-queue"`
 	MaxTokens    int      `json:"max_tokens,omitempty"       jsonschema:"Deprecated: accepted for backward compatibility but ignored."`
 	Experiment   string   `json:"experiment,omitempty"       jsonschema:"Filter to runs that include this experiment name. When set, runs whose experiment artifact does not contain an assignment for this experiment name are skipped."`
 	Variant      string   `json:"variant,omitempty"          jsonschema:"Filter to runs assigned this specific variant value. Requires experiment to be set."`
-	Runtime      string   `json:"runtime,omitempty"          jsonschema:"Filter to runs using a specific sandbox agent runtime (e.g., gvisor, docker-sbx). Runs without a matching runtime are skipped."`
+	Runtime      string   `json:"runtime,omitempty"          jsonschema:"Filter to runs using a specific sandbox agent runtime (e.g., cloud-hypervisor). Runs without a matching runtime are skipped."`
 }
 
 // normalizeAuditRunInput converts a single-run audit input (run_id or
@@ -536,7 +536,7 @@ When a job URL is provided (single-run mode only):
 Use experiment/variant to filter runs by A/B experiment assignment (skips runs
 that do not match). variant requires experiment.
 
-Use runtime to filter runs by sandbox agent runtime (gvisor, docker-sbx); runs
+Use runtime to filter runs by sandbox agent runtime (cloud-hypervisor); runs
 without a matching runtime are skipped.
 
 Single-run returns JSON with:
@@ -715,7 +715,7 @@ func buildAuditErrorResult(err error, outputStr string, runItems []string) (*mcp
 type auditDiffArgs struct {
 	BaseRunID     string   `json:"base_run_id"     jsonschema:"Numeric ID of the base (reference) workflow run"`
 	CompareRunIDs []string `json:"compare_run_ids" jsonschema:"One or more numeric IDs of the comparison runs"`
-	Artifacts     []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage"`
+	Artifacts     []string `json:"artifacts,omitempty" jsonschema:"Artifact sets to download (default: all). Valid sets: all, activation, agent, detection, experiment, firewall, github-api, mcp, usage, work-queue"`
 }
 
 // registerAuditDiffTool registers the audit-diff tool with the MCP server.

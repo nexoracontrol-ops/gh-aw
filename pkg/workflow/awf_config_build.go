@@ -7,7 +7,6 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,9 +30,18 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 
 	// Resolve firewall config once — used for both the schema URL and the container image tag.
 	firewallConfig := getFirewallConfig(config.WorkflowData)
+	if err := validateModelRouting(config.WorkflowData, config.EngineName); err != nil {
+		return "", err
+	}
+	if err := validateEngineFallbackModels(config.WorkflowData); err != nil {
+		return "", err
+	}
 
 	awfConfig := AWFConfigFile{
 		Schema: buildAWFConfigSchemaURL(firewallConfig),
+	}
+	if isModelRoutingEnabled(config.WorkflowData) {
+		awfConfig.Experimental = &AWFExperimentalConfig{ModelRouting: true}
 	}
 	if config.WorkflowData != nil {
 		awfConfig.Enclaves = buildAWFEnclavesConfig(config.WorkflowData.Enclaves)
@@ -71,27 +79,6 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		awfConfig.Network.Isolation = true
 		awfConfig.Network.TopologyAttach = buildAWFTopologyAttachList(config.WorkflowData)
 		awfConfigLog.Printf("Network section: isolation enabled with %d topology attachments", len(awfConfig.Network.TopologyAttach))
-	}
-
-	// Docker sbx microVMs resolve host services via
-	// host.docker.internal
-	// (the Docker bridge gateway, 172.17.0.1). Allow this domain so AWF's network
-	// policy permits connections from the microVM to the api-proxy, MCP gateway, and
-	// Squid proxy that are all published on the host bridge.
-	if isDockerSbxRuntime(config.WorkflowData) {
-		if awfConfig.Network == nil {
-			awfConfig.Network = &AWFNetworkConfig{}
-		}
-		const hostDockerInternal = "host.docker.internal"
-		if !slices.Contains(awfConfig.Network.AllowDomains, hostDockerInternal) {
-			awfConfig.Network.AllowDomains = append(awfConfig.Network.AllowDomains, hostDockerInternal)
-			awfConfigLog.Printf("Network section: added %s for microVM runtime routing", hostDockerInternal)
-		}
-		if awfSupportsVerifySbxEgress(firewallConfig) {
-			awfConfig.Network.VerifySbxEgress = true
-		} else {
-			awfConfigLog.Printf("Skipping network.verifySbxEgress: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFVerifySbxEgressMinVersion)
-		}
 	}
 
 	// ── Filesystem section ───────────────────────────────────────────────────
@@ -154,10 +141,22 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 
 	apiProxy := &AWFAPIProxyConfig{
 		Enabled:             true,
+		FallbackModels:      nativeAWFFallbackModels(config.WorkflowData),
 		MaxRuns:             maxRuns,
 		MaxTurnCacheMisses:  maxTurnCacheMisses,
 		MaxAICredits:        maxAICredits,
 		EnableTokenSteering: tokenSteeringEnabled,
+	}
+	if isModelRoutingEnabled(config.WorkflowData) {
+		routing := config.WorkflowData.EngineConfig.ModelRouting
+		apiProxy.Routing = &AWFModelRoutingConfig{
+			Objective: AWFModelRoutingObjective{Goal: routing.Goal, Mode: routing.Mode},
+			Task:      AWFModelRoutingTask{ConversationFile: modelRoutingConversationFile},
+		}
+	}
+	if hostedWeb := buildHostedWebConfig(config.EngineName, config.EngineRuntimeID, config.WorkflowData, firewallConfig); hostedWeb != nil {
+		apiProxy.HostedWeb = hostedWeb
+		awfConfigLog.Printf("API proxy: hosted web policy configured for %s", config.EngineName)
 	}
 
 	if !enableTokenSteering {
@@ -166,7 +165,11 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFTokenSteeringMinVersion)
 	}
 
-	if mf := extractModelFallback(config.WorkflowData); mf != nil {
+	if config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && len(config.WorkflowData.EngineConfig.FallbackModels) > 0 {
+		// An explicit ordered chain must not silently insert a catalog-selected model.
+		disabled := TemplatableBool("false")
+		apiProxy.ModelFallback = &AWFModelFallbackConfig{Enabled: &disabled}
+	} else if mf := extractModelFallback(config.WorkflowData); mf != nil {
 		apiProxy.ModelFallback = mf
 		enabledDisplay := "<unset>"
 		if mf.Enabled != nil {
@@ -191,7 +194,12 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 
 	targets := map[string]*AWFAPITargetConfig{}
 
-	if openaiTarget := extractAPIProxyTargetHost(config.WorkflowData, "OPENAI_BASE_URL", firewallConfig); openaiTarget != "" {
+	openaiTarget := extractAPIProxyTargetHost(config.WorkflowData, "OPENAI_BASE_URL", firewallConfig)
+	codexOpenAITarget := config.EngineName == "codex" && NewCodexEngine().ResolveLLMProvider(config.WorkflowData) == LLMProviderOpenAI
+	if codexOpenAITarget && config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && config.WorkflowData.EngineConfig.APITarget != "" {
+		openaiTarget = config.WorkflowData.EngineConfig.APITarget
+	}
+	if openaiTarget != "" {
 		targets["openai"] = &AWFAPITargetConfig{Host: openaiTarget}
 		awfConfigLog.Printf("API proxy: custom openai target=%s", openaiTarget)
 	}
@@ -215,7 +223,11 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		}
 		awfConfigLog.Printf("API proxy: custom %s authHeader=%s", provider, authHeader)
 	}
-	if copilotTarget := GetCopilotAPITarget(config.WorkflowData); copilotTarget != "" {
+	copilotTarget := GetCopilotAPITarget(config.WorkflowData)
+	if codexOpenAITarget && config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && config.WorkflowData.EngineConfig.APITarget != "" {
+		copilotTarget = ""
+	}
+	if copilotTarget != "" {
 		targets["copilot"] = &AWFAPITargetConfig{Host: copilotTarget}
 		awfConfigLog.Printf("API proxy: custom copilot target=%s", copilotTarget)
 	}
@@ -275,6 +287,21 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		awfConfigLog.Printf("Models section: %d alias entries", len(config.WorkflowData.ModelMappings))
 	}
 	allowedModels, disallowedModels := resolveModelPolicyForAWFConfig(config.WorkflowData)
+	if isModelRoutingEnabled(config.WorkflowData) {
+		candidates, err := resolveModelRoutingAllowedModels(config.WorkflowData.EngineConfig.ModelRouting)
+		if err != nil {
+			return "", NewValidationError("engine.model-routing.allowed-models", "", "invalid model-routing candidates", err.Error())
+		}
+		policyAllowed := allowedModels
+		allowedModels, err = intersectModelRoutingPolicy(candidates, policyAllowed, disallowedModels)
+		if err != nil {
+			return "", NewValidationError("engine.model-routing.allowed-models", "", "model-routing candidates violate model policy", err.Error())
+		}
+		if apiProxySupportsRoutingCandidateModels(config.WorkflowData) {
+			apiProxy.Routing.CandidateModels = allowedModels
+			allowedModels, _ = subAgentRequestModels(config.WorkflowData, allowedModels, policyAllowed, disallowedModels)
+		}
+	}
 	if len(allowedModels) > 0 {
 		apiProxy.AllowedModels = allowedModels
 		awfConfigLog.Printf("Models policy: %d allowed model pattern(s)", len(allowedModels))
@@ -304,25 +331,20 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 	if len(containerImages) > 0 {
 		awfImageTag = ""
 	}
-	agentRuntime := getAgentContainerRuntime(config.WorkflowData)
 	agentTimeout := 0
-	if isDockerSbxRuntime(config.WorkflowData) || isCloudHypervisorRuntime(config.WorkflowData) {
+	if isCloudHypervisorRuntime(config.WorkflowData) || isNVXRuntime(config.WorkflowData) {
 		agentTimeout = resolveAWFContainerAgentTimeoutMinutes(config.WorkflowData)
 	}
-	// containerRuntime is only emitted when the effective AWF version supports it.
-	// Gate here to avoid sending an unrecognised field to older AWF binaries.
-	if !awfSupportsContainerRuntime(firewallConfig) {
-		if agentRuntime != "" {
-			awfConfigLog.Printf("Skipping containerRuntime: AWF version %q requires at least %s (gh-aw-firewall#6093)", getAWFImageTag(firewallConfig), constants.AWFContainerRuntimeMinVersion)
-		}
-		agentRuntime = ""
-	}
-	if awfImageTag != "" || isArcDindTopology(config.WorkflowData) || agentRuntime != "" || agentTimeout > 0 || len(containerImages) > 0 {
+	if awfImageTag != "" || isArcDindTopology(config.WorkflowData) || agentTimeout > 0 || len(containerImages) > 0 || isNVXRuntime(config.WorkflowData) {
 		container := &AWFContainerConfig{
-			ImageTag:         awfImageTag,
-			AgentTimeout:     agentTimeout,
-			ContainerRuntime: agentRuntime,
-			Images:           containerImages,
+			ImageTag:     awfImageTag,
+			AgentTimeout: agentTimeout,
+			Images:       containerImages,
+		}
+		if isNVXRuntime(config.WorkflowData) {
+			nvx := effectiveNVXConfig(getAgentConfig(config.WorkflowData).NVX)
+			container.ContainerRuntime = string(AgentRuntimeNVX)
+			container.ContainerWorkDir = nvx.ContainerWorkDir
 		}
 		// NOTE: dockerHostPathPrefix is intentionally NOT set for arc-dind topology.
 		// With sysroot-stage active, the Docker daemon can access all needed paths:
@@ -336,9 +358,6 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		if awfImageTag != "" {
 			awfConfigLog.Printf("Container section: image_tag=%s", awfImageTag)
 		}
-		if agentRuntime != "" {
-			awfConfigLog.Printf("Container section: containerRuntime=%s", agentRuntime)
-		}
 		if agentTimeout > 0 {
 			awfConfigLog.Printf("Container section: agentTimeout=%d", agentTimeout)
 		}
@@ -349,6 +368,25 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 
 	if isCloudHypervisorRuntime(config.WorkflowData) {
 		awfConfig.CloudHypervisor = buildAWFCloudHypervisorConfig()
+	} else if isNVXRuntime(config.WorkflowData) {
+		agentConfig := getAgentConfig(config.WorkflowData)
+		awfConfig.NVX = buildAWFNVXConfig(agentConfig.NVX)
+	} else if hasCloudHypervisorEnclaves(config.WorkflowData) {
+		if awfConfig.Container == nil {
+			awfConfig.Container = &AWFContainerConfig{}
+		}
+		awfConfig.Container.ContainerRuntime = "docker"
+		awfConfig.CloudHypervisor = &AWFCloudHypervisorConfig{
+			PreviewEnabled:             true,
+			MountPolicy:                "workspace-only",
+			CloudHypervisorBinary:      "${GH_AW_CLOUD_HYPERVISOR_BINARY}",
+			KernelPath:                 "${GH_AW_CLOUD_HYPERVISOR_KERNEL}",
+			RootfsPath:                 "${GH_AW_CLOUD_HYPERVISOR_ROOTFS}",
+			SupervisorPath:             "${GH_AW_CLOUD_HYPERVISOR_SUPERVISOR}",
+			ArtifactManifestPath:       "${GH_AW_CLOUD_HYPERVISOR_ARTIFACT_MANIFEST}",
+			ArtifactManifestBundlePath: "${GH_AW_CLOUD_HYPERVISOR_ARTIFACT_MANIFEST_BUNDLE}",
+			ArtifactReleaseTag:         "${GH_AW_CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG}",
+		}
 	}
 
 	// ── Logging section ──────────────────────────────────────────────────────
@@ -381,6 +419,43 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 	return jsonStr, nil
 }
 
+func buildHostedWebConfig(engineName, engineRuntimeID string, workflowData *WorkflowData, firewallConfig *FirewallConfig) *AWFHostedWebConfig {
+	if workflowData == nil || workflowData.NetworkPermissions == nil {
+		return nil
+	}
+	runtimeID := hostedWebRuntimeID(engineName, engineRuntimeID)
+	if runtimeID != "claude" && runtimeID != "codex" {
+		return nil
+	}
+	if !awfSupportsHostedWeb(firewallConfig) {
+		awfConfigLog.Printf("Skipping apiProxy.hostedWeb: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFHostedWebMinVersion)
+		return nil
+	}
+
+	policy := workflowData.NetworkPermissions.HostedWeb
+	if policy == nil {
+		if !workflowData.NetworkPermissions.ExplicitlyDefined {
+			return nil
+		}
+		policy = &HostedWebPolicy{}
+	}
+
+	awfPolicy := &AWFHostedWebPolicy{
+		Enabled:        policy.Enabled,
+		AllowedDomains: policy.Allowed,
+		BlockedDomains: policy.Blocked,
+		MaxUses:        policy.MaxUses,
+	}
+	switch runtimeID {
+	case "claude":
+		return &AWFHostedWebConfig{Claude: awfPolicy}
+	case "codex":
+		return &AWFHostedWebConfig{Codex: awfPolicy}
+	default:
+		return nil
+	}
+}
+
 func buildAWFCloudHypervisorConfig() *AWFCloudHypervisorConfig {
 	return &AWFCloudHypervisorConfig{
 		PreviewEnabled: true,
@@ -391,7 +466,7 @@ func buildAWFCloudHypervisorConfig() *AWFCloudHypervisorConfig {
 }
 
 func resolveAWFContainerAgentTimeoutMinutes(workflowData *WorkflowData) int {
-	// Reuse the workflow-level default timeout so docker-sbx inherits the same
+	// Reuse the workflow-level default timeout so Cloud Hypervisor inherits the same
 	// runtime ceiling when top-level timeout-minutes is omitted or non-numeric.
 	defaultTimeout := compilerenv.ResolveDefaultTimeoutMinutes(int(constants.DefaultAgenticWorkflowTimeout / time.Minute))
 	if workflowData == nil || workflowData.TimeoutMinutes == "" {

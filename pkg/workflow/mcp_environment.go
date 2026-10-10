@@ -48,6 +48,7 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"strconv"
 
 	"slices"
 
@@ -62,13 +63,24 @@ var mcpEnvironmentLog = logger.New("workflow:mcp_environment")
 // from the workflow configuration to be passed to both Start MCP gateway and MCP Gateway steps
 func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, workflowData *WorkflowData, hasAgenticWorkflows bool) map[string]string { //nolint:largefunc // Existing MCP environment collection remains centralized.
 	envVars := make(map[string]string)
+	if workflowData != nil {
+		if workflowData.ToolsStartupTimeout != "" {
+			envVars["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
+		}
+		if workflowData.ToolsTimeout != "" {
+			envVars["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
+		}
+	}
 
 	// Check for GitHub MCP server token
 	hasGitHub := slices.Contains(mcpTools, "github")
 	rawGitHubTool, hasGitHubInTools := tools["github"]
 	githubToolEnabledInTools := hasGitHubInTools && rawGitHubTool != false
 	if hasGitHub {
-		toolConfig, _ := rawGitHubTool.(map[string]any)
+		toolConfig, ok := rawGitHubTool.(map[string]any)
+		if !ok {
+			toolConfig = nil
+		}
 
 		// Check if GitHub App is configured for token minting
 		appConfigured := hasGitHubApp(toolConfig)
@@ -103,6 +115,11 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 		// though the step may still be generated to supply GH_AW_SINK_VISIBILITY.
 		// Security: Pass step outputs through environment variables to prevent template injection.
 		guardPoliciesExplicit := len(getGitHubGuardPolicies(toolConfig)) > 0
+		if githubToolEnabledInTools && guardPoliciesExplicit && !githubBackendIsEnclaveOnly(workflowData) {
+			envVars["GH_AW_GUARD_BLOCKED_USERS"] = "${{ steps.parse-guard-vars.outputs.blocked_users }}"
+			envVars["GH_AW_GUARD_TRUSTED_USERS"] = "${{ steps.parse-guard-vars.outputs.trusted_users }}"
+			envVars["GH_AW_GUARD_APPROVAL_LABELS"] = "${{ steps.parse-guard-vars.outputs.approval_labels }}"
+		}
 		if githubToolEnabledInTools && !guardPoliciesExplicit && !githubBackendIsEnclaveOnly(workflowData) && githubLockdownDetectionStepEnabled(workflowData) {
 			envVars["GITHUB_MCP_GUARD_MIN_INTEGRITY"] = "${{ steps.determine-automatic-lockdown.outputs.min_integrity }}"
 			envVars["GITHUB_MCP_GUARD_REPOS"] = "${{ steps.determine-automatic-lockdown.outputs.repos }}"
@@ -151,6 +168,24 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 			envVars["GH_AW_ASSETS_BRANCH"] = "${{ env.GH_AW_ASSETS_BRANCH }}"
 			envVars["GH_AW_ASSETS_MAX_SIZE_KB"] = "${{ env.GH_AW_ASSETS_MAX_SIZE_KB }}"
 			envVars["GH_AW_ASSETS_ALLOWED_EXTS"] = "${{ env.GH_AW_ASSETS_ALLOWED_EXTS }}"
+		}
+	}
+	if memory := workflowData.RepoMemoryConfig.ledgerEntry(); memory != nil {
+		envVars["GH_AW_MEMORY_DIR"] = constants.TmpRepoMemoryDir + memory.ID
+		if memory.Ledger.Schema != "" {
+			envVars["GH_AW_LEDGER_SCHEMA"] = memory.Ledger.Schema
+		}
+		if memory.Ledger.MaxShards > 0 {
+			envVars["GH_AW_LEDGER_MAX_SHARDS"] = strconv.Itoa(memory.Ledger.MaxShards)
+		}
+		if memory.Ledger.MaxSegmentKB > 0 {
+			envVars["GH_AW_LEDGER_MAX_SEGMENT_KB"] = strconv.Itoa(memory.Ledger.MaxSegmentKB)
+		}
+		if memory.Ledger.MaxRecordKB > 0 {
+			envVars["GH_AW_LEDGER_MAX_RECORD_KB"] = strconv.Itoa(memory.Ledger.MaxRecordKB)
+		}
+		if memory.Ledger.MaxPatchKB > 0 {
+			envVars["GH_AW_LEDGER_MAX_PATCH_KB"] = strconv.Itoa(memory.Ledger.MaxPatchKB)
 		}
 	}
 
@@ -221,7 +256,8 @@ func collectMCPEnvironmentVariables(tools map[string]any, mcpTools []string, wor
 	// the converted MCP config can be copied into the writable Codex home directory.
 	// This matches the value set on the agent step in codex_engine.go.
 	if workflowData != nil && workflowData.AI == string(constants.CodexEngine) {
-		envVars["CODEX_HOME"] = constants.TmpMcpConfigDir
+		envVars["CODEX_HOME"] = codexHome(workflowData)
+		applyOptionalEngineToolTimeouts(envVars, workflowData)
 	}
 
 	return envVars

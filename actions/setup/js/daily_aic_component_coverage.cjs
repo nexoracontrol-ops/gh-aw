@@ -12,6 +12,19 @@ const COMPONENT_FILES = {
   evals: [["evals", "token_usage.jsonl"]],
 };
 
+// Generated jobs display as "Agent", "Detection" and "Evaluations".
+const COMPONENT_DISPLAY_NAMES = { evaluations: "evals" };
+
+function componentKey(job) {
+  for (const candidate of [job.job_id, job.name]) {
+    if (typeof candidate !== "string") continue;
+    const lower = candidate.toLowerCase();
+    const key = COMPONENT_DISPLAY_NAMES[lower] ?? lower;
+    if (Object.hasOwn(COMPONENT_FILES, key)) return key;
+  }
+  return "";
+}
+
 async function loadBillableJobs({ github, budget }, owner, repo, run) {
   const components = new Map();
   let complete = false;
@@ -28,16 +41,17 @@ async function loadBillableJobs({ github, budget }, owner, repo, run) {
     const jobs = response.data.jobs;
     if (!Array.isArray(jobs)) throw new Error("Incomplete daily AIC job metadata");
     for (const job of jobs) {
-      if (!Object.hasOwn(COMPONENT_FILES, job.name)) continue;
+      const name = componentKey(job);
+      if (!name) continue;
       if (!Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1 || job.run_attempt > run.run_attempt || job.status !== "completed" || !job.conclusion) {
         throw new Error("Incomplete daily AIC component attempt metadata");
       }
-      const prior = components.get(job.name);
+      const prior = components.get(name);
       if (prior && job.run_attempt === prior.run_attempt && job.id !== prior.id) {
         throw new Error("Ambiguous daily AIC component jobs");
       }
       if (!prior || (prior.conclusion === "skipped" && job.conclusion !== "skipped") || (job.conclusion !== "skipped" && job.run_attempt > prior.run_attempt) || (prior.conclusion === "skipped" && job.run_attempt > prior.run_attempt)) {
-        components.set(job.name, job);
+        components.set(name, job);
       }
     }
     if (jobs.length < 100) {
@@ -55,7 +69,16 @@ function allBillableJobsSkipped(components) {
 }
 
 function provesJobExecutionNotStarted(job) {
-  return job.conclusion === "failure" && Object.hasOwn(job, "runner_id") && (job.runner_id === null || job.runner_id === 0) && !job.runner_name && (!Array.isArray(job.steps) || job.steps.length === 0);
+  return (
+    (job.conclusion === "failure" || job.conclusion === "cancelled") &&
+    Object.hasOwn(job, "runner_id") &&
+    (job.runner_id === null || job.runner_id === 0) &&
+    Object.hasOwn(job, "runner_name") &&
+    job.runner_name === null &&
+    Object.hasOwn(job, "steps") &&
+    Array.isArray(job.steps) &&
+    job.steps.length === 0
+  );
 }
 
 function provesExecutionNotStarted(directory, name, runId, runAttempt) {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var mcpCLIMountLog = logger.New("workflow:mcp_cli_mount")
@@ -96,7 +97,7 @@ func getMCPCLIServerNames(data *WorkflowData) []string { //nolint:largefunc // E
 				if !isPlaywrightCLIMode(data.Tools) {
 					servers = append(servers, toolName)
 				}
-			case "qmd":
+			case "qmd", "work-queue":
 				servers = append(servers, toolName)
 			case "agentic-workflows":
 				// The gateway and manifest use "agenticworkflows" (no hyphen) as the server ID.
@@ -147,6 +148,9 @@ func getMCPCLIServerNames(data *WorkflowData) []string { //nolint:largefunc // E
 	if isCLIMountActive && data.EngineConfig != nil && data.EngineConfig.ID == string(constants.CopilotEngine) {
 		if hasGitHubTool(data.ParsedTools) && !isGitHubCLIModeEnabled(data) && !slices.Contains(servers, constants.GitHubMCPServerID.String()) {
 			servers = append(servers, constants.GitHubMCPServerID.String())
+		}
+		if isWorkQueueEnabled(data) && !slices.Contains(servers, "work-queue") {
+			servers = append(servers, "work-queue")
 		}
 
 		for toolName, toolValue := range data.Tools {
@@ -293,11 +297,8 @@ func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map
 // getMCPCLIExcludeFromAgentConfig returns the sorted list of MCP server names that
 // should be excluded from the agent's MCP config (because they are CLI-only).
 //
-// Only excludes servers when tools.cli-proxy is explicitly enabled. Infrastructure
-// servers (safeoutputs, mcpscripts) are CLI-mounted even without cli-proxy (so the
-// agent can call them as shell commands), but they remain in the agent's MCP config
-// unless cli-proxy is explicitly enabled. This preserves existing agent behaviour
-// for workflows that use safeoutputs via MCP rather than via the CLI wrapper.
+// Only explicit tools.cli-proxy excludes CLI-mounted servers. Infrastructure
+// wrappers do not otherwise prevent native MCP access.
 func getMCPCLIExcludeFromAgentConfig(data *WorkflowData) []string {
 	if data == nil || data.ParsedTools == nil || !data.ParsedTools.CLIProxy {
 		return nil
@@ -324,7 +325,7 @@ func (c *Compiler) generateMCPCLIMountStep(yaml *strings.Builder, data *Workflow
 	}
 	yaml.WriteString("          MCP_GATEWAY_DOMAIN: ${{ steps.start-mcp-gateway.outputs.gateway-domain }}\n")
 	yaml.WriteString("          MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getActionPin("actions/github-script"))
+	yaml.WriteString("        uses: " + getActionPin("actions/github-script") + "\n")
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -375,7 +376,7 @@ func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
 	// would reference a step from the agent job in the activation job's env block, which
 	// is out of scope and triggers actionlint errors.
 	budgetLines := staticEnclaveInformationBudgetPromptLines(data)
-	lines := make([]string, 0, len(servers)+len(budgetLines))
+	lines := make([]string, 0, typeutil.SafeAllocationCapacity(len(servers), len(budgetLines)))
 	for _, server := range servers {
 		lines = append(lines, fmt.Sprintf("- `%s` — run `%s --help` to see available tools", server, server))
 	}
@@ -384,6 +385,9 @@ func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
 	}
 
 	promptFile := mcpCLIToolsPromptFile
+	envVars := map[string]string{
+		"GH_AW_MCP_CLI_SERVERS_LIST": strings.Join(lines, "\n"),
+	}
 	if slices.Contains(servers, constants.SafeOutputsMCPServerID.String()) {
 		promptFile = mcpCLIToolsWithSafeOutputsPromptFile
 	}
@@ -391,9 +395,7 @@ func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
 	return &PromptSection{
 		Content: promptFile,
 		IsFile:  true,
-		EnvVars: map[string]string{
-			"GH_AW_MCP_CLI_SERVERS_LIST": strings.Join(lines, "\n"),
-		},
+		EnvVars: envVars,
 	}
 }
 

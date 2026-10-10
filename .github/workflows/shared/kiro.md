@@ -5,6 +5,7 @@ engine:
   display-name: Kiro
   description: Kiro CLI with headless execution and native MCP support
   experimental: true
+  version: "2.27.1"
   provider:
     name: kiro
   auth:
@@ -49,11 +50,16 @@ engine:
       env:
         KIRO_LOG_NO_COLOR: "1"
         NO_COLOR: "1"
+    log-parser: |
+      function parseLog(logContent) {
+        return require("./parse_kiro_log.cjs").parseKiroLog(logContent);
+      }
     mcp:
       config-path: .kiro/settings/mcp.json
       config-adapter: |
         const fs = require("fs");
         const path = require("path");
+        const log = message => process.stderr.write(`[kiro-mcp] ${message}\n`);
 
         const requireEnvVar = name => {
           const value = process.env[name];
@@ -66,25 +72,47 @@ engine:
         const gatewayDomain = process.env.MCP_GATEWAY_DOMAIN || "host.docker.internal";
         const gatewayPort = requireEnvVar("MCP_GATEWAY_PORT");
         const gatewayURL = `http://${gatewayDomain}:${gatewayPort}`;
+        log("Reading MCP gateway configuration");
 
         let cliServers;
         try {
-          cliServers = new Set(JSON.parse(process.env.GH_AW_MCP_CLI_SERVERS || "[]"));
-        } catch (error) {
-          throw new Error(`Failed to parse GH_AW_MCP_CLI_SERVERS: ${error instanceof Error ? error.message : String(error)}`);
+          cliServers = JSON.parse(process.env.GH_AW_MCP_CLI_SERVERS || "[]");
+        } catch {
+          throw new Error("GH_AW_MCP_CLI_SERVERS must be a JSON array of server names");
         }
+        if (!Array.isArray(cliServers) || !cliServers.every(name => typeof name === "string")) {
+          throw new Error("GH_AW_MCP_CLI_SERVERS must be a JSON array of server names");
+        }
+        cliServers = new Set(cliServers);
 
-        const gatewayOutput = JSON.parse(fs.readFileSync(gatewayOutputPath, "utf8"));
-        const rawServers = gatewayOutput.mcpServers;
-        const servers = rawServers && typeof rawServers === "object" && !Array.isArray(rawServers) ? rawServers : {};
+        const gatewayContent = fs.readFileSync(gatewayOutputPath, "utf8");
+        let gatewayOutput;
+        try {
+          gatewayOutput = JSON.parse(gatewayContent);
+        } catch {
+          throw new Error("MCP_GATEWAY_OUTPUT must contain valid JSON; check the MCP gateway logs");
+        }
+        const servers = gatewayOutput?.mcpServers;
+        if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+          throw new Error("MCP_GATEWAY_OUTPUT must contain an mcpServers object");
+        }
         const mcpServers = {};
+        let skipped = 0;
+        let httpServers = 0;
 
         for (const [name, entry] of Object.entries(servers)) {
-          if (cliServers.has(name) || !entry || typeof entry !== "object") continue;
+          if (cliServers.has(name)) {
+            skipped++;
+            continue;
+          }
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            throw new Error("MCP_GATEWAY_OUTPUT contains an invalid server entry");
+          }
           const transformed = { ...entry };
           if (typeof transformed.url === "string") {
             transformed.url = transformed.url.replace(/^http:\/\/[^/]+\/mcp\//, `${gatewayURL}/mcp/`);
             transformed.type = "http";
+            httpServers++;
           }
           delete transformed.tools;
           mcpServers[name] = transformed;
@@ -94,6 +122,7 @@ engine:
         fs.mkdirSync(path.dirname(configPath), { recursive: true });
         fs.writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2), { mode: 0o600 });
         fs.chmodSync(configPath, 0o600);
+        log(`Wrote ${Object.keys(mcpServers).length} native MCP server(s), ${httpServers} HTTP server(s), skipped ${skipped} CLI-mounted server(s); permissions=0600`);
     harness-script: |
       const { createHash } = require("crypto");
       const { existsSync, mkdtempSync, readFileSync, rmSync } = require("fs");
@@ -104,62 +133,104 @@ engine:
       const [, ...commandArgs] = process.argv.slice(2);
       const installDir = mkdtempSync(join(tmpdir(), "kiro-cli-"));
       const archive = join(installDir, "kiro-cli.tar.gz");
-      const version = "2.16.1";
+      const version = "2.27.1";
+      const started = Date.now();
       const releases = {
         x64: {
           arch: "x86_64",
-          checksum: "393633c991faab5ef688b2aa0dd420481cab7fca312cd863923c3287e9874b82",
+          checksum: "3c0d7268a4bfb73f8e827822049978fa578e020b271afc1021c7532602d45d99",
         },
         arm64: {
           arch: "aarch64",
-          checksum: "8413b62072780747374c0932147022e290725e934d461e430b5ae12a73f33b23",
+          checksum: "33ad5462c3111ba4ef527f1d58bda08a9d1997e0ae73841a7c2ca734ebcba2d0",
         },
       };
       const fail = (result, action) => {
         if (result.error) throw result.error;
-        if (result.status !== 0) throw new Error(`${action} failed with exit code ${result.status ?? "unknown"}`);
+        if (result.status !== 0) {
+          const detail = result.signal ? `signal ${result.signal}` : `exit code ${result.status ?? "unknown"}`;
+          const hint = action === "Kiro CLI execution" && result.status === 3
+            ? "; required MCP server startup failed; check .kiro/settings/mcp.json and MCP gateway logs"
+            : "";
+          const error = new Error(`${action} failed with ${detail}${hint}`);
+          error.exitCode = result.status ?? 1;
+          throw error;
+        }
       };
       const log = message => process.stderr.write(`[kiro-harness] ${message}\n`);
+      const run = (command, args, action, options = {}) => {
+        const start = Date.now();
+        log(`${action} started`);
+        fail(spawnSync(command, args, { stdio: "inherit", ...options }), action);
+        log(`${action} completed in ${Date.now() - start}ms`);
+      };
 
       try {
+        log(`Starting Kiro CLI ${version}; architecture=${process.arch}`);
+        if (process.env.GH_AW_ENGINE_VERSION && process.env.GH_AW_ENGINE_VERSION !== version) {
+          throw new Error(`This Kiro harness supports only engine.version ${version}; update the pinned release and checksums together`);
+        }
         if (!process.env.KIRO_API_KEY && process.env.SECRET_KIRO_API_KEY) {
           process.env.KIRO_API_KEY = process.env.SECRET_KIRO_API_KEY;
+          log("Using KIRO_API_KEY from the secret binding");
         }
+        if (!process.env.KIRO_API_KEY) throw new Error("KIRO_API_KEY is required for headless execution; configure the KIRO_API_KEY Actions secret");
+        log("Headless API key is configured");
         const release = releases[process.arch];
         if (!release) throw new Error(`Unsupported Kiro CLI architecture: ${process.arch}`);
-        const releaseURL = `https://prod.download.cli.kiro.dev/stable/${version}/kirocli-${release.arch}-linux.tar.gz`;
-
-        fail(spawnSync("curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive, releaseURL], { stdio: "inherit" }), "Kiro CLI download");
-        if (createHash("sha256").update(readFileSync(archive)).digest("hex") !== release.checksum) {
-          throw new Error("Kiro CLI download checksum did not match");
-        }
-        fail(spawnSync("tar", ["-xzf", archive, "-C", installDir], { stdio: "inherit" }), "Kiro CLI extraction");
-
-        const binDir = join(installDir, "kirocli", "bin");
-        const executable = join(binDir, "kiro-cli");
-        if (!existsSync(executable)) throw new Error("Kiro CLI executable was not found in the release archive");
-        fail(spawnSync(executable, ["--version"], { stdio: "inherit" }), "Kiro CLI verification");
 
         const promptPath = process.env.GH_AW_PROMPT;
         if (!promptPath) throw new Error("GH_AW_PROMPT is required");
         const prompt = readFileSync(promptPath, "utf8");
+        if (!prompt.trim()) throw new Error("GH_AW_PROMPT must contain a non-empty instruction");
         const selectedModel = process.env.KIRO_MODEL;
         if (!selectedModel?.startsWith("kiro/")) {
           throw new Error("KIRO_MODEL must use kiro/model format");
         }
         const model = selectedModel.slice("kiro/".length);
-        if (!model) throw new Error("KIRO_MODEL must include a model name");
+        if (!model.trim()) throw new Error("KIRO_MODEL must include a model name");
+        log(`Prompt loaded (${Buffer.byteLength(prompt, "utf8")} bytes); model override is configured`);
 
-        fail(spawnSync(executable, [...commandArgs, "--model", model, prompt], {
+        const mcpConfigPath = process.env.GH_AW_MCP_CONFIG;
+        if (mcpConfigPath) {
+          let config;
+          const content = readFileSync(mcpConfigPath, "utf8");
+          try {
+            config = JSON.parse(content);
+          } catch {
+            throw new Error("GH_AW_MCP_CONFIG must contain valid JSON; check the Kiro MCP adapter logs");
+          }
+          if (!config?.mcpServers || typeof config.mcpServers !== "object" || Array.isArray(config.mcpServers)) {
+            throw new Error("GH_AW_MCP_CONFIG must contain an mcpServers object");
+          }
+          log(`Native MCP configuration loaded (${Object.keys(config.mcpServers).length} server(s))`);
+        } else {
+          log("No GH_AW_MCP_CONFIG path supplied; Kiro will use its default MCP configuration");
+        }
+
+        const releaseURL = `https://prod.download.cli.kiro.dev/stable/${version}/kirocli-${release.arch}-linux.tar.gz`;
+        run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive, releaseURL], "Kiro CLI download");
+        if (createHash("sha256").update(readFileSync(archive)).digest("hex") !== release.checksum) {
+          throw new Error("Kiro CLI download checksum did not match");
+        }
+        log("Kiro CLI SHA-256 checksum verified");
+        run("tar", ["-xzf", archive, "-C", installDir], "Kiro CLI extraction");
+
+        const binDir = join(installDir, "kirocli", "bin");
+        const executable = join(binDir, "kiro-cli");
+        if (!existsSync(executable)) throw new Error("Kiro CLI executable was not found in the release archive");
+        run(executable, ["--version"], "Kiro CLI verification");
+
+        run(executable, [...commandArgs, "--model", model, "--", prompt], "Kiro CLI execution", {
           cwd: process.env.GITHUB_WORKSPACE,
           env: { ...process.env, PATH: `${binDir}:${process.env.PATH || ""}` },
-          stdio: "inherit",
-        }), "Kiro CLI execution");
+        });
       } catch (error) {
         log(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
+        process.exitCode = Number.isInteger(error?.exitCode) && error.exitCode > 0 ? error.exitCode : 1;
       } finally {
         rmSync(installDir, { recursive: true, force: true });
+        log(`Cleaned up Kiro CLI installation; total duration=${Date.now() - started}ms; exit code=${process.exitCode || 0}`);
       }
 ---
 
@@ -180,4 +251,50 @@ imports:
 Configure the `KIRO_API_KEY` GitHub Actions secret with an API key from Kiro.
 Kiro serves the selected model through its own API, so this engine does not use
 universal provider routing.
+
+The harness pins [Kiro CLI 2.27.1](https://kiro.dev/changelog/cli/2-27/) and
+verifies the x86_64 or aarch64 Linux archive against the SHA-256 checksum in
+the [stable release manifest](https://prod.download.cli.kiro.dev/stable/latest/manifest.json).
+Update `engine.version`, the harness version, and both checksums together.
+Other `engine.version` overrides are rejected rather than silently installing
+a different release.
+
+Headless execution retains `--no-interactive`, `--trust-all-tools`, and
+`--require-mcp-startup`; `kiro/<model>` is passed as `--model <model>`.
+Native MCP configuration uses `.kiro/settings/mcp.json`, preserves HTTP
+authorization headers, and excludes servers already mounted as CLIs.
+The config is written with owner-only permissions. MCP startup failures retain
+Kiro's exit code 3, with a hint to inspect the gateway logs.
+
+Look for `[kiro-mcp]` and `[kiro-harness]` in the agent logs for MCP server
+counts, authentication presence, prompt size, installation timings, checksum
+verification, process failures, and cleanup. These diagnostics do not print
+API keys, MCP headers, configuration contents, or prompt contents. For Kiro's
+own verbose CLI logging, add `--verbose` to `behaviors.execution.args` in this
+shared definition when investigating a runtime failure.
+
+The parser supports the older `> ` conversation layout and Kiro CLI 2.27's
+`[tool]` announcements/statuses with buffered assistant answers. It writes
+canonical `agent-session.jsonl`; conclusion projects that trace into
+`usage/aw_session.jsonl`. The observed 200-byte command previews ending in `...`
+are marked `inputTruncated: true`, not reconstructed as complete arguments.
+Concurrent and orphan statuses
+remain anonymous because stdout supplies no tool-call IDs. `Failed` is an
+explicit tool failure; `Completed` establishes completion but does not supply
+an exit code or independently verified success. Elapsed time, natural-language
+claims, and credit summaries do not become token, USD, or turn accounting.
+Harness execution errors become failed session results only when the final
+adjacent error/cleanup diagnostics agree with the runner's nonzero exit.
+An error-looking line in a prompt, command, tool output, or assistant answer
+does not establish a session failure; incomplete trailers remain uncorroborated.
+
+Sanitized regression excerpts in `actions/setup/js/fixtures/kiro_ci_sessions.cjs`
+come from existing Smoke Kiro runs
+[37862725262](https://github.com/github/gh-aw/actions/runs/37862725262) and
+[37549851664](https://github.com/github/gh-aw/actions/runs/37549851664).
+Both Kiro processes exited zero; the second workflow failed during log
+redaction, not engine execution. The sampled stdout does not expose structured
+user prompts, reasoning, provider refusals, tool outputs, or token usage.
+Synthetic partial/error and canonical round-trip cases are labeled separately
+and do not claim live coverage for those fields.
 -->

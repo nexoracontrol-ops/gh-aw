@@ -35,6 +35,21 @@ func TestLoadUsageActivitySummary(t *testing.T) {
 			"total_calls":5,
 			"failed_calls":1,
 			"tool_calls":[{"tool_call_id":"call-1","timestamp":"2026-09-09T00:00:00Z","server_name":"github","tool_name":"issue_read","request_size":100,"response_size":200,"duration_ms":25,"outcome":"success"}]
+		},
+		"steering":{
+			"total_events":3,
+			"event_counts":{"token_steering":2,"timeout_steering":1}
+		},
+		"skills":{
+			"total_invocations":2,
+			"unique_skills":1,
+			"items":[{
+				"name":"documentation",
+				"invocation_count":2,
+				"failed_count":1,
+				"first_timestamp":"2026-09-09T00:00:01Z",
+				"last_timestamp":"2026-09-09T00:00:02Z"
+			}]
 		}
 	}`), 0o644), "should write usage activity summary")
 
@@ -57,6 +72,20 @@ func TestLoadUsageActivitySummary(t *testing.T) {
 	applyUsageActivitySummaryToResult(summary, &result, true)
 	require.NotNil(t, result.MCPToolUsage, "loaded gateway summary should populate MCP usage")
 	require.Len(t, result.MCPToolUsage.ToolCalls, 1, "loaded gateway summary should populate MCP call records")
+	require.NotNil(t, result.TokenUsage, "loaded steering summary should populate token usage")
+	assert.Equal(t, 3, result.TokenUsage.TotalSteeringEvents)
+	assert.Equal(t, map[string]int{"token_steering": 2, "timeout_steering": 1}, result.TokenUsage.SteeringEventCounts)
+	require.Len(t, result.SkillActivations, 1, "loaded skill summary should populate skill activations")
+	assert.Equal(t, SkillActivation{
+		Name:            "documentation",
+		Status:          "invoked",
+		Source:          "usage_summary",
+		InvocationCount: 2,
+		FailedCount:     1,
+		ReportProvenance: ReportProvenance{
+			Timestamp: "2026-09-09T00:00:01Z",
+		},
+	}, result.SkillActivations[0])
 	assert.Equal(t, MCPToolCall{
 		ToolCallID: "call-1",
 		Timestamp:  "2026-09-09T00:00:00Z",
@@ -67,6 +96,25 @@ func TestLoadUsageActivitySummary(t *testing.T) {
 		Duration:   "25ms",
 		Status:     "success",
 	}, result.MCPToolUsage.ToolCalls[0])
+}
+
+func TestApplyUsageActivitySkillsEnrichesDetailedActivations(t *testing.T) {
+	t.Parallel()
+
+	result := DownloadResult{
+		RunAnalysis: RunAnalysis{
+			SkillActivations: []SkillActivation{{Name: "existing", Status: "invoked", Source: "log_parse"}},
+		},
+	}
+	summary := &usageActivitySummary{
+		Skills: &usageActivitySkills{
+			Items: []usageActivitySkillItem{{Name: "existing", InvocationCount: 2, FailedCount: 1}},
+		},
+	}
+
+	applyUsageActivitySummaryToResult(summary, &result, true)
+
+	assert.Equal(t, []SkillActivation{{Name: "existing", Status: "invoked", Source: "log_parse", InvocationCount: 2, FailedCount: 1}}, result.SkillActivations)
 }
 
 func TestApplyUsageActivitySummaryToResult(t *testing.T) {
@@ -94,11 +142,11 @@ func TestApplyUsageActivitySummaryToResult(t *testing.T) {
 			MaxInputSize:    70,
 			MaxOutputSize:   140,
 			Servers: []usageActivityGatewayServer{
-				{ServerName: "github", RequestCount: 5, ToolCallCount: 5, FailedCalls: 2, TotalInputSize: 100, TotalOutputSize: 200, AvgDurationMS: 12},
+				{ServerName: "github", RequestCount: 5, ToolCallCount: 5, FailedCalls: 2, TotalInputSize: 100, TotalOutputSize: 200, AvgInputSize: 20, AvgOutputSize: 40, MaxInputSize: 70, MaxOutputSize: 140, AvgDurationMS: 12},
 				{ServerName: "playwright", ToolCallCount: 1, FailedCalls: 0},
 			},
 			Tools: []usageActivityGatewayTool{
-				{ServerName: "github", ToolName: "issue_read", CallCount: 5, FailedCalls: 2, TotalInputSize: 100, TotalOutputSize: 200, MaxInputSize: 70, MaxOutputSize: 140, AvgDurationMS: 12, MaxDurationMS: 30},
+				{ServerName: "github", ToolName: "issue_read", CallCount: 5, FailedCalls: 2, TotalInputSize: 100, TotalOutputSize: 200, AvgInputSize: 20, AvgOutputSize: 40, MaxInputSize: 70, MaxOutputSize: 140, AvgDurationMS: 12, MaxDurationMS: 30},
 			},
 			ToolCalls: []usageActivityGatewayCall{
 				{ToolCallID: "call-1", Timestamp: "2026-09-09T00:00:00Z", ServerName: "github", ToolName: "issue_read", RequestSize: 100, ResponseSize: 200, DurationMS: 25, Outcome: "success"},
@@ -109,6 +157,10 @@ func TestApplyUsageActivitySummaryToResult(t *testing.T) {
 			FilteredServerCounts: map[string]int{"github": 2},
 			FilteredToolCounts:   map[string]int{"issue_read": 2},
 			FilteredReasonCounts: map[string]int{"integrity": 2},
+		},
+		Steering: &usageActivitySteering{
+			TotalEvents: 4,
+			EventCounts: map[string]int{"token_steering": 3, "timeout_steering": 1},
 		},
 	}
 
@@ -139,15 +191,48 @@ func TestApplyUsageActivitySummaryToResult(t *testing.T) {
 	assert.Equal(t, 2, result.MCPToolUsage.Servers[0].ErrorCount, "failed call counts should map to server error counts")
 	assert.Equal(t, 100, result.MCPToolUsage.Servers[0].TotalInputSize, "server input sizes should be preserved")
 	assert.Equal(t, 200, result.MCPToolUsage.Servers[0].TotalOutputSize, "server output sizes should be preserved")
+	assert.Equal(t, 20, result.MCPToolUsage.Servers[0].AvgInputSize, "server average input sizes should be preserved")
+	assert.Equal(t, 40, result.MCPToolUsage.Servers[0].AvgOutputSize, "server average output sizes should be preserved")
+	assert.Equal(t, 70, result.MCPToolUsage.Servers[0].MaxInputSize, "server maximum input sizes should be preserved")
+	assert.Equal(t, 140, result.MCPToolUsage.Servers[0].MaxOutputSize, "server maximum output sizes should be preserved")
 	assert.Equal(t, "12ms", result.MCPToolUsage.Servers[0].AvgDuration, "server average durations should be formatted")
 	require.Len(t, result.MCPToolUsage.Summary, 1, "gateway tools should be copied from the summary")
 	assert.Equal(t, "issue_read", result.MCPToolUsage.Summary[0].ToolName, "tool names should be preserved")
 	assert.Equal(t, 100, result.MCPToolUsage.Summary[0].TotalInputSize, "tool input sizes should be preserved")
+	assert.Equal(t, 20, result.MCPToolUsage.Summary[0].AvgInputSize, "tool average input sizes should be preserved")
+	assert.Equal(t, 40, result.MCPToolUsage.Summary[0].AvgOutputSize, "tool average output sizes should be preserved")
 	assert.Equal(t, 140, result.MCPToolUsage.Summary[0].MaxOutputSize, "tool maximum output sizes should be preserved")
 	assert.Equal(t, "30ms", result.MCPToolUsage.Summary[0].MaxDuration, "tool maximum durations should be formatted")
 	require.NotNil(t, result.MCPToolUsage.Integrity, "integrity summary should be backfilled")
 	assert.Equal(t, 2, result.MCPToolUsage.Integrity.TotalFiltered, "integrity filtered counts should be preserved")
 	assert.Equal(t, map[string]int{"issue_read": 2}, result.MCPToolUsage.Integrity.FilteredToolCounts, "integrity tool counts should be preserved")
+	require.NotNil(t, result.TokenUsage, "steering summary should create token usage data")
+	assert.Equal(t, 4, result.TokenUsage.TotalSteeringEvents)
+	assert.Equal(t, map[string]int{"token_steering": 3, "timeout_steering": 1}, result.TokenUsage.SteeringEventCounts)
+}
+
+func TestApplyUsageActivitySteeringSummaryPreservesDetailedAnalysis(t *testing.T) {
+	t.Parallel()
+
+	tokenUsage := &TokenUsageSummary{
+		TotalSteeringEvents: 2,
+		SteeringEventCounts: map[string]int{"token_steering": 2},
+	}
+	applyUsageActivitySteeringSummary(&usageActivitySteering{
+		TotalEvents: 3,
+		EventCounts: map[string]int{"timeout_steering": 3},
+	}, &tokenUsage)
+
+	assert.Equal(t, 2, tokenUsage.TotalSteeringEvents)
+	assert.Equal(t, map[string]int{"token_steering": 2}, tokenUsage.SteeringEventCounts)
+
+	legacyTokenUsage := &TokenUsageSummary{TotalSteeringEvents: 4}
+	applyUsageActivitySteeringSummary(&usageActivitySteering{
+		TotalEvents: 3,
+		EventCounts: map[string]int{"timeout_steering": 3},
+	}, &legacyTokenUsage)
+	assert.Equal(t, 4, legacyTokenUsage.TotalSteeringEvents)
+	assert.Equal(t, map[string]int{"timeout_steering": 3}, legacyTokenUsage.SteeringEventCounts)
 }
 
 func TestApplyUsageActivitySummaryBackfillsIntegrityWithoutGateway(t *testing.T) {

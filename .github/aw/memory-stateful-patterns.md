@@ -112,3 +112,30 @@ Write the current advisory IDs to `/tmp/gh-aw/repo-memory/default/vuln-baseline.
 - **`max:` flood guard** — caps issues opened per run; use `max: 5` for nightly scans, `max: 1` for secret alerts, `max: 10` for weekly audits
 - **Engine restriction** — `repo-memory` requires Claude or a custom engine; it is **not available** for the Copilot engine
 - **Baseline schema** — store only stable identifiers (advisory ID strings), not mutable fields like severity, to avoid false "new" alerts when metadata changes
+
+## Append-only Event History (standalone ledger; experimental)
+
+Use a standalone ledger when a workflow needs a durable event log rather than
+a replaceable baseline: for example, a low-volume audit that appends one
+structured result per run and queries prior results by a stable event key.
+Configure a built-in log independently of repo-memory:
+
+```yaml
+tools:
+  ledger:
+    audit-history:
+      type: log
+      compaction:
+        min-segments: 32
+        max-segments: 32
+```
+
+At the start of a run, query the read-only SQLite `state` or `records` tables at
+`/tmp/gh-aw/ledgers/audit-history/ledger.db`. After the result is complete,
+submit `ledger_append` with `operation: append` and a `value` containing a
+stable domain key. The response confirms queuing; records become durable only
+after `push_ledger_changes` succeeds. Never modify SQLite or ledger shards
+directly. Use stable application keys to identify duplicate events.
+
+For built-in types, script restrictions, and persistence behavior, see
+[memory.md](memory.md#structured-event-history-standalone-ledger-experimental).

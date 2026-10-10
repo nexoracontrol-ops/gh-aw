@@ -18,6 +18,7 @@ import (
 
 const (
 	behaviorSecretStrategyUniversalLLMConsumer  = "universal-llm-consumer"
+	behaviorSecretStrategyGeminiAPIKey          = "gemini-api-key"
 	behaviorProviderEnvModeUniversalLLMConsumer = "universal-llm-consumer"
 	behaviorConfigMergeJSON                     = "json-merge"
 )
@@ -228,7 +229,7 @@ func (e *BehaviorDefinedEngine) GetInstallationSteps(workflowData *WorkflowData)
 			CooldownEnabled:   install.Cooldown,
 		},
 	)
-	// microVM runtimes (docker-sbx/cloud-hypervisor) do not mount the runner tool cache,
+	// Cloud Hypervisor does not mount the runner tool cache,
 	// so a global npm install is invisible inside the sandbox. Stage a second copy of the
 	// CLI under ${RUNNER_TEMP}/gh-aw/engine-cli, which is mounted into the sandbox, exactly
 	// as the Claude and Codex engines do.
@@ -236,11 +237,11 @@ func (e *BehaviorDefinedEngine) GetInstallationSteps(workflowData *WorkflowData)
 	if binaryName == "" && behavior.Execution != nil {
 		binaryName = behavior.Execution.CommandName
 	}
-	if binaryName != "" && (isDockerSbxRuntime(workflowData) || isCloudHypervisorRuntime(workflowData)) {
-		npmSteps = append(npmSteps, GenerateDockerSbxNpmCLIInstallStep(
+	if binaryName != "" && isCloudHypervisorRuntime(workflowData) {
+		npmSteps = append(npmSteps, GenerateMicroVMNpmCLIInstallStep(
 			install.PackageName,
 			version,
-			install.StepName+" in docker-sbx path",
+			install.StepName+" in microVM path",
 			binaryName,
 			install.PostInstallScripts,
 			install.Cooldown,
@@ -475,6 +476,11 @@ func (e *BehaviorDefinedEngine) GetLogParserScriptId() string {
 	return e.logParserScriptFilename()
 }
 
+// GetLogParserScriptSource returns the generated parser source for local parsing.
+func (e *BehaviorDefinedEngine) GetLogParserScriptSource() string {
+	return e.buildWrappedLogParserScript()
+}
+
 // buildLogParserWriteStep generates a GitHub Actions step that writes the
 // behavior-defined engine's log-parser script to
 // ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_log_parser.cjs so the post-agent
@@ -641,8 +647,8 @@ func (e *BehaviorDefinedEngine) applyBehaviorDefinedModelEnv(exec *EngineExecuti
 	}
 	modelVal := workflowData.Model
 	if exec.ModelEnvProviderPrefix != "" {
-		if parts := strings.SplitN(modelVal, "/", 2); len(parts) == 2 {
-			modelVal = path.Join(exec.ModelEnvProviderPrefix, parts[1])
+		if _, model, ok := strings.Cut(modelVal, "/"); ok {
+			modelVal = path.Join(exec.ModelEnvProviderPrefix, model)
 		}
 	}
 	env[exec.ModelEnvVarName] = modelVal
@@ -690,22 +696,25 @@ func (e *BehaviorDefinedEngine) buildFirewallCommand(exec *EngineExecutionDefini
 	engineCommandWithPath := fmt.Sprintf("export no_proxy=\"${NO_PROXY:-}\" && %s && %s", GetNpmBinPathSetup(), engineCommand)
 	// microVM runtimes stage the engine CLI under ${RUNNER_TEMP}/gh-aw/engine-cli/bin
 	// because the runner tool cache is not mounted inside the sandbox.
-	if dockerSbxCLIPath := GetDockerSbxNpmCLIPathSetup(workflowData); dockerSbxCLIPath != "" {
-		engineCommandWithPath = fmt.Sprintf("%s && %s", dockerSbxCLIPath, engineCommandWithPath)
+	if microVMCLIPath := GetMicroVMNpmCLIPathSetup(workflowData); microVMCLIPath != "" {
+		engineCommandWithPath = fmt.Sprintf("%s && %s", microVMCLIPath, engineCommandWithPath)
 	}
 	if mcpCLIPath := GetMCPCLIPathSetup(workflowData); mcpCLIPath != "" {
 		engineCommandWithPath = fmt.Sprintf("%s && %s", mcpCLIPath, engineCommandWithPath)
 	}
 
 	excludedSecretNames := e.GetRequiredSecretNames(workflowData)
-	for _, binding := range e.definition.Auth {
-		excludedSecretNames = slices.DeleteFunc(excludedSecretNames, func(secretName string) bool {
-			return secretName == binding.Secret
-		})
+	if e.behavior().SecretStrategy != behaviorSecretStrategyGeminiAPIKey {
+		for _, binding := range e.definition.Auth {
+			excludedSecretNames = slices.DeleteFunc(excludedSecretNames, func(secretName string) bool {
+				return secretName == binding.Secret
+			})
+		}
 	}
 
 	return BuildAWFCommand(AWFCommandConfig{
 		EngineName:         e.GetID(),
+		EngineRuntimeID:    e.definition.RuntimeID,
 		EngineCommand:      engineCommandWithPath,
 		LogFile:            logFile,
 		WorkflowData:       workflowData,
@@ -887,9 +896,9 @@ func deepCopyAny(v any) any {
 		}
 		return cp
 	case []any:
-		cp := make([]any, len(val))
-		for i, elem := range val {
-			cp[i] = deepCopyAny(elem)
+		cp := make([]any, 0, len(val))
+		for _, elem := range val {
+			cp = append(cp, deepCopyAny(elem))
 		}
 		return cp
 	default:

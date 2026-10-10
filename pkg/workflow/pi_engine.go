@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"maps"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -21,11 +23,8 @@ var piLog = logger.New("workflow:pi_engine")
 // firewall can route LLM traffic through the correct sidecar port.  Without a provider
 // prefix Pi defaults to the GitHub/Copilot gateway.
 //
-// Requirements:
-//   - tools.github.mode: gh-proxy must be enabled (pre-authenticated gh CLI).
-//   - tools.cli-proxy: true must be enabled (MCP servers mounted as CLI tools).
-//
-// Both requirements are validated at compile time by validatePiEngineRequirements.
+// Native MCP connects through the compiler-managed MCP gateway. CLI-mounted tools
+// remain available when a workflow explicitly selects cli-proxy.
 type PiEngine struct {
 	BaseEngine
 }
@@ -42,13 +41,16 @@ func NewPiEngine() *PiEngine {
 			experimental:     false,
 			ghSkillAgentName: "pi",
 			capabilities: EngineCapabilities{
-				ToolsAllowlist:   true,
-				MCP:              false,
-				MaxTurns:         true,
-				MaxContinuations: false,
-				WebSearch:        false,
-				NativeAgentFile:  false,
-				BareMode:         true, // Pi is bare by default; bare mode is a no-op
+				ToolsAllowlist:       true,
+				MCP:                  true,
+				MaxTurns:             true,
+				ContextWindow:        true,
+				MaxContinuations:     false,
+				WebSearch:            false,
+				NativeAgentFile:      false,
+				BareMode:             true,
+				BashCommandAllowlist: true,
+				BashDisable:          true,
 			},
 		},
 	}
@@ -64,7 +66,7 @@ func (e *PiEngine) GetModelEnvVarName() string {
 // ResolveLLMProvider returns the effective provider for Pi inference.
 // Default is github, overridable via engine.model-provider.
 func (e *PiEngine) ResolveLLMProvider(workflowData *WorkflowData) LLMProvider {
-	return resolveEngineLLMProvider(workflowData, LLMProviderGitHub)
+	return resolveEngineLLMProvider(workflowData, LLMProvider(piReflectProviderName(resolvePiBackend(workflowData))))
 }
 
 // resolvePiBackend extracts the provider prefix from the engine model (if any) and maps
@@ -74,8 +76,20 @@ func (e *PiEngine) ResolveLLMProvider(workflowData *WorkflowData) LLMProvider {
 // "github-copilot/" is accepted as an alias for "copilot/" since that is the
 // provider name used by Pi CLI's built-in model registry.
 func resolvePiBackend(workflowData *WorkflowData) UniversalLLMBackend {
-	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.Model == "" {
+	if workflowData == nil || workflowData.EngineConfig == nil {
 		return UniversalLLMBackendCopilot
+	}
+	if workflowData.EngineConfig.LLMProvider != "" {
+		switch normalizeLLMProvider(string(workflowData.EngineConfig.LLMProvider)) {
+		case LLMProviderGitHub:
+			return UniversalLLMBackendCopilot
+		case LLMProviderAnthropic:
+			return UniversalLLMBackendAnthropic
+		case LLMProviderOpenAI:
+			return UniversalLLMBackendCodex
+		case "google", "gemini":
+			return piBackendGoogle
+		}
 	}
 	model := workflowData.Model
 	if !strings.Contains(model, "/") {
@@ -86,6 +100,8 @@ func resolvePiBackend(workflowData *WorkflowData) UniversalLLMBackend {
 	// an alias so workflows can use either "copilot/..." or "github-copilot/...".
 	backend, err := resolveBackendWithAliases(model, map[string]UniversalLLMBackend{
 		"github-copilot": UniversalLLMBackendCopilot,
+		"google":         piBackendGoogle,
+		"gemini":         piBackendGoogle,
 	})
 	if err != nil {
 		piLog.Printf("Could not resolve backend for Pi model %q, defaulting to copilot: %v", model, err)
@@ -104,30 +120,18 @@ func extractPiModelID(model string) string {
 	return model
 }
 
-// piNativeProviderName maps an AWF UniversalLLMBackend to the corresponding
-// Pi CLI built-in provider name.  Used when there is no AWF gateway to proxy
-// through (firewall disabled) so Pi can call the provider's API directly.
-func piNativeProviderName(backend UniversalLLMBackend) string {
-	switch backend {
-	case UniversalLLMBackendAnthropic:
-		return "anthropic"
-	case UniversalLLMBackendCodex:
-		return "openai"
-	default:
-		return "github-copilot"
-	}
-}
-
 // piReflectProviderName maps an AWF UniversalLLMBackend to the normalized
 // provider name used by the AWF api-proxy /reflect endpoint and the
 // GH_AW_LLM_PROVIDER convention (see llm_provider.go). This is distinct from
-// piNativeProviderName, which returns Pi-CLI-specific provider identifiers.
+// piConfiguredProvider, which returns Pi-CLI-specific provider identifiers.
 func piReflectProviderName(backend UniversalLLMBackend) string {
 	switch backend {
 	case UniversalLLMBackendAnthropic:
 		return string(LLMProviderAnthropic)
 	case UniversalLLMBackendCodex:
 		return string(LLMProviderOpenAI)
+	case piBackendGoogle:
+		return "google"
 	default:
 		return string(LLMProviderGitHub)
 	}
@@ -135,7 +139,7 @@ func piReflectProviderName(backend UniversalLLMBackend) string {
 
 func resolvePiGatewaySecretEnvVar(profile universalLLMBackendProfile, backend UniversalLLMBackend) string {
 	if len(profile.coreSecretNames) > 0 {
-		return profile.coreSecretNames[0]
+		return profile.coreSecretNames[0] //nolint:uncheckedsliceindex // len(profile.coreSecretNames) is checked above.
 	}
 
 	switch backend {
@@ -143,6 +147,8 @@ func resolvePiGatewaySecretEnvVar(profile universalLLMBackendProfile, backend Un
 		return "ANTHROPIC_API_KEY"
 	case UniversalLLMBackendCodex:
 		return "CODEX_API_KEY"
+	case piBackendGoogle:
+		return "GEMINI_API_KEY"
 	default:
 		// copilot-requests: write intentionally leaves coreSecretNames empty and
 		// uses COPILOT_GITHUB_TOKEN=${{ github.token }} instead.
@@ -156,8 +162,7 @@ func resolvePiGatewaySecretEnvVar(profile universalLLMBackendProfile, backend Un
 // Copilot LLM gateway and reuses COPILOT_GITHUB_TOKEN.
 func (e *PiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	piLog.Print("Collecting required secrets for Pi engine")
-	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
+	profile := piProviderProfile(workflowData)
 	secrets := append([]string{}, profile.coreSecretNames...)
 	secrets = append(secrets, collectCommonMCPSecrets(workflowData)...)
 	return secrets
@@ -167,23 +172,34 @@ func (e *PiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 // supports as defined in the AWF specification. Pi is a multi-provider engine so all
 // provider API keys are valid engine.env overrides.
 func (e *PiEngine) GetSupportedEnvVarKeys() []string {
-	return []string{
+	keys := []string{
 		constants.CopilotGitHubToken,
 		constants.AnthropicAPIKey,
 		constants.CodexAPIKey,
 		constants.OpenAIAPIKey,
+		"ANTHROPIC_OAUTH_TOKEN",
+		"ANTHROPIC_AUTH_TOKEN",
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_SESSION_TOKEN",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"GOOGLE_CLOUD_API_KEY",
 	}
+	for _, providerKeys := range piNativeProviderKeys {
+		keys = append(keys, providerKeys...)
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
 }
 
 // GetSecretValidationStep returns the secret validation step for the Pi engine.
 // The validated secret depends on the resolved provider backend.
 func (e *PiEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
-	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
+	profile := piProviderProfile(workflowData)
 	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
 		SecretNames: profile.coreSecretNames,
 		EngineName:  "Pi",
-		DocsURL:     "https://github.github.com/gh-aw/reference/engines/#pi",
+		DocsURL:     "https://github.github.com/gh-aw/engines/pi/",
 	})
 }
 
@@ -215,13 +231,13 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 			},
 		)
 
-		// microVM runtimes (docker-sbx/cloud-hypervisor) cannot see the globally installed
+		// Cloud Hypervisor cannot see the globally installed
 		// CLI in the hosted tool cache, so stage a second copy under RUNNER_TEMP.
-		if isDockerSbxRuntime(workflowData) || isCloudHypervisorRuntime(workflowData) {
-			npmSteps = append(npmSteps, GenerateDockerSbxNpmCLIInstallStep(
+		if isCloudHypervisorRuntime(workflowData) {
+			npmSteps = append(npmSteps, GenerateMicroVMNpmCLIInstallStep(
 				"@earendil-works/pi-coding-agent",
 				version,
-				"Install Pi CLI in docker-sbx path",
+				"Install Pi CLI in microVM path",
 				"pi",
 				false,
 				false,
@@ -229,27 +245,33 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 		}
 
 		steps = BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
+		steps = append(steps, GitHubActionStep{
+			"      - name: Record Pi package location",
+			"        run: |",
+			`          GH_AW_PI_PACKAGE_ROOT="$(npm root -g)/@earendil-works/pi-coding-agent"`,
+			`          printf 'GH_AW_PI_PACKAGE_ROOT=%s\n' "$GH_AW_PI_PACKAGE_ROOT" >> "$GITHUB_ENV"`,
+		})
 	}
 
-	// Install extensions declared in engine.extensions: [...]
-	// Each extension is installed via `pi install <extension>` before the agent runs.
-	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Extensions) > 0 {
-		commandName := "pi"
-		if workflowData.EngineConfig.Command != "" {
-			commandName = workflowData.EngineConfig.Command
-		}
+	return append(steps, e.extensionInstallationSteps(workflowData)...)
+}
 
-		for _, ext := range workflowData.EngineConfig.Extensions {
-			installCmd := fmt.Sprintf("%s install %s", commandName, shellEscapeArg(ext))
-			stepLines := []string{
-				"      - name: Install Pi extension " + ext,
-			}
-			stepLines = FormatStepWithCommandAndEnv(stepLines, installCmd, nil)
-			steps = append(steps, GitHubActionStep(stepLines))
-		}
-		piLog.Printf("Added %d Pi extension install steps", len(workflowData.EngineConfig.Extensions))
+func (e *PiEngine) extensionInstallationSteps(data *WorkflowData) []GitHubActionStep {
+	if data.EngineConfig == nil || len(data.EngineConfig.Extensions) == 0 {
+		return nil
 	}
-
+	command := "pi"
+	if data.EngineConfig.Command != "" {
+		command = data.EngineConfig.Command
+	}
+	steps := make([]GitHubActionStep, 0, len(data.EngineConfig.Extensions))
+	for _, source := range data.EngineConfig.Extensions {
+		lines := []string{"      - name: " + strconv.Quote("Install Pi extension "+source)}
+		lines = FormatStepWithCommandAndEnv(lines, fmt.Sprintf("%s install %s", command, shellEscapeArg(source)), map[string]string{
+			"PI_CODING_AGENT_DIR": constants.TmpPiAgentDir, "PI_OFFLINE": "1",
+		})
+		steps = append(steps, GitHubActionStep(lines))
+	}
 	return steps
 }
 
@@ -258,6 +280,8 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 func (e *PiEngine) GetDeclaredOutputFiles() []string {
 	return []string{
 		PiStreamingLogFile,
+		PiSessionDirectory + "/*.jsonl",
+		constants.TmpPiAgentDir + "/session.html",
 	}
 }
 
@@ -274,7 +298,7 @@ func (e *PiEngine) GetLogFileForParsing() string {
 // GetAgentManifestFiles returns Pi-specific instruction files treated as
 // security-sensitive manifests.
 func (e *PiEngine) GetAgentManifestFiles() []string {
-	return []string{"PI.md", "AGENTS.md"}
+	return []string{"PI.md", "AGENTS.md", "AGENTS.override.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"}
 }
 
 // GetAgentManifestPathPrefixes returns Pi-specific config directory prefixes.
@@ -286,6 +310,14 @@ func (e *PiEngine) GetAgentManifestPathPrefixes() []string {
 // The prompt is piped to Pi via stdin; streaming JSON events are written to
 // PiStreamingLogFile for post-run analysis and step summary rendering.
 func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string) []GitHubActionStep {
+	if workflowData.Model == "" {
+		withModel := *workflowData
+		withModel.Model = "copilot/gpt-5.4"
+		if resolvePiBackend(workflowData) == UniversalLLMBackendCopilot && isFirewallEnabled(workflowData) {
+			withModel.Model = "copilot/auto"
+		}
+		workflowData = &withModel
+	}
 	piLog.Printf("Generating execution steps for Pi engine: workflow=%s, firewall=%v",
 		workflowData.Name, isFirewallEnabled(workflowData))
 
@@ -295,9 +327,10 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 	}
 
 	// Resolve backend and profile early so we can use them when building piArgs.
-	modelConfigured := workflowData.Model != ""
+	modelRouting := isModelRoutingEnabled(workflowData)
+	modelConfigured := workflowData.Model != "" && !modelRouting
 	backend := resolvePiBackend(workflowData)
-	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
+	profile := piProviderProfile(workflowData)
 	firewallEnabled := isFirewallEnabled(workflowData)
 
 	// When engine.driver is set, run the driver script directly instead of the pi CLI.
@@ -312,18 +345,48 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 }
 
 func (e *PiEngine) buildPiArgs(workflowData *WorkflowData) []string {
-	piArgs := []string{"--print", "--mode", "json", "--no-session"}
+	piArgs := []string{"--print", "--mode", "json"}
+	modelRouting := isModelRoutingEnabled(workflowData)
+	session := piSessionSettings(workflowData)
+	if session.Enabled {
+		piArgs = append(piArgs, "--session-dir", PiSessionDirectory)
+		switch {
+		case session.Resume != "":
+			piArgs = append(piArgs, "--session", session.Resume)
+		case session.Fork != "":
+			piArgs = append(piArgs, "--fork", session.Fork)
+		}
+		if session.ID != "" {
+			piArgs = append(piArgs, "--session-id", session.ID)
+		}
+	} else {
+		piArgs = append(piArgs, "--no-session")
+	}
+	piArgs = append(piArgs, "--no-approve")
+	if workflowData.BashDisabled || hasBashFullyDisabled(workflowData.Tools) {
+		piArgs = append(piArgs, "--exclude-tools", "bash")
+	}
+	if workflowData.Tools["edit"] == false {
+		piArgs = append(piArgs, "--exclude-tools", "edit,write")
+	}
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Bare {
+		piArgs = append(piArgs, "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-extensions", "--no-themes")
+	}
 	if workflowData.EngineConfig != nil {
-		piArgs = append(piArgs, filterPiArgs(workflowData.EngineConfig.Args)...)
+		piArgs = append(piArgs, filterPiArgs(workflowData.EngineConfig.Args, modelRouting)...)
 	}
 	return piArgs
 }
 
 func (e *PiEngine) buildPiModelsJSONSetup(workflowData *WorkflowData, profile universalLLMBackendProfile, backend UniversalLLMBackend, piArgs []string, firewallEnabled, modelConfigured, driverConfigured bool) (string, []string) {
-	if !modelConfigured {
+	modelRouting := isModelRoutingEnabled(workflowData)
+	if !modelConfigured && !modelRouting {
 		return "", piArgs
 	}
-	modelID := extractPiModelID(workflowData.Model)
+	modelID := ""
+	if modelConfigured {
+		modelID = extractPiModelID(workflowData.Model)
+	}
 	gatewaySecretEnvVar := resolvePiGatewaySecretEnvVar(profile, backend)
 	if firewallEnabled {
 		if gatewaySecretEnvVar == "" {
@@ -335,19 +398,28 @@ func (e *PiEngine) buildPiModelsJSONSetup(workflowData *WorkflowData, profile un
 		// /reflect endpoint at runtime (when AWF_REFLECT_ENABLED=1) to resolve the live
 		// api-proxy port for reflectProvider, since AWF's actual port assignment is the
 		// source of truth and can drift from the compiled-in value.
+		contextWindowAssignment := ""
+		if workflowData.EngineConfig != nil && workflowData.EngineConfig.ContextWindow > 0 {
+			contextWindowAssignment = " GH_AW_PI_CONTEXT_WINDOW=" + shellEscapeArg(strconv.Itoa(workflowData.EngineConfig.ContextWindow))
+		}
+		modelIDAssignment := ""
+		if modelID != "" {
+			modelIDAssignment = "export GH_AW_PI_MODEL_ID=" + shellEscapeArg(modelID) + " && "
+		}
 		setup := fmt.Sprintf(
-			`export GH_AW_PI_MODEL_ID=%s GH_AW_PI_GATEWAY_SECRET_ENV=%s GH_AW_PI_GATEWAY_FALLBACK_PORT=%d GH_AW_LLM_PROVIDER=%s && ( %s "%s/pi_models_json.cjs" ) && `,
-			shellEscapeArg(modelID), shellEscapeArg(gatewaySecretEnvVar), profile.gatewayPort, shellEscapeArg(reflectProvider),
+			`%sexport GH_AW_PI_GATEWAY_SECRET_ENV=%s GH_AW_PI_GATEWAY_FALLBACK_PORT=%d GH_AW_LLM_PROVIDER=%s%s && ( %s "%s/pi_models_json.cjs" ) && `,
+			modelIDAssignment, shellEscapeArg(gatewaySecretEnvVar), profile.gatewayPort, shellEscapeArg(reflectProvider),
+			contextWindowAssignment,
 			nodeRuntimeResolutionCommand, SetupActionDestinationShell,
 		)
-		if !driverConfigured {
+		if !driverConfigured && !modelRouting {
 			piArgs = append(piArgs, "--model", "aw-gateway/"+modelID)
 		}
 		piLog.Printf("Pi: using /reflect-resolved models.json gateway routing for model %q via aw-gateway (fallback port %d)", modelID, profile.gatewayPort)
 		return setup, piArgs
 	}
 	if !driverConfigured {
-		nativeProvider := piNativeProviderName(backend)
+		nativeProvider := piExecutionProvider(workflowData)
 		piArgs = append(piArgs, "--model", path.Join(nativeProvider, modelID))
 		piLog.Printf("Pi: using native provider %q for model %q (no firewall)", nativeProvider, modelID)
 	}
@@ -360,12 +432,27 @@ func (e *PiEngine) buildPiCommand(workflowData *WorkflowData, commandName string
 		piCommand = buildPiDriverCommand(workflowData.EngineConfig.Driver)
 		piLog.Printf("Pi: using driver mode with driver=%s", workflowData.EngineConfig.Driver)
 	} else {
+		routingEnv := ""
+		modelArg := ""
+		if isModelRoutingEnabled(workflowData) {
+			routingEnv = `GH_AW_PI_MODEL="aw-gateway/$(cat /tmp/gh-aw/pi-routing-model)" GH_AW_PI_NATIVE_PROVIDER="aw-gateway" `
+			modelArg = ` --model "aw-gateway/$(cat /tmp/gh-aw/pi-routing-model)"`
+		}
 		piCommand = fmt.Sprintf(
-			`cat /tmp/gh-aw/aw-prompts/prompt.txt | %s %s --extension "${RUNNER_TEMP}/gh-aw/actions/pi_provider.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_steering_extension.cjs" 2>&1 | tee %s`,
-			commandName, shellJoinArgs(piArgs), PiStreamingLogFile)
+			`cat /tmp/gh-aw/aw-prompts/user.txt | %s%s %s%s --append-system-prompt /tmp/gh-aw/aw-prompts/system.txt --extension "${RUNNER_TEMP}/gh-aw/actions/pi_provider.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_steering_extension.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_tool_policy.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_subagent_extension.cjs" --extension builtin:mcp --extension builtin:codemode --extension builtin:tool-search 2>&1 | tee %s`,
+			routingEnv, commandName, shellJoinArgs(piArgs), modelArg, PiStreamingLogFile)
 	}
-	if piModelsJSONSetup != "" {
-		piCommand = piModelsJSONSetup + piCommand
+	if !driverConfigured && piSessionSettings(workflowData).Export {
+		piCommand += fmt.Sprintf(` && %s "%s/pi_session_export.cjs"`, nodeRuntimeResolutionCommand, SetupActionDestinationShell)
+	}
+	piRuntimeCommand := fmt.Sprintf(`%s "%s/pi_runtime.cjs"`, nodeRuntimeResolutionCommand, SetupActionDestinationShell)
+	if isModelRoutingEnabled(workflowData) && piModelsJSONSetup != "" {
+		piCommand = piModelsJSONSetup + piRuntimeCommand + " && " + piCommand
+	} else {
+		if piModelsJSONSetup != "" {
+			piCommand = piModelsJSONSetup + piCommand
+		}
+		piCommand = piRuntimeCommand + " && " + piCommand
 	}
 	return getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + piCommand
 }
@@ -373,8 +460,8 @@ func (e *PiEngine) buildPiCommand(workflowData *WorkflowData, commandName string
 func (e *PiEngine) buildPiExecutionCommand(workflowData *WorkflowData, logFile, piCommand string, firewallEnabled, modelConfigured bool, profile universalLLMBackendProfile) string {
 	if firewallEnabled {
 		piCommandWithPath := fmt.Sprintf("%s && %s", GetNpmBinPathSetup(), piCommand)
-		if dockerSbxCLIPath := GetDockerSbxNpmCLIPathSetup(workflowData); dockerSbxCLIPath != "" {
-			piCommandWithPath = fmt.Sprintf("%s && %s", dockerSbxCLIPath, piCommandWithPath)
+		if microVMCLIPath := GetMicroVMNpmCLIPathSetup(workflowData); microVMCLIPath != "" {
+			piCommandWithPath = fmt.Sprintf("%s && %s", microVMCLIPath, piCommandWithPath)
 		}
 		if mcpCLIPath := GetMCPCLIPathSetup(workflowData); mcpCLIPath != "" {
 			piCommandWithPath = fmt.Sprintf("%s && %s", mcpCLIPath, piCommandWithPath)
@@ -390,14 +477,14 @@ func (e *PiEngine) buildPiExecutionCommand(workflowData *WorkflowData, logFile, 
 			UsesTTY:            false,
 			AllowedDomains:     e.piAllowedDomains(workflowData, modelConfigured),
 			PathSetup:          pathSetup,
-			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, profile.coreSecretNames),
+			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, e.GetSupportedEnvVarKeys()),
 		})
 	}
-	// Even without AWF, a docker-sbx/cloud-hypervisor runtime can be configured
-	// (e.g. network.firewall: false paired with sandbox.agent.runtime: docker-sbx),
+	// Even without AWF, a Cloud Hypervisor runtime can be configured
+	// (e.g. network.firewall: false paired with sandbox.agent.runtime: cloud-hypervisor),
 	// so the staged CLI path must still be exported for the microVM to see `pi`.
-	if dockerSbxCLIPath := GetDockerSbxNpmCLIPathSetup(workflowData); dockerSbxCLIPath != "" {
-		piCommand = fmt.Sprintf("%s && %s", dockerSbxCLIPath, piCommand)
+	if microVMCLIPath := GetMicroVMNpmCLIPathSetup(workflowData); microVMCLIPath != "" {
+		piCommand = fmt.Sprintf("%s && %s", microVMCLIPath, piCommand)
 	}
 	return fmt.Sprintf(`set -o pipefail
 printf '%%s' "$(date +%%s%%3N)" > %s
@@ -423,18 +510,22 @@ func (e *PiEngine) piAllowedDomains(workflowData *WorkflowData, modelConfigured 
 
 func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile universalLLMBackendProfile, backend UniversalLLMBackend, firewallEnabled, modelConfigured, hasModelsJSONSetup bool) map[string]string {
 	env := map[string]string{
-		"GH_AW_PROMPT":          constants.AwPromptsFile,
-		"GITHUB_AW":             "true",
-		"GITHUB_STEP_SUMMARY":   AgentStepSummaryPath,
-		"GITHUB_WORKSPACE":      "${{ github.workspace }}",
-		"GH_AW_TIMEOUT_MINUTES": resolveStepTimeoutValue(workflowData),
-		"PI_OFFLINE":            "1",
-		"RUNNER_TEMP":           "${{ runner.temp }}",
+		"GH_AW_PROMPT":           constants.AwPromptsFile,
+		"GH_AW_PI_USER_PROMPT":   constants.TmpGhAwDir + "/aw-prompts/user.txt",
+		"GH_AW_PI_SYSTEM_PROMPT": constants.TmpGhAwDir + "/aw-prompts/system.txt",
+		"GITHUB_AW":              "true",
+		"GITHUB_STEP_SUMMARY":    AgentStepSummaryPath,
+		"GITHUB_WORKSPACE":       "${{ github.workspace }}",
+		"GH_AW_TIMEOUT_MINUTES":  resolveStepTimeoutValue(workflowData),
+		"PI_OFFLINE":             "1",
+		"PI_CODING_AGENT_DIR":    constants.TmpPiAgentDir,
+		"RUNNER_TEMP":            "${{ runner.temp }}",
 	}
 	applyPlaywrightBrowserEnv(env, workflowData)
 	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	if modelConfigured {
 		env["GH_AW_PI_MODEL"] = workflowData.Model
+		env["GH_AW_PI_NATIVE_PROVIDER"] = piExecutionProvider(workflowData)
 	}
 	maps.Copy(env, profile.env)
 	if backend == UniversalLLMBackendCopilot {
@@ -463,6 +554,7 @@ func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile unive
 		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
 	}
 	applyEngineCwdEnv(env, workflowData)
+	e.applyPiConfigEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}
@@ -470,6 +562,8 @@ func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile unive
 		maps.Copy(env, agentConfig.Env)
 		piLog.Printf("Added %d custom env vars from agent config", len(agentConfig.Env))
 	}
+	applyPiToolPolicyEnv(env, workflowData)
+	applyModelRoutingEnv(env, workflowData)
 	return env
 }
 
@@ -489,15 +583,34 @@ func (e *PiEngine) buildPiExecutionStep(workflowData *WorkflowData, command stri
 // and step summary rendering.
 const PiStreamingLogFile = "/tmp/gh-aw/pi-streaming.jsonl"
 
-// filterPiArgs removes redundant Pi CLI flags that gh-aw should not pass through.
-// Pi runs in yolo mode by default, so explicit --yolo flags are ignored while all
-// other engine args are preserved in order.
-func filterPiArgs(args []string) []string {
+const PiSessionDirectory = constants.TmpGhAwAgentDir + "pi-sessions"
+
+// filterPiArgs removes redundant Pi CLI flags and prevents fixed model or thinking
+// options from overriding a routed selection.
+func filterPiArgs(args []string, modelRouting bool) []string {
 	filtered := make([]string, 0, len(args))
+	skipValue := false
 	for _, arg := range args {
+		if skipValue {
+			skipValue = false
+			if !strings.HasPrefix(arg, "-") {
+				continue
+			}
+		}
 		if arg == "--yolo" || strings.HasPrefix(arg, "--yolo=") {
 			piLog.Printf("Pi: dropping redundant arg %q because Pi runs in yolo mode by default", arg)
 			continue
+		}
+		if modelRouting {
+			if arg == "--model" || arg == "--thinking" {
+				piLog.Printf("Pi: dropping routed override %q", arg)
+				skipValue = true
+				continue
+			}
+			if strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--thinking=") {
+				piLog.Printf("Pi: dropping routed override %q", arg)
+				continue
+			}
 		}
 		filtered = append(filtered, arg)
 	}

@@ -12,6 +12,135 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGetMCPCLIExcludeFromAgentConfig(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{AddComments: &AddCommentsConfig{}}
+	mcpScripts := &MCPScriptsConfig{
+		Tools: map[string]*MCPScriptToolConfig{
+			"hello": {Name: "hello", Script: "return 'ok';"},
+		},
+	}
+	enclaves := EnclavesConfig{{Script: &ScriptEnclaveConfig{}}}
+	customTools := map[string]any{
+		"custom": map[string]any{"type": "http", "url": "http://localhost:8080"},
+	}
+	infra := []string{constants.MCPScriptsMCPServerID.String(), constants.SafeOutputsMCPServerID.String()}
+
+	tests := []struct {
+		name     string
+		data     *WorkflowData
+		expected []string
+	}{
+		{name: "nil workflow"},
+		{name: "empty workflow", data: &WorkflowData{}},
+		{
+			name: "agy no infrastructure",
+			data: &WorkflowData{EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: false}},
+		},
+		{
+			name: "agy empty infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: false},
+				SafeOutputs: &SafeOutputsConfig{}, MCPScripts: &MCPScriptsConfig{},
+			},
+		},
+		{
+			name: "agy safeoutputs only",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: false},
+				SafeOutputs: safeOutputs,
+			},
+		},
+		{
+			name: "agy mcpscripts only",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: false},
+				MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "agy both infrastructure servers",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: false},
+				SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "agy nil parsed tools keeps native infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)},
+				SafeOutputs:  safeOutputs, MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "agy preserves enclave and custom without infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: NewTools(customTools),
+				Tools: customTools, Enclaves: enclaves,
+			},
+		},
+		{
+			name: "agy preserves enclave and custom with infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: NewTools(customTools),
+				Tools: customTools, Enclaves: enclaves, SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "agy explicit cli proxy excludes all mounted servers",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, ParsedTools: &Tools{CLIProxy: true},
+				Tools: customTools, Enclaves: enclaves, SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+			expected: []string{enclaveMCPServerName, "custom", constants.MCPScriptsMCPServerID.String(), constants.SafeOutputsMCPServerID.String()},
+		},
+		{
+			name: "other engine without cli proxy keeps infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.ClaudeEngine)}, ParsedTools: &Tools{CLIProxy: false},
+				Tools: customTools, Enclaves: enclaves, SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "other engine explicit cli proxy excludes all mounted servers",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: string(constants.ClaudeEngine)}, ParsedTools: &Tools{CLIProxy: true},
+				Tools: customTools, Enclaves: enclaves, SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+			expected: []string{enclaveMCPServerName, "custom", constants.MCPScriptsMCPServerID.String(), constants.SafeOutputsMCPServerID.String()},
+		},
+		{
+			name: "nil engine keeps infrastructure without cli proxy",
+			data: &WorkflowData{ParsedTools: &Tools{CLIProxy: false}, SafeOutputs: safeOutputs, MCPScripts: mcpScripts},
+		},
+		{
+			name: "engine ID alone does not exclude infrastructure",
+			data: &WorkflowData{EngineConfig: &EngineConfig{ID: string(constants.AgyEngine)}, SafeOutputs: safeOutputs, MCPScripts: mcpScripts},
+		},
+		{
+			name: "arbitrary engine keeps native infrastructure",
+			data: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "custom-capability-engine"}, ParsedTools: NewTools(customTools),
+				Tools: customTools, Enclaves: enclaves, SafeOutputs: safeOutputs, MCPScripts: mcpScripts,
+			},
+		},
+		{
+			name: "native infrastructure works without engine config",
+			data: &WorkflowData{SafeOutputs: safeOutputs, MCPScripts: mcpScripts},
+		},
+		{
+			name:     "nil engine explicit cli proxy excludes infrastructure",
+			data:     &WorkflowData{ParsedTools: &Tools{CLIProxy: true}, SafeOutputs: safeOutputs, MCPScripts: mcpScripts},
+			expected: infra,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getMCPCLIExcludeFromAgentConfig(tt.data))
+		})
+	}
+}
+
 func TestHasBashRestrictedAllowlist(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -219,7 +348,6 @@ func TestBuildMCPCLIPromptSection_PromptFileUsesNonHeadingLabels(t *testing.T) {
 	assert.NotContains(t, serversList, "${{", "server list must not use a GitHub Actions expression (step output reference is out of scope in activation job)")
 	assert.Contains(t, serversList, "safeoutputs", "server list must mention the safeoutputs server")
 	assert.Contains(t, serversList, "--help", "server list must guide agents to use --help for tool signatures")
-
 	wd, err := os.Getwd()
 	require.NoError(t, err)
 	content, err := os.ReadFile(filepath.Clean(filepath.Join(wd, "../../actions/setup/md", section.Content)))
@@ -368,4 +496,47 @@ func TestBuildMCPCLIPromptSection_OmittedWhenBashDisabled(t *testing.T) {
 
 	require.NotEmpty(t, getMCPCLIServerNames(data), "safeoutputs is still CLI-mounted")
 	assert.Nil(t, buildMCPCLIPromptSection(data), "CLI-only instructions must be omitted when the agent has no shell")
+}
+
+func TestWorkQueueCLIMountSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		engine   string
+		enabled  any
+		cliProxy bool
+		expected []string
+	}{
+		{"copilot enabled", "copilot", true, false, []string{"safeoutputs", "work-queue"}},
+		{"copilot implicit", "copilot", nil, false, []string{"safeoutputs", "work-queue"}},
+		{"copilot disabled", "copilot", false, false, []string{"safeoutputs"}},
+		{"claude MCP", "claude", true, false, []string{"safeoutputs"}},
+		{"claude CLI", "claude", true, true, []string{"safeoutputs", "work-queue"}},
+		{"copilot CLI deduplicated", "copilot", true, true, []string{"safeoutputs", "work-queue"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools := map[string]any{
+				"work-queue": tc.enabled,
+				"cli-proxy":  tc.cliProxy,
+				"bash":       []any{"echo"},
+			}
+			data := &WorkflowData{
+				Tools:        tools,
+				ParsedTools:  NewTools(tools),
+				EngineConfig: &EngineConfig{ID: tc.engine},
+				SafeOutputs:  &SafeOutputsConfig{NoOp: &NoOpConfig{}},
+			}
+			require.Equal(t, tc.expected, getMCPCLIServerNames(data))
+
+			section := buildMCPCLIPromptSection(data)
+			require.NotNil(t, section)
+			commands := withMountedCLIShellCommandsInRestrictedBash(data)["bash"]
+			if len(tc.expected) == 2 {
+				require.Contains(t, section.EnvVars["GH_AW_MCP_CLI_SERVERS_LIST"], "`work-queue --help`")
+				require.Contains(t, commands, "work-queue:*")
+			} else {
+				require.NotContains(t, section.EnvVars["GH_AW_MCP_CLI_SERVERS_LIST"], "work-queue")
+				require.NotContains(t, commands, "work-queue:*")
+			}
+		})
+	}
 }

@@ -80,6 +80,22 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{MaxToolDenials: "${{ inputs.max-tool-denials }}"},
 		},
 		{
+			name: "top-level max-tool-calls without engine",
+			frontmatter: map[string]any{
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "24"},
+		},
+		{
+			name: "top-level max-tool-calls expression",
+			frontmatter: map[string]any{
+				"max-tool-calls": "${{ inputs.max-tool-calls }}",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "${{ inputs.max-tool-calls }}"},
+		},
+		{
 			name: "top-level max-turn-cache-misses without engine",
 			frontmatter: map[string]any{
 				"max-turn-cache-misses": 6,
@@ -346,6 +362,17 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "copilot",
 			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolDenials: "8"},
+		},
+		{
+			name: "object format - with top-level max-tool-calls",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolCalls: "24"},
 		},
 		{
 			name: "object format - top-level max-turns overrides engine max-turns",
@@ -632,6 +659,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				}
 				if config.MaxToolDenials != test.expectedConfig.MaxToolDenials {
 					t.Errorf("Expected config.MaxToolDenials '%s', got '%s'", test.expectedConfig.MaxToolDenials, config.MaxToolDenials)
+				}
+				if config.MaxToolCalls != test.expectedConfig.MaxToolCalls {
+					t.Errorf("Expected config.MaxToolCalls '%s', got '%s'", test.expectedConfig.MaxToolCalls, config.MaxToolCalls)
 				}
 
 				if config.MaxRuns != test.expectedConfig.MaxRuns {
@@ -1282,6 +1312,92 @@ func TestNilEngineConfig(t *testing.T) {
 	}
 }
 
+func TestEngineDynamicWorkflowsFieldExtraction(t *testing.T) {
+	compiler := NewCompiler()
+	tests := []struct {
+		name    string
+		engine  any
+		enabled bool
+	}{
+		{
+			name:    "engine string uses engine default",
+			engine:  "claude",
+			enabled: false,
+		},
+		{
+			name: "engine object uses engine default",
+			engine: map[string]any{
+				"id": "claude",
+			},
+			enabled: false,
+		},
+		{
+			name: "explicitly enabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": true,
+			},
+			enabled: true,
+		},
+		{
+			name: "explicitly disabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": false,
+			},
+			enabled: false,
+		},
+	}
+
+	for _, engineID := range []string{"claude", "copilot"} {
+		for _, tt := range tests {
+			t.Run(engineID+"/"+tt.name, func(t *testing.T) {
+				engine := tt.engine
+				if object, ok := engine.(map[string]any); ok {
+					engineObject := map[string]any{"id": engineID}
+					if value, exists := object["dynamic-workflows"]; exists {
+						engineObject["dynamic-workflows"] = value
+					}
+					engine = engineObject
+				} else {
+					engine = engineID
+				}
+				_, config, _ := compiler.ExtractEngineConfig(map[string]any{"engine": engine})
+				if !assert.NotNil(t, config) {
+					return
+				}
+				assert.Equal(t, tt.enabled, config.DynamicWorkflowsEnabled())
+			})
+		}
+	}
+}
+
+func TestDynamicWorkflowsEnabledUsesEngineCapability(t *testing.T) {
+	engine := NewClaudeEngine()
+	engine.id = "not-claude"
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+	enabled := true
+	assert.True(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+
+	disabled := false
+	assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+
+	engine.capabilities.DynamicWorkflows = false
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+}
+
+func TestDynamicWorkflowsEnabledRequiresOptIn(t *testing.T) {
+	enabled, disabled := true, false
+	for _, engine := range []CodingAgentEngine{NewCopilotEngine(), NewClaudeEngine(), NewCodexEngine()} {
+		t.Run(engine.GetID(), func(t *testing.T) {
+			assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{}))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+			assert.Equal(t, engine.GetCapabilities().DynamicWorkflows, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+		})
+	}
+}
+
 func TestEngineBareFieldExtraction(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -1497,6 +1613,26 @@ func TestSupportsBareMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().BareMode,
 				"BareMode capability should be %v for %s", tt.expected, tt.engine.GetID())
+		})
+	}
+}
+
+func TestSupportsContextWindow(t *testing.T) {
+	tests := []struct {
+		name     string
+		engine   CodingAgentEngine
+		expected bool
+	}{
+		{name: "Claude does not support context-window", engine: NewClaudeEngine()},
+		{name: "Codex does not support context-window", engine: NewCodexEngine()},
+		{name: "Copilot does not support context-window", engine: NewCopilotEngine()},
+		{name: "Gemini does not support context-window", engine: NewGeminiEngine()},
+		{name: "Pi supports context-window", engine: NewPiEngine(), expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().ContextWindow)
 		})
 	}
 }

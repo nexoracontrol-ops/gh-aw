@@ -33,8 +33,8 @@ safe-outputs:
 timeout-minutes: 45
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.3-codex
+  model-provider: github
+model: copilot/gpt-5.6-luna
 strict: true
 imports:
   - shared/mcp-pagination.md
@@ -51,9 +51,6 @@ evals:
     question: Does the agent output include at least one actionable recommendation for improving repository productivity using agentic workflows?
   - id: evidence-cited
     question: Does the agent output cite specific repository characteristics or existing workflows as evidence supporting its recommendations?
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 # Repository Audit & Agentic Workflow Opportunity Analyzer

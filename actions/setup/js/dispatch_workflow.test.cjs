@@ -1,6 +1,15 @@
 // @ts-check
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { main } from "./dispatch_workflow.cjs";
+import { withClaimExecution } from "./work_queue_claim_scope.cjs";
+import { queueFixture } from "./work_queue_lifecycle.test_helpers.cjs";
+import { fakeGitHub } from "./work_queue_store_checks.cjs";
+import { replayTransactions } from "./work_queue_replay.cjs";
+import { main as writeSnapshot } from "./write_work_queue_snapshot.cjs";
+import fs from "node:fs";
+import path from "node:path";
+
+const temporaryDirectory = prefix => fs.mkdtempSync(path.join(fs.realpathSync(process.cwd()), `.gh-aw-${prefix}-`));
 
 // Mock dependencies
 global.core = {
@@ -48,6 +57,212 @@ describe("dispatch_workflow handler factory", () => {
     // Reset shared context to a known baseline so tests are order-independent
     global.context.ref = "refs/heads/main";
     global.context.payload = { repository: { default_branch: "main" } };
+    delete global.getOctokit;
+  });
+
+  it("validates the protected selected client on the direct native route before one durable START and POST", async () => {
+    const previousGithub = global.github;
+    const previousContext = global.context;
+    for (const kind of ["github_token", "github_app", "authenticated"]) {
+      for (const mode of ["approved", "wrong-principal", "wrong-client", "missing-binding"]) {
+        if (kind === "authenticated" && mode === "wrong-client") continue;
+        const root = temporaryDirectory("direct-dispatch-credential");
+        const fixture = queueFixture({ granted: false, count: 1, workerPrincipal: "22" });
+        const native = fakeGitHub(fixture.transactions);
+        let identities = 0;
+        let posts = 0;
+        const publisher = {
+          rest: {
+            git: native.githubClient.rest.git,
+            repos: { ...native.githubClient.rest.repos, ...fixture.githubClient.rest.repos },
+            actions: {
+              ...native.githubClient.rest.actions,
+              ...fixture.githubClient.rest.actions,
+              createWorkflowDispatch: async () => {
+                throw new Error("The separate publisher client must never POST");
+              },
+            },
+          },
+        };
+        const login = kind === "github_token" ? "github-actions[bot]" : kind === "github_app" ? "approved-worker[bot]" : "approved-pat-owner";
+        const identity = async () => {
+          identities++;
+          return { status: 200, data: { id: mode === "wrong-principal" ? "11" : "22", login, type: kind === "authenticated" ? "User" : "Bot" } };
+        };
+        const dispatchClient = {
+          auth: async () => ({ type: "token", token: mode === "wrong-client" ? "different-token" : "protected-selected-token" }),
+          rest: {
+            repos: publisher.rest.repos,
+            users: { getByUsername: identity, getAuthenticated: identity },
+            actions: {
+              createWorkflowDispatch: async () => {
+                posts++;
+                expect(identities).toBe(1);
+                const state = replayTransactions(native.log());
+                const dispatch = [...state.dispatches.values()][0];
+                expect(dispatch.state).toBe("started");
+                expect(dispatch.sender.run_attempt).toBe(2);
+                expect(dispatch.sender.principal).toBe("11");
+                expect(native.log().find(commit => commit.request.kind === "dispatch_next").actor.run_attempt).toBe(1);
+                return { status: 200, data: { workflow_run_id: "42", run_url: "https://api.github.com/repos/owner/repo/actions/runs/42", html_url: "https://github.com/owner/repo/actions/runs/42" } };
+              },
+              getWorkflowRun: async () => {
+                const dispatch = [...replayTransactions(native.log()).dispatches.values()][0];
+                return { status: 200, data: { ...fixture.nativeRun(), display_title: `gh-aw work-queue ${dispatch.dispatch_id}` } };
+              },
+            },
+          },
+        };
+        try {
+          const snapshotPath = path.join(root, "snapshot.json");
+          const origin = await writeSnapshot({
+            githubClient: publisher,
+            context: fixture.dispatcherContext,
+            workflowRef: `owner/repo/.github/workflows/dispatcher.lock.yml@${"a".repeat(40)}`,
+            snapshotPath,
+            role: "dispatcher",
+            core: global.core,
+          });
+          fixture.dispatcherContext.runAttempt = 2;
+          global.github = publisher;
+          global.context = fixture.dispatcherContext;
+          global.getOctokit = () => dispatchClient;
+          vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+          vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "dispatcher");
+          vi.stubEnv("GH_AW_WORK_QUEUE_SNAPSHOT", snapshotPath);
+          vi.stubEnv("GH_AW_WORK_QUEUE_INTENT_ORIGIN", JSON.stringify(origin.origin));
+          vi.stubEnv("GITHUB_WORKFLOW_REF", `owner/repo/.github/workflows/dispatcher.lock.yml@${"a".repeat(40)}`);
+          const config = {
+            work_queue_enabled: true,
+            work_queue_workflows: ["worker"],
+            aw_context_workflows: ["worker"],
+            "github-token": "protected-selected-token",
+            ...(mode === "missing-binding" ? {} : { work_queue_dispatch_credential: { kind, ...(kind === "github_app" ? { app_slug: "approved-worker" } : {}) } }),
+          };
+          const message = { type: "work_queue_dispatch_next", intent_id: "direct-credential", pool: "default", max_claims: 1, max_dispatches: 1 };
+          const handler = await main(config);
+          const result = await handler(message, {});
+          if (mode === "approved") {
+            expect(result.success, JSON.stringify(result)).toBe(true);
+            expect(posts).toBe(1);
+            const dispatch = [...replayTransactions(native.log()).dispatches.values()][0];
+            expect(dispatch.state).toBe("bound");
+            expect(dispatch.run.principal).toBe("22");
+            const retry = await main(config);
+            await retry(message, {});
+            expect(posts).toBe(1);
+            expect(
+              native
+                .log()
+                .flatMap(commit => commit.operations)
+                .filter(operation => operation.kind === "Dispatch" && operation.state === "started")
+            ).toHaveLength(1);
+          } else {
+            expect(posts).toBe(0);
+            expect(
+              native
+                .log()
+                .flatMap(commit => commit.operations)
+                .some(operation => operation.kind === "Dispatch" && operation.state === "started")
+            ).toBe(false);
+            if (mode !== "wrong-principal") expect(identities).toBe(0);
+          }
+        } finally {
+          vi.unstubAllEnvs();
+          global.github = previousGithub;
+          global.context = previousContext;
+          delete global.getOctokit;
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    }
+  });
+
+  it("rejects agent-selected Work and forged assignments before any POST", async () => {
+    const handler = await main({ workflows: ["worker"], workflow_files: { worker: ".lock.yml" }, work_queue_enabled: true, work_queue_workflows: ["worker"] });
+    for (const key of ["work_queue", "work_claim", "work_queue_claim", "work_queue_assignment"]) {
+      expect((await handler({ workflow_name: "worker", inputs: { [key]: { work_id: "chosen" } } }, {})).success).toBe(false);
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects every assignment alias on protected observer dispatches before any POST", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "observer");
+    const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" } });
+    try {
+      for (const key of ["work_queue", "work_claim", "work_queue_claim", "work_queue_assignment"]) {
+        const result = await handler({ workflow_name: "ordinary", inputs: { [key]: {} } }, {});
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/Agent-supplied queue assignments/);
+      }
+      expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("retains main's disabled input conversion and reserved keys despite stray queue context", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "false");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+    global.context.payload.inputs = { work_queue_assignment: null };
+    try {
+      const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" } });
+      const result = await handler({ workflow_name: "ordinary", inputs: { work_claim: { note: "ordinary input" }, work_queue_assignment: "ordinary input", work_queue_claim: "ignored reserved input", count: 2, flag: false } }, {});
+      expect(result.success).toBe(true);
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: { work_claim: '{"note":"ordinary input"}', work_queue_assignment: "ordinary input", count: "2", flag: "false" },
+        })
+      );
+      const denied = await main({ workflows: ["ordinary"] });
+      expect((await denied({ workflow_name: "ordinary", inputs: { work_queue: {} } }, {})).error).toMatch(/Work queue dispatch requires/);
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("requires an immutable scheduler assignment even for ordinary/staged calls to a queue worker", async () => {
+    for (const staged of [false, true]) {
+      const handler = await main({ workflows: ["worker"], workflow_files: { worker: ".lock.yml" }, work_queue_enabled: true, work_queue_workflows: ["worker"], staged });
+      expect((await handler({ workflow_name: "worker", inputs: { task: "unassigned" } }, {})).success).toBe(false);
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects ordinary allowed targets in queue mode and scoped execution even without a serialized queue flag", async () => {
+    const message = { type: "dispatch_workflow", workflow_name: "ordinary", inputs: { task: "delegate" } };
+    for (const staged of [false, true]) {
+      const handler = await main({ workflows: ["ordinary"], work_queue_enabled: true, staged });
+      expect((await handler(message, {})).success).toBe(false);
+    }
+    const fixture = queueFixture({ count: 1, bound: true });
+    const scoped = await main({ workflows: ["ordinary"] });
+    expect((await withClaimExecution({ assignment: fixture.assignment, claim_handle: "h1" }, () => scoped(message, {}))).success).toBe(false);
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    try {
+      expect((await scoped(message, {})).success).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("preserves explicitly configured ordinary observer outputs without granting queue controls or assignment downgrade", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "observer");
+    try {
+      const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" }, work_queue_enabled: true, max: 3 });
+      const result = await handler({ type: "dispatch_workflow", workflow_name: "ordinary", inputs: {} }, {});
+      expect(result.success, result.error).toBe(true);
+      expect((await handler({ type: "dispatch_workflow", workflow_name: "unapproved", inputs: {} }, {})).success).toBe(false);
+      global.context.payload.inputs = { work_queue_assignment: null };
+      await expect(handler({ type: "dispatch_workflow", workflow_name: "ordinary", inputs: {} }, {})).rejects.toThrow();
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("should create a handler function", async () => {

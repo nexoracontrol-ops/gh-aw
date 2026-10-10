@@ -88,7 +88,7 @@ check_validation_ordering() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ parse ]] && continue
         [[ "$handler" =~ buffer ]] && continue
         
@@ -115,7 +115,7 @@ check_max_limits() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test and utility files
-        [[ "$handler" =~ (test|parse|buffer|factory) ]] && continue
+        [[ "$handler" =~ (test|parse|buffer|factory)|_checks\.cjs$ ]] && continue
         
         # Only check files that perform GitHub API operations
         if ! grep -q "octokit\." "$handler"; then
@@ -142,7 +142,7 @@ check_sanitization() {
 
     for handler in actions/setup/js/{add_comment,create_issue,create_discussion,create_pull_request,update_issue,close_issue,close_discussion,close_pull_request,add_labels,remove_labels,create_check_run,approve_workflow_run,create_pr_review_comment,comment_memory,create_agent_session,assign_milestone,create_project,create_forecast_issue}.cjs; do
         # Skip test and utility files
-        [[ "$handler" =~ (test|parse|buffer) ]] && continue
+        [[ "$handler" =~ (test|parse|buffer)|_checks\.cjs$ ]] && continue
         [ ! -f "$handler" ] && continue
 
         # Skip files with a documented SEC-004 exemption annotation
@@ -175,7 +175,7 @@ check_cross_repo() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         
         # Skip files with a documented SEC-005 exemption annotation
         if grep -q "@safe-outputs-exempt.*SEC-005" "$handler"; then
@@ -205,7 +205,7 @@ check_error_codes() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files and non-safe-output modules
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
         
         # Only check handlers that interact with GitHub via octokit or record safe output operations
@@ -258,7 +258,7 @@ check_staged_mode() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files and non-safe-output modules
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
         
         # Only check handlers that explicitly reference the safe outputs staged mode env var
@@ -466,6 +466,7 @@ compiler_populated_fields = {
     "safe-outputs.call-workflow.workflow_files",
     "safe-outputs.dispatch-workflow.workflow_files",
     "safe-outputs.dispatch-workflow.aw_context_workflows",
+    "safe-outputs.dispatch-workflow.work_queue_workflows",
 }
 
 tool_configured_outputs = {"comment-memory"}
@@ -539,6 +540,125 @@ PY
     fi
 }
 check_safe_output_config_schema_coverage
+
+# IMP-005: Safe Output Target Authorization Coverage
+check_safe_output_target_authorization_coverage() {
+    local findings
+
+    echo "Running IMP-005: Safe Output Target Authorization Coverage..."
+
+    findings=$(python3 - <<'PY'
+import re
+from pathlib import Path
+
+spec_path = Path("docs/src/content/docs/specs/safe-outputs-specification.md")
+spec = spec_path.read_text()
+
+target_authorized_types = {
+    "add_comment": ("actions/setup/js/add_comment.cjs", "resolveTarget"),
+    "update_issue": ("actions/setup/js/update_issue.cjs", "resolveTarget"),
+    "close_issue": ("actions/setup/js/close_issue.cjs", "resolveTarget"),
+    "add_labels": ("actions/setup/js/add_labels.cjs", "resolveTarget"),
+    "remove_labels": ("actions/setup/js/remove_labels.cjs", "resolveTarget"),
+    "link_sub_issue": ("actions/setup/js/link_sub_issue.cjs", "resolveTarget"),
+    "close_pull_request": ("actions/setup/js/close_pull_request.cjs", "resolveTarget"),
+    "merge_pull_request": ("actions/setup/js/merge_pull_request.cjs", "resolveTarget"),
+    "mark_pull_request_as_ready_for_review": ("actions/setup/js/mark_pull_request_as_ready_for_review.cjs", "resolveTarget"),
+    "resolve_pull_request_review_thread": ("actions/setup/js/resolve_pr_review_thread.cjs", "reviewThreadTargetChecks"),
+    "add_reviewer": ("actions/setup/js/add_reviewer.cjs", "resolveTarget"),
+    "assign_milestone": ("actions/setup/js/assign_milestone.cjs", "resolveTarget"),
+    "assign_to_agent": ("actions/setup/js/assign_to_agent.cjs", "resolveTarget"),
+    "assign_to_user": ("actions/setup/js/assign_to_user.cjs", "resolveTarget"),
+    "unassign_from_user": ("actions/setup/js/unassign_from_user.cjs", "resolveTarget"),
+    "set_issue_type": ("actions/setup/js/set_issue_type.cjs", "resolveTarget"),
+    "set_issue_field": ("actions/setup/js/set_issue_field.cjs", "resolveTarget"),
+    "hide_comment": ("actions/setup/js/hide_comment.cjs", "commentParentTargetChecks"),
+}
+
+
+def type_section(type_name):
+    header = f"#### Type: {type_name}"
+    start = spec.find(header)
+    if start == -1:
+        return ""
+    rest = spec[start + len(header):]
+    next_section = rest.find("\n#### Type: ")
+    if next_section == -1:
+        return spec[start:]
+    return spec[start:start + len(header) + next_section]
+
+
+messages = []
+for type_name, (handler_path, enforcement_mode) in target_authorized_types.items():
+    section = type_section(type_name)
+    if not section:
+        messages.append(f"missing specification section for {type_name}")
+        continue
+    if "**Target Authorization**" not in section:
+        messages.append(f"missing Target Authorization section for {type_name}")
+        continue
+
+    prefix_match = re.search(r"\*\*([A-Z]+)-001\*\*", section)
+    if not prefix_match:
+        messages.append(f"missing numbered target authorization requirements for {type_name}")
+    else:
+        prefix = prefix_match.group(1)
+        for suffix in ("001", "002", "003", "004", "005"):
+            if f"**{prefix}-{suffix}**" not in section:
+                messages.append(f"missing {prefix}-{suffix} in {type_name} target authorization requirements")
+
+    for needle in ('target: "triggering"', 'target: "*"'):
+        if needle not in section:
+            messages.append(f"missing {needle} semantics in {type_name} target authorization requirements")
+
+    test_path = Path(f"pkg/workflow/safe_outputs_specification_{type_name}_test.go")
+    if not test_path.exists():
+        messages.append(f"missing specification regression test for {type_name}")
+
+    handler = Path(handler_path)
+    if not handler.exists():
+        messages.append(f"missing target-authorized handler {handler_path}")
+        continue
+    handler_text = handler.read_text()
+    if enforcement_mode == "resolveTarget":
+        if "resolveTarget" not in handler_text:
+            messages.append(f"{handler_path} does not use resolveTarget for runtime target authorization")
+    elif enforcement_mode == "reviewThreadTargetChecks":
+        for needle in ("resolveInvocationContext", "threadPRNumber", "triggeringPRNumber"):
+            if needle not in handler_text:
+                messages.append(f"{handler_path} missing {needle} review-thread target boundary check")
+    elif enforcement_mode == "commentParentTargetChecks":
+        for needle in ("resolvedComment.itemNumber", "resolvedComment.kind", "expectedKind"):
+            if needle not in handler_text:
+                messages.append(f"{handler_path} missing {needle} comment parent target boundary check")
+
+helper = Path("actions/setup/js/safe_output_helpers.cjs").read_text()
+helper_test = Path("actions/setup/js/safe_output_helpers.test.cjs").read_text()
+if "assertTargetAuthorizationInvariant" not in helper:
+    messages.append("safe_output_helpers.cjs missing fail-safe target authorization invariant assertion")
+for needle in (
+    "should ignore agent-supplied issue numbers for triggering targets",
+    "should ignore conflicting agent-supplied issue numbers for fixed targets",
+    "should ignore agent-supplied PR numbers for triggering targets",
+    "should ignore conflicting agent-supplied PR numbers for fixed targets",
+    "ERR_TARGET_AUTHORIZATION",
+):
+    if needle not in helper_test:
+        messages.append(f"safe_output_helpers.test.cjs missing regression coverage: {needle}")
+
+print("\n".join(sorted(set(messages))))
+PY
+)
+
+    if [ -n "$findings" ]; then
+        while IFS= read -r finding; do
+            log_high "IMP-005: Safe output target authorization conformance gap: $finding"
+        done <<< "$findings"
+    else
+        log_pass "IMP-005: Safe output target authorization is specified, tested, and enforced"
+    fi
+}
+check_safe_output_target_authorization_coverage
 
 # MCE-001: Tool Description Constraint Disclosure (Section 8.3 MCE2)
 echo "Running MCE-001: Tool Description Constraint Disclosure..."
@@ -1974,6 +2094,8 @@ check_fork_backed_pr_semantics() {
     # 4. head-github-app takes precedence over head-github-token when both are configured.
     # 5. Successful executions MUST record head_repo in the safe-output summary and manifest.
     # 6. push_to_pull_request_branch follow-up is limited to PRs whose head repo matches head-repo.
+    # 7. head_repo MUST be included whenever head-repo differs from target-repo, even when both
+    #    share the same owner/organization (Section 7.1 v1.29.5).
 
     if [ ! -f "$pr_handler" ]; then
         log_high "TYPE-012: create_pull_request handler missing: $pr_handler"
@@ -1997,12 +2119,26 @@ check_fork_backed_pr_semantics() {
             log_high "TYPE-012: create_pull_request handler does not record head_repo in summary/manifest (Section 7.1 v1.26.0 requirement 5)"
             failed=1
         fi
+
+        # Check head_repo is gated on full repo identity, not owner alone, so that
+        # same-organization forks (differing repo, same owner) still send head_repo (requirement 7)
+        if ! grep -qE "pushRepo\.toLowerCase\(\)\s*===\s*itemRepo\.toLowerCase\(\)" "$pr_handler"; then
+            log_high "TYPE-012: create_pull_request handler does not compare full repo identity before omitting head_repo, risking same-organization fork failures (Section 7.1 v1.29.5 requirement 7)"
+            failed=1
+        fi
     fi
 
     # Check push_to_pull_request_branch restricts to configured head-repo (requirement 6)
     if [ -f "$push_handler" ]; then
         if ! grep -qE "head.repo|headRepo|head_repo" "$push_handler"; then
             log_high "TYPE-012: push_to_pull_request_branch handler does not enforce head-repo restriction (Section 7.1 v1.26.0 requirement 6)"
+            failed=1
+        fi
+
+        # Check head_repo params are gated on full repo identity, not owner alone, so that
+        # same-organization forks (differing repo, same owner) still send head_repo (requirement 7)
+        if ! grep -qE "pushRepo\.toLowerCase\(\)\s*===\s*itemRepo\.toLowerCase\(\)" "$push_handler"; then
+            log_high "TYPE-012: push_to_pull_request_branch handler does not compare full repo identity before omitting head_repo, risking same-organization fork failures (Section 7.1 v1.29.5 requirement 7)"
             failed=1
         fi
     else
@@ -2022,7 +2158,7 @@ check_fork_backed_pr_semantics() {
     fi
 
     if [ $failed -eq 0 ]; then
-        log_pass "TYPE-012: Fork-backed PR semantics implemented: allowlist, owner-qualified refs, head_repo provenance, and head-github-app precedence (Section 7.1 v1.26.0)"
+        log_pass "TYPE-012: Fork-backed PR semantics implemented: allowlist, owner-qualified refs, head_repo provenance (including same-organization forks), and head-github-app precedence (Section 7.1 v1.29.5)"
     fi
 }
 check_fork_backed_pr_semantics

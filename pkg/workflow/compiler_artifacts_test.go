@@ -640,8 +640,11 @@ Body.
 		"/tmp/gh-aw/agent_usage.jsonl",
 		"/tmp/gh-aw/agent_usage.json",
 		"/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/model-routing.jsonl",
 		"/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl",
 		"/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl",
 		"/tmp/gh-aw/agent/graders/grader_manifest.json",
 		"/tmp/gh-aw/agent/graders/grader_results.json",
 		"if-no-files-found: ignore",
@@ -714,7 +717,9 @@ safe-outputs:
 		"${{ runner.temp }}/gh-aw/agent_output.json",
 		"${{ runner.temp }}/gh-aw/agent_usage.jsonl",
 		"${{ runner.temp }}/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl",
 		"${{ runner.temp }}/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl",
 		"${{ runner.temp }}/gh-aw/agent/graders/grader_manifest.json",
 	} {
 		assert.Contains(t, uploadSection, expected)
@@ -759,6 +764,7 @@ safe-outputs:
 	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Initialize agent execution evidence"), `"state":"not_started"`)
 	assert.NotContains(t, lockYAML, "Mark agent execution started")
 	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload agent output fallback artifact"), agentExecutionEvidencePath)
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload agent output fallback artifact"), agentExecutionExitCodePath)
 	assert.Contains(t, lockYAML, `pattern: "{agent,agent-output-fallback}"`)
 	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload usage artifact"), "/tmp/gh-aw/usage/agent/execution.json")
 }

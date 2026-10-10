@@ -62,6 +62,7 @@ func getEarlyCodemods() []Codemod {
 		getNetworkFirewallCodemod(),
 		getCommandToSlashCommandCodemod(),
 		getWorkflowDispatchRequiredFalseCodemod(), // Set required: false for slash/label command triggers
+		getWorkflowDispatchAwContextRemovalCodemod(),
 		getMCPScriptsModeCodemod(),
 		getUploadAssetsCodemod(),
 		getMigrateWritePermissionsToReadCodemod(),
@@ -78,6 +79,7 @@ func getEarlyCodemods() []Codemod {
 		getInstallScriptURLCodemod(),
 		getBashAnonymousRemovalCodemod(),              // Replace bash: with bash: false
 		getBashSingleQuotedArgsCodemod(),              // Rewrite single-quoted bash args to double-quoted form
+		getCopilotWebFetchRemovalCodemod(),            // Remove native Copilot web-fetch, unavailable in offline BYOK mode
 		getBashAllowlistUnsupportedEngineCodemod(),    // Detect restricted tools.bash on engines that ignore it and emit guided error
 		getActivationOutputsCodemod(),                 // Transform needs.activation.outputs.* to steps.sanitized.outputs.*
 		getRolesToOnRolesCodemod(),                    // Move top-level roles to on.roles
@@ -120,7 +122,6 @@ func getLaterCodemods() []Codemod {
 		getCopilotRequestsFeatureToPermissionsCodemod(),   // Migrate features.copilot-requests to permissions.copilot-requests
 		getByokCopilotFeatureRemovalCodemod(),             // Remove deprecated features.byok-copilot (Copilot BYOK is default)
 		getInlineAgentsFeatureRemovalCodemod(),            // Remove deprecated features.inline-agents (inline sub-agents now default)
-		getCliProxyFeatureToGitHubModeCodemod(),           // Migrate features.cli-proxy: true to tools.github.mode: gh-proxy
 		getDIFCProxyToIntegrityProxyCodemod(),             // Migrate deprecated features.difc-proxy to tools.github.integrity-proxy
 		getMountAsCLIsToCLIProxyCodemod(),                 // Rename tools.mount-as-clis to tools.cli-proxy and remove features.mcp-cli
 		getMinIntegrityNoneRequiresBashCodemod(),          // Add tools.bash: false when tools.github.min-integrity is 'none'
@@ -128,6 +129,7 @@ func getLaterCodemods() []Codemod {
 		getSandboxMCPContainerRemovalCodemod(),            // Remove deprecated sandbox.mcp.container (now managed internally)
 		getSandboxMCPVersionRemovalCodemod(),              // Remove deprecated sandbox.mcp.version (now managed internally)
 		getSandboxRuntimeProfileCodemod(),                 // Migrate sandbox.agent.sudo / legacy-security to sandbox.agent.runtime profiles
+		getSandboxFieldsCodemod(),                         // Normalize camel-cased sandbox fields to kebab-case
 		getInferToDisableModelInvocationCodemod(),         // Migrate deprecated 'infer' to 'disable-model-invocation'
 		getRunInstallScriptsToRuntimesNodeCodemod(),       // Move top-level run-install-scripts under runtimes.node
 		getMentionsAllowTeamMembersCodemod(),              // Rename allow-team-members to allowed-collaborators in safe-outputs.mentions

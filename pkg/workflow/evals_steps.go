@@ -170,6 +170,7 @@ func (c *Compiler) buildEvalsEngineSteps(data *WorkflowData) []string { //nolint
 		copy := *data.EngineConfig
 		evalsEngineConfig = &copy
 		evalsEngineConfig.Agent = ""
+		evalsEngineConfig.ModelRouting = nil
 		if evalsEngineConfig.ID == "" {
 			evalsEngineConfig.ID = engineID
 		}
@@ -219,13 +220,16 @@ func (c *Compiler) buildEvalsEngineSteps(data *WorkflowData) []string { //nolint
 		ModelCosts:        data.ModelCosts,      // propagate pricing providers so evals awf-config.json can resolve AI-credit costs
 		CompiledVersion:   data.CompiledVersion, // propagate compiler version so install steps can inject GH_AW_COMPILED_VERSION
 		NetworkPermissions: &NetworkPermissions{
-			Allowed: getThreatDetectionAdditionalAllowedDomains(data),
+			Allowed: getThreatDetectionAdditionalAllowedDomains(data, engineID),
 		},
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
 				Type: SandboxTypeAWF,
 			},
 		},
+	}
+	if isOTLPEnabled(data) {
+		evalsData.ExcludedEnv = append(evalsData.ExcludedEnv, otlpSandboxExcludedEnvVarNames...)
 	}
 	if firewallConfig := getFirewallConfig(data); firewallConfig != nil {
 		firewallCopy := *firewallConfig
@@ -242,12 +246,12 @@ func (c *Compiler) buildEvalsEngineSteps(data *WorkflowData) []string { //nolint
 	var steps []string
 
 	// Install the engine binary (fresh runner has no engine installed).
-	installSteps := engine.GetInstallationSteps(evalsData)
+	installSteps := applyNodeSetupOverrides(engine.GetInstallationSteps(evalsData), data)
 
 	// Ensure Node.js is on PATH when the engine harness requires it.
 	// Guard against engines whose install steps already bundle Setup Node.js.
 	if engineRequiresNodeHarness(engine) && !installStepsContainNodeSetup(installSteps) {
-		for _, line := range GenerateNodeJsSetupStep() {
+		for _, line := range generateNodeJsSetupStepForWorkflow(data) {
 			steps = append(steps, line+"\n")
 		}
 	}
@@ -388,9 +392,9 @@ await main();`
 	}
 	if len(secretReferences) > 0 {
 		steps = append(steps, "        env:\n")
-		escapedRefs := make([]string, len(secretReferences))
-		for i, ref := range secretReferences {
-			escapedRefs[i] = escapeSingleQuoteBackslash(ref)
+		escapedRefs := make([]string, 0, len(secretReferences))
+		for _, ref := range secretReferences {
+			escapedRefs = append(escapedRefs, escapeSingleQuoteBackslash(ref))
 		}
 		steps = append(steps, fmt.Sprintf("          GH_AW_SECRET_NAMES: '%s'\n", strings.Join(escapedRefs, ",")))
 		for _, secretName := range secretReferences {
@@ -569,7 +573,7 @@ func marshalEvalsQuestions(questions []EvalDefinition) string {
 		// Use json.Marshal for robust string quoting (handles all JSON escape sequences)
 		idJSON, _ := json.Marshal(q.ID)             //nolint:jsonmarshalignoredeerror // marshaling a string cannot fail
 		questionJSON, _ := json.Marshal(q.Question) //nolint:jsonmarshalignoredeerror // marshaling a string cannot fail
-		fmt.Fprintf(&sb, `{"id":%s,"question":%s}`, idJSON, questionJSON)
+		sb.WriteString(`{"id":` + string(idJSON) + `,"question":` + string(questionJSON) + `}`)
 	}
 	sb.WriteString("]")
 	return sb.String()

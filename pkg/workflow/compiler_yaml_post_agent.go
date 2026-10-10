@@ -13,7 +13,9 @@ import (
 // patch/bundle paths, and firewall audit paths.
 func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEngine, logFileFull string, initialPaths []string) []string { //nolint:largefunc // Existing artifact policy remains explicit and ordered.
 	paths := initialPaths
-	paths = append(paths, agentExecutionEvidencePath)
+	paths = append(paths, agentExecutionEvidencePath, agentExecutionExitCodePath,
+		constants.TmpGhAwDirSlash+"agent-session.jsonl", constants.TmpGhAwDirSlash+"agent-errors.jsonl",
+		constants.TmpGhAwDirSlash+"aw-prompts/user.txt", constants.TmpGhAwDirSlash+"aw-prompts/system.txt")
 
 	// Merge engine-declared output files into the unified artifact instead of creating a
 	// separate agent_outputs artifact.
@@ -35,6 +37,13 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	// Requires AWF v0.25.8+
 	if isFirewallEnabled(data) || engine.GetID() == string(constants.CopilotEngine) {
 		paths = append(paths, constants.TmpGhAwDirSlash+constants.TokenUsageFilename.String())
+	}
+	if isModelRoutingEnabled(data) {
+		// The post-run parser patches this runner-side copy with the AWF selection.
+		// Keep it in the agent artifact; activation's separate "info" artifact remains
+		// the compile-time snapshot for compatibility with existing downloads.
+		paths = append(paths, constants.TmpGhAwDirSlash+"agent/aw_info.json")
+		paths = append(paths, constants.TmpGhAwDirSlash+"agent/awf-routing-outcome.json")
 	}
 	if engine.GetID() == string(constants.CopilotEngine) {
 		paths = append(paths, constants.TmpGhAwDirSlash+"agent_usage.jsonl")
@@ -73,6 +82,20 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 		paths = append(paths, constants.TmpGhAwDirSlash+constants.AgentOutputFilename.String())
 		if data.CommentMemoryConfig != nil {
 			paths = append(paths, constants.TmpCommentMemoryDir)
+		}
+		// Custom safe-outputs jobs can declare additional agent-job filesystem paths
+		// (via safe-outputs.jobs.*.artifacts) that their steps depend on. Persist them
+		// in the unified agent artifact so they survive into the downstream job.
+		paths = append(paths, collectSafeJobArtifactPaths(data.SafeOutputs.Jobs)...)
+	}
+	if isWorkQueueParticipant(data) {
+		paths = append(paths, constants.WorkQueueFinishIntentPath)
+		paths = append(paths, constants.WorkQueueIntentPath)
+		for _, extension := range secretRedactionScannedExtensions {
+			paths = append(paths, constants.WorkQueueClaimArtifactsPath+"/**/*"+extension)
+		}
+		if usesPatchesAndCheckouts(data.SafeOutputs) {
+			paths = append(paths, constants.WorkQueueClaimArtifactsPath+"/*/aw-*.bundle")
 		}
 	}
 
@@ -210,7 +233,7 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// receive a valid (empty) JSON file instead of an ENOENT error.
 	// The placeholder is only written if the engine did not already write the file.
 	if data.SafeOutputs != nil {
-		c.generateAgentOutputPlaceholderStep(yaml)
+		c.generateAgentOutputPlaceholderStep(yaml, data)
 	}
 
 	// Add post-execution cleanup step for Copilot engine
@@ -274,7 +297,7 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
 	compilerYamlLog.Printf("Emitting unified agent artifact upload with %d path(s)", len(artifactPaths))
 	c.generateAgentOutputFallbackUpload(yaml, data, agentArtifactPrefix)
-	c.generateUnifiedArtifactUpload(yaml, artifactPaths, agentArtifactPrefix)
+	c.generateUnifiedArtifactUpload(yaml, artifactPaths, agentArtifactPrefix, hasSafeJobArtifactPaths(data) || isWorkQueueEnabled(data))
 
 	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files
 	// live in the workspace. When a checkout: entry targets an external repository without a path

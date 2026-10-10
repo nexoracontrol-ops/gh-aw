@@ -175,6 +175,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 		}
 		runs = append(runs, run)
 	}
+	logsOrchestratorLog.Printf("Resolved %d/%d run(s) from stdin input", len(runs), len(opts.RunURLs))
 
 	if len(runs) == 0 {
 		finishGitHubAPIRateLimitReports(ctx, allAPIRateLimits, opts.JSONOutput)
@@ -201,6 +202,8 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 		engine:            opts.Engine,
 		runtime:           opts.Runtime,
 		noStaged:          opts.NoStaged,
+		dryRun:            opts.DryRun,
+		noDryRun:          opts.NoDryRun,
 		firewallOnly:      opts.FirewallOnly,
 		noFirewall:        opts.NoFirewall,
 		safeOutputType:    opts.SafeOutputType,
@@ -223,6 +226,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 		}
 		if errors.Is(result.Error, errLogsStorageLimitReached) {
 			storageLimitReached = true
+			logsOrchestratorLog.Print("Storage limit reached while processing stdin runs")
 		}
 		if result.Skipped {
 			if opts.Verbose && result.Error != nil {
@@ -253,7 +257,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 			} else {
 				logMdPath := filepath.Join(result.LogsPath, "log.md")
 				if fileutil.FileExists(logMdPath) {
-					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed log for run %d → %s", processedRun.Run.DatabaseID, logMdPath)))
+					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Parsed log for run %d → %s", processedRun.Run.DatabaseID, logMdPath)))
 				}
 			}
 			if err := parseFirewallLogs(result.LogsPath, opts.Verbose); err != nil {
@@ -261,7 +265,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 			} else {
 				firewallMdPath := filepath.Join(result.LogsPath, "firewall.md")
 				if fileutil.FileExists(firewallMdPath) {
-					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Parsed firewall logs for run %d → %s", processedRun.Run.DatabaseID, firewallMdPath)))
+					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Parsed firewall logs for run %d → %s", processedRun.Run.DatabaseID, firewallMdPath)))
 				}
 			}
 		}
@@ -275,6 +279,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 	if opts.CachedJSONL != "" {
 		renderLogsCollectionStats(collectionStats)
 	}
+	logsOrchestratorLog.Printf("Processed %d run(s) into output (storageLimitReached=%t)", len(processedRuns), storageLimitReached)
 
 	if len(processedRuns) == 0 {
 		finishGitHubAPIRateLimitReports(ctx, allAPIRateLimits, opts.JSONOutput)
@@ -322,6 +327,7 @@ func DownloadWorkflowLogsFromStdin(ctx context.Context, opts StdinLogsOptions) (
 		message:           message,
 		verbose:           opts.Verbose,
 		artifactFilter:    artifactFilter,
+		includeWorkQueue:  workQueueEvidenceRequested(opts.ArtifactSets),
 		apiRateLimit:      apiRateLimit,
 		apiRateLimits:     apiRateLimits,
 		cachedJSONLWriter: cachedJSONLWriter,

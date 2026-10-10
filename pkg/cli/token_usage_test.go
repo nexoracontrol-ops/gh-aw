@@ -457,6 +457,126 @@ func TestFindTokenUsageFile(t *testing.T) {
 	})
 }
 
+func TestFindAPIProxyEventsLog(t *testing.T) {
+	t.Run("recovers from invalid cached value", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-invalid-cache")
+		cacheKey := filepath.Clean(tmpDir)
+		apiProxySteeringLogCache.Store(cacheKey, "invalid")
+		t.Cleanup(func() {
+			apiProxySteeringLogCache.Delete(cacheKey)
+		})
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		eventsFile := filepath.Join(logsDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"token_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, eventsFile, result.path)
+	})
+
+	t.Run("finds in sandbox/firewall/audit path", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-events")
+		auditDir := filepath.Join(tmpDir, "sandbox", "firewall", "audit", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(auditDir, 0o755))
+		eventsFile := filepath.Join(auditDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"token_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, eventsFile, result.path, "should find file in AWF audit path")
+	})
+
+	t.Run("finds event-logs filename", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-event-logs")
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		eventsFile := filepath.Join(logsDir, "event-logs.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"model_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, eventsFile, result.path)
+	})
+
+	t.Run("prefers sandbox/firewall/logs over sandbox/firewall/audit when both exist", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-events")
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		auditDir := filepath.Join(tmpDir, "sandbox", "firewall", "audit", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		require.NoError(t, os.MkdirAll(auditDir, 0o755))
+		logsFile := filepath.Join(logsDir, "events.jsonl")
+		auditFile := filepath.Join(auditDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(logsFile, []byte(`{"event":"token_steering"}`+"\n"), 0o644))
+		require.NoError(t, os.WriteFile(auditFile, []byte(`{"event":"timeout_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, logsFile, result.path, "should prefer primary logs path over AWF audit path")
+	})
+
+	t.Run("skips empty and steering-free event logs across layouts", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-events-fallback")
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		auditDir := filepath.Join(tmpDir, "sandbox", "firewall", "audit", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		require.NoError(t, os.MkdirAll(auditDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(logsDir, "event-logs.jsonl"), nil, 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(logsDir, "events.jsonl"), []byte(`{"event":"request"}`+"\n"), 0o644))
+		auditFile := filepath.Join(auditDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(auditFile, []byte(`{"event":"token_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, auditFile, result.path)
+	})
+
+	t.Run("skips empty legacy event logs", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-legacy-fallback")
+		legacyDir := filepath.Join(tmpDir, "firewall-audit-logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(legacyDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(legacyDir, "event-logs.jsonl"), nil, 0o644))
+		eventsFile := filepath.Join(legacyDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"timeout_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, eventsFile, result.path)
+	})
+
+	t.Run("finds legacy event logs nested under sandbox", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-nested-legacy")
+		legacyDir := filepath.Join(tmpDir, "sandbox", "firewall-audit-logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(legacyDir, 0o755))
+		eventsFile := filepath.Join(legacyDir, "events.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"token_steering"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Equal(t, eventsFile, result.path)
+	})
+
+	t.Run("returns no log when no candidates contain steering", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "find-api-proxy-no-steering")
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		eventsFile := filepath.Join(logsDir, "event-logs.jsonl")
+		require.NoError(t, os.WriteFile(eventsFile, []byte(`{"event":"request"}`+"\n"), 0o644))
+
+		result, err := findAPIProxyEventsLog(tmpDir)
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	})
+}
+
 func TestAnalyzeTokenUsageAICOnly(t *testing.T) {
 	t.Run("sums agent and detection usage artifact jsonl files", func(t *testing.T) {
 		tmpDir := testutil.TempDir(t, "analyze-token-usage-aic-only")
@@ -694,7 +814,7 @@ func TestTokenUsageSummaryMethods(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, string(encoded), "reasoning_tokens", "row JSON should preserve legacy shape")
 
-		rendered := console.RenderStruct(rows)
+		rendered := console.RenderStructStdout(rows)
 		assert.Contains(t, rendered, "Input", "row table should keep quartet columns")
 		assert.Contains(t, rendered, "Output", "row table should keep quartet columns")
 		assert.Contains(t, rendered, "Cache Read", "row table should keep quartet columns")
@@ -766,8 +886,10 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		eventsContent := strings.Join([]string{
 			`{"event":"token_steering","message":"[AWF TOKEN WARNING] You have used 80% of your AI Credits budget. Begin planning to wrap up your current work."}`,
 			`{"type":"token_steering","message":"[AWF TOKEN WARNING] You have used 90% of your AI Credits budget. Complete your current task and prepare final output."}`,
+			`{"event":"token_steering","payload":"opaque","message":"[AWF TOKEN WARNING] Still steering."}`,
 			`{"event_name":"timeout_steering","message":"[AWF TIME WARNING] You have used 80% of your allotted run time. Begin planning to wrap up your current work."}`,
 			`{"eventName":"timeout_steering","message":"[AWF TIME WARNING] You have used 90% of your allotted run time. Complete your current task and prepare final output."}`,
+			`{"payload":{"type":"model_steering"}}`,
 			`{"event":"request.forwarded"}`,
 			`{"event":"token_steering","message":"warn 95%"}`,
 			`{"event":"budget_steering","message":"[AWF TOKEN WARNING] non-spec event name"}`,
@@ -777,7 +899,13 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		summary, err := analyzeTokenUsage(tmpDir, false)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		assert.Equal(t, 4, summary.TotalSteeringEvents, "should count spec-compliant steering events from api-proxy events.jsonl")
+		assert.Equal(t, 8, summary.TotalSteeringEvents, "should count all steering events from api-proxy events.jsonl")
+		assert.Equal(t, map[string]int{
+			"budget_steering":        1,
+			"model_steering":         1,
+			tokenSteeringEventName:   4,
+			timeoutSteeringEventName: 2,
+		}, summary.SteeringEventCounts, "should aggregate steering events by type")
 	})
 
 	t.Run("counts steering events from legacy firewall-audit-logs events file", func(t *testing.T) {
@@ -795,6 +923,41 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, summary)
 		assert.Equal(t, 1, summary.TotalSteeringEvents, "should count steering events from legacy events.jsonl")
+	})
+
+	t.Run("extracts gateway steering event details", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "extract-gateway-steering-events")
+		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
+		require.NoError(t, os.MkdirAll(logsDir, 0o755))
+		eventsContent := strings.Join([]string{
+			`{"timestamp":"2026-09-23T12:00:00Z","event":"token_steering","message":"[AWF TOKEN WARNING] You are running out of AI Credits."}`,
+			`{"timestamp":"2026-09-23T12:01:00Z","event_name":"timeout_steering","message":"[AWF TIME WARNING] You are running out of time."}`,
+			`{"event":"token_steering","payload":["opaque"],"message":"[AWF TOKEN WARNING] Still steering."}`,
+			`{"event":"token_steering","message":"wrong prefix"}`,
+		}, "\n")
+		require.NoError(t, os.WriteFile(filepath.Join(logsDir, "events.jsonl"), []byte(eventsContent+"\n"), 0o644))
+
+		events, err := extractGatewaySteeringEvents(tmpDir)
+
+		require.NoError(t, err)
+		require.Len(t, events, 3)
+		assert.Equal(t, GatewaySteeringEvent{
+			Type:      tokenSteeringEventName,
+			Message:   "[AWF TOKEN WARNING] You are running out of AI Credits.",
+			Timestamp: "2026-09-23T12:00:00Z",
+		}, events[0])
+		assert.Equal(t, timeoutSteeringEventName, events[1].Type)
+		assert.Contains(t, events[1].Message, "running out of time")
+		assert.Equal(t, tokenSteeringEventName, events[2].Type)
+	})
+
+	t.Run("returns nil when no events file exists", func(t *testing.T) {
+		tmpDir := testutil.TempDir(t, "extract-gateway-steering-events-missing")
+
+		events, err := extractGatewaySteeringEvents(tmpDir)
+
+		require.NoError(t, err)
+		assert.Nil(t, events)
 	})
 
 	t.Run("falls back to agent_usage.json when token-usage.jsonl is missing", func(t *testing.T) {
@@ -844,7 +1007,7 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		require.Contains(t, summary.ByModel, "unknown", "unknown model bucket should be present")
 	})
 
-	t.Run("records requested sub-agent models and mismatch when token logs do not show requested model", func(t *testing.T) {
+	t.Run("does not infer sub-agent models from agent stdio", func(t *testing.T) {
 		tmpDir := testutil.TempDir(t, "analyze-subagent-model-mismatch")
 		logsDir := filepath.Join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs")
 		require.NoError(t, os.MkdirAll(logsDir, 0o755))
@@ -860,18 +1023,10 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		summary, err := analyzeTokenUsage(tmpDir, false)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		require.Len(t, summary.SubagentModelRequests, 3)
-		require.Len(t, summary.SubagentModelActuals, 1)
-		assert.Equal(t, 3, summary.MismatchCount)
-		assert.Equal(t, "claude-sonnet-4-6", summary.SubagentModelActuals[0].Model)
-		require.Contains(t, summary.Warnings, subagentStdioWarning)
-
-		for _, req := range summary.SubagentModelRequests {
-			assert.Equal(t, "claude-haiku-4.5", req.RequestedModel)
-			assert.Equal(t, 1, req.InvocationCount)
-			assert.Equal(t, "claude-sonnet-4-6", req.EffectiveModel)
-			assert.Equal(t, modelMismatchReasonModelNotObserved, req.ReasonCode)
-		}
+		require.Empty(t, summary.SubagentModelRequests)
+		require.Empty(t, summary.SubagentModelActuals)
+		assert.Zero(t, summary.MismatchCount)
+		require.Empty(t, summary.Warnings)
 	})
 
 	t.Run("records token-usage-missing reason when sub-agent model request is present but no model actuals exist", func(t *testing.T) {
@@ -882,12 +1037,10 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		summary, err := analyzeTokenUsage(tmpDir, false)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		require.Len(t, summary.SubagentModelRequests, 1)
+		require.Empty(t, summary.SubagentModelRequests)
 		assert.Empty(t, summary.SubagentModelActuals)
-		assert.Equal(t, 1, summary.MismatchCount)
-		assert.Equal(t, modelMismatchReasonTokenUsageMissing, summary.SubagentModelRequests[0].ReasonCode)
-		assert.Empty(t, summary.SubagentModelRequests[0].EffectiveModel)
-		require.Contains(t, summary.Warnings, subagentStdioWarning)
+		assert.Zero(t, summary.MismatchCount)
+		require.Empty(t, summary.Warnings)
 	})
 
 	t.Run("falls back to agent_usage.json in usage subdir when token_usage.jsonl is empty", func(t *testing.T) {
@@ -929,12 +1082,9 @@ func TestAnalyzeTokenUsage(t *testing.T) {
 		summary, err := analyzeTokenUsage(tmpDir, false)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		require.Len(t, summary.SubagentModelRequests, 1)
-		assert.Equal(t, "small", summary.SubagentModelRequests[0].RequestedModel)
-		assert.Equal(t, "gpt-5-mini", summary.SubagentModelRequests[0].EffectiveModel)
-		assert.Equal(t, modelMismatchReasonModelNotObserved, summary.SubagentModelRequests[0].ReasonCode)
-		assert.Equal(t, 1, summary.MismatchCount)
-		require.Contains(t, summary.Warnings, subagentStdioWarning)
+		require.Empty(t, summary.SubagentModelRequests)
+		assert.Zero(t, summary.MismatchCount)
+		require.Empty(t, summary.Warnings)
 	})
 }
 

@@ -274,54 +274,6 @@ func TestEmitGeneralToolWarningsCloudHypervisorDoesNotWarn(t *testing.T) {
 	assert.Zero(t, compiler.GetWarningCount())
 }
 
-func TestEmitGeneralToolWarningsDeprecatedSandboxRuntimes(t *testing.T) {
-	tests := []struct {
-		name            string
-		agent           *AgentSandboxConfig
-		expectedMessage string
-	}{
-		{
-			name:            "gvisor runtime",
-			agent:           &AgentSandboxConfig{Runtime: AgentRuntimeGVisor},
-			expectedMessage: "sandbox.agent.runtime: gvisor is deprecated and will be removed in a future release",
-		},
-		{
-			name:            "docker-sbx runtime",
-			agent:           &AgentSandboxConfig{Runtime: AgentRuntimeDockerSbx},
-			expectedMessage: "sandbox.agent.runtime: docker-sbx is deprecated and will be removed in a future release",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			compiler := NewCompiler()
-			workflowData := &WorkflowData{
-				SandboxConfig: &SandboxConfig{Agent: tt.agent},
-			}
-
-			oldStderr := os.Stderr
-			r, w, err := os.Pipe()
-			require.NoError(t, err)
-			os.Stderr = w
-			t.Cleanup(func() {
-				os.Stderr = oldStderr
-				_ = r.Close()
-			})
-
-			compiler.emitGeneralToolWarnings(workflowData, "test.md")
-
-			require.NoError(t, w.Close())
-			os.Stderr = oldStderr
-
-			var buf bytes.Buffer
-			_, err = io.Copy(&buf, r)
-			require.NoError(t, err)
-			assert.Contains(t, buf.String(), tt.expectedMessage)
-			assert.Equal(t, 1, compiler.GetWarningCount())
-		})
-	}
-}
-
 func TestEmitGeneralToolWarningsIgnoredFilesystemAllowWrite(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -329,12 +281,11 @@ func TestEmitGeneralToolWarningsIgnoredFilesystemAllowWrite(t *testing.T) {
 		expectWarning bool
 	}{
 		{name: "docker runtime warns", runtime: AgentRuntimeDocker, expectWarning: true},
-		{name: "gvisor runtime warns", runtime: AgentRuntimeGVisor, expectWarning: true},
 		{name: "default runtime warns", runtime: "", expectWarning: true},
 		{name: "cloud-hypervisor runtime does not warn", runtime: AgentRuntimeCloudHypervisor, expectWarning: false},
 	}
 
-	const expectedMessage = "sandbox.agent.config.filesystem.allowWrite is ignored for this runtime"
+	const expectedMessage = "sandbox.agent.config.filesystem.allow-write is ignored for this runtime"
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -792,7 +743,7 @@ func TestEmitGeneralToolWarnings_PiThreatDetectionAuthWarning(t *testing.T) {
 			},
 		},
 		{
-			name: "does not warn with explicit Copilot token",
+			name: "warns when token is configured only on the main Pi engine",
 			data: &WorkflowData{
 				AI: "pi",
 				EngineConfig: &EngineConfig{
@@ -804,6 +755,25 @@ func TestEmitGeneralToolWarnings_PiThreatDetectionAuthWarning(t *testing.T) {
 				Permissions: "permissions:\n  contents: read\n",
 				SafeOutputs: &SafeOutputsConfig{
 					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+			wantWarning: true,
+		},
+		{
+			name: "does not warn with explicit detection Copilot token",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{
+						EngineConfig: &EngineConfig{
+							ID: "copilot",
+							Env: map[string]string{
+								"COPILOT_GITHUB_TOKEN": "${{ secrets.DETECTION_COPILOT_TOKEN }}",
+							},
+						},
+					},
 				},
 			},
 		},

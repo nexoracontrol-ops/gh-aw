@@ -57,6 +57,134 @@ func TestResolveAWFContainerAgentTimeoutMinutes(t *testing.T) {
 	})
 }
 
+func TestBuildAWFConfigJSON_HostedWebPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		engine     string
+		runtime    string
+		network    *NetworkPermissions
+		wantPolicy map[string]any
+	}{
+		{
+			name:   "Claude allowlist",
+			engine: "claude",
+			network: &NetworkPermissions{
+				HostedWeb: &HostedWebPolicy{
+					Enabled: true,
+					Allowed: []string{"docs.github.com"},
+					MaxUses: 5,
+				},
+			},
+			wantPolicy: map[string]any{
+				"claude": map[string]any{
+					"enabled":        true,
+					"allowedDomains": []any{"docs.github.com"},
+					"maxUses":        float64(5),
+				},
+			},
+		},
+		{
+			name:   "Codex blocklist",
+			engine: "codex",
+			network: &NetworkPermissions{
+				HostedWeb: &HostedWebPolicy{
+					Enabled: true,
+					Blocked: []string{"example.com"},
+				},
+			},
+			wantPolicy: map[string]any{
+				"codex": map[string]any{
+					"enabled":        true,
+					"blockedDomains": []any{"example.com"},
+				},
+			},
+		},
+		{
+			name:   "Network policy defaults to deny",
+			engine: "claude",
+			network: &NetworkPermissions{
+				ExplicitlyDefined: true,
+			},
+			wantPolicy: map[string]any{
+				"claude": map[string]any{
+					"enabled": false,
+				},
+			},
+		},
+		{
+			name:    "Custom engine uses resolved Codex runtime",
+			engine:  "my-codex-wrapper",
+			runtime: "codex",
+			network: &NetworkPermissions{
+				HostedWeb: &HostedWebPolicy{
+					Enabled: true,
+					Allowed: []string{"docs.github.com"},
+				},
+			},
+			wantPolicy: map[string]any{
+				"codex": map[string]any{
+					"enabled":        true,
+					"allowedDomains": []any{"docs.github.com"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jsonStr, err := BuildAWFConfigJSON(AWFCommandConfig{
+				EngineName:      tt.engine,
+				EngineRuntimeID: tt.runtime,
+				WorkflowData: &WorkflowData{
+					EngineConfig:       &EngineConfig{ID: tt.engine},
+					NetworkPermissions: tt.network,
+				},
+			})
+			require.NoError(t, err)
+
+			var config map[string]any
+			require.NoError(t, json.Unmarshal([]byte(jsonStr), &config))
+			assert.Equal(t, tt.wantPolicy, config["apiProxy"].(map[string]any)["hostedWeb"])
+			require.NoError(t, validateAWFConfigJSON(jsonStr))
+		})
+	}
+}
+
+func TestBuildAWFConfigJSON_HostedWebSkippedForOlderAWF(t *testing.T) {
+	jsonStr, err := BuildAWFConfigJSON(AWFCommandConfig{
+		EngineName: "claude",
+		WorkflowData: &WorkflowData{
+			EngineConfig: &EngineConfig{ID: "claude"},
+			NetworkPermissions: &NetworkPermissions{
+				HostedWeb: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+				Firewall:  &FirewallConfig{Version: "v0.28.24"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var config map[string]any
+	require.NoError(t, json.Unmarshal([]byte(jsonStr), &config))
+	assert.NotContains(t, config["apiProxy"].(map[string]any), "hostedWeb")
+}
+
+func TestBuildAWFConfigJSON_HostedWebDoesNotInferUnrelatedPrefix(t *testing.T) {
+	jsonStr, err := BuildAWFConfigJSON(AWFCommandConfig{
+		EngineName: "codexbridge",
+		WorkflowData: &WorkflowData{
+			EngineConfig: &EngineConfig{ID: "codexbridge"},
+			NetworkPermissions: &NetworkPermissions{
+				HostedWeb: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var config map[string]any
+	require.NoError(t, json.Unmarshal([]byte(jsonStr), &config))
+	assert.NotContains(t, config["apiProxy"].(map[string]any), "hostedWeb")
+}
+
 // TestBuildAWFConfigJSON verifies that BuildAWFConfigJSON produces a valid JSON config
 // that contains the expected network, apiProxy, and container fields.
 func TestBuildAWFConfigJSON(t *testing.T) {
@@ -126,23 +254,6 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 		jsonStr, err := BuildAWFConfigJSON(config)
 		require.NoError(t, err)
 		assert.NotContains(t, jsonStr, `"platform":`, "platform should be absent when sandbox agent is disabled")
-	})
-
-	t.Run("enables sbx egress verification for docker-sbx", func(t *testing.T) {
-		config := AWFCommandConfig{
-			EngineName: "copilot",
-			WorkflowData: &WorkflowData{
-				NetworkPermissions: &NetworkPermissions{
-					Firewall: &FirewallConfig{Enabled: true},
-				},
-				SandboxConfig: &SandboxConfig{
-					Agent: &AgentSandboxConfig{Runtime: AgentRuntimeDockerSbx},
-				},
-			},
-		}
-		jsonStr, err := BuildAWFConfigJSON(config)
-		require.NoError(t, err)
-		assert.Contains(t, jsonStr, `"verifySbxEgress":true`)
 	})
 
 	t.Run("blocked domains are included in the network section", func(t *testing.T) {
@@ -216,8 +327,8 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 		assert.NotContains(t, jsonStr, `"filesystem"`)
 	})
 
-	t.Run("filesystem allowWrite is omitted for the compose runtimes", func(t *testing.T) {
-		for _, runtime := range []AgentRuntime{"", AgentRuntimeDocker, AgentRuntimeGVisor, AgentRuntimeDockerSbx} {
+	t.Run("filesystem allowWrite is omitted for the Docker runtimes", func(t *testing.T) {
+		for _, runtime := range []AgentRuntime{"", AgentRuntimeDocker, AgentRuntimeDockerSudoIptables} {
 			config := AWFCommandConfig{
 				EngineName: "copilot",
 				WorkflowData: &WorkflowData{
@@ -2012,16 +2123,6 @@ func TestValidateAWFConfigJSON_AllowsFilesystemAllowWrite(t *testing.T) {
 	require.NoError(t, err, "filesystem.allowWrite should pass AWF config schema validation")
 }
 
-func TestValidateAWFConfigJSON_AllowsSbxContainerRuntime(t *testing.T) {
-	err := validateAWFConfigJSON(`{"container":{"containerRuntime":"sbx"}}`)
-	require.NoError(t, err, "container.containerRuntime=sbx should pass compile-time schema validation")
-}
-
-func TestValidateAWFConfigJSON_AllowsGVisorContainerRuntime(t *testing.T) {
-	err := validateAWFConfigJSON(`{"container":{"containerRuntime":"gvisor"}}`)
-	require.NoError(t, err, "container.containerRuntime=gvisor should pass compile-time schema validation")
-}
-
 func TestValidateAWFConfigJSON_RejectsUnknownContainerRuntime(t *testing.T) {
 	err := validateAWFConfigJSON(`{"container":{"containerRuntime":"runc"}}`)
 	require.Error(t, err, "container.containerRuntime must only accept enum values; unknown runtime \"runc\" should be rejected")
@@ -2040,6 +2141,34 @@ func TestValidateAWFConfigJSON_AllowsDefaultAiCreditsPricingNonZero(t *testing.T
 func TestValidateAWFConfigJSON_AllowsDefaultAiCreditsPricingCachedFields(t *testing.T) {
 	err := validateAWFConfigJSON(`{"apiProxy":{"enabled":true,"maxRuns":500,"defaultAiCreditsPricing":{"input":3,"output":15,"cachedInput":0.3,"cacheWrite":3}}}`)
 	require.NoError(t, err, "apiProxy.defaultAiCreditsPricing should allow cachedInput and cacheWrite fields")
+}
+
+func TestValidateAWFConfigJSON_GitHubAPIPointBudgets(t *testing.T) {
+	err := validateAWFConfigJSON(`{"rateLimiting":{"maxGithubApiPointsRest":2000,"maxGithubApiPointsGraphql":1500}}`)
+	require.NoError(t, err, "the upstream schema leaves the security.difcProxy.host dependency to AWF runtime validation")
+
+	for _, field := range []string{"maxGithubApiPointsRest", "maxGithubApiPointsGraphql"} {
+		t.Run(field+" rejects zero", func(t *testing.T) {
+			err := validateAWFConfigJSON(`{"rateLimiting":{"` + field + `":0}}`)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), field)
+		})
+	}
+}
+
+func TestValidateAWFConfigJSON_ModelRoutingGate(t *testing.T) {
+	routing := `"apiProxy":{"routing":{"objective":{"goal":"cost","mode":"balanced"},"task":{"conversationFile":"/tmp/gh-aw/routing-conversation.json"}}}`
+
+	require.NoError(t, validateAWFConfigJSON(`{"experimental":{"modelRouting":true},`+routing+`}`))
+	require.NoError(t, validateAWFConfigJSON(`{"experimental":{"modelRouting":true}}`))
+
+	err := validateAWFConfigJSON(`{` + routing + `}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "experimental")
+
+	err = validateAWFConfigJSON(`{"experimental":{"modelRouting":false},` + routing + `}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "modelRouting")
 }
 
 // TestBuildAWFConfigJSON_ValidateFlag verifies that schema validation runs when
@@ -2624,6 +2753,54 @@ func TestIntersectModelPolicyRules_EmptyLocalUsesOverride(t *testing.T) {
 func TestIntersectModelPolicyRules_OverlapOnly(t *testing.T) {
 	got := intersectModelPolicyRules([]string{"gpt-5", "claude-sonnet"}, []string{"gemini-pro", "gpt-5"})
 	assert.Equal(t, []string{"gpt-5"}, got)
+}
+
+func TestUnionModelPolicyRules(t *testing.T) {
+	tests := []struct {
+		name     string
+		local    []string
+		override []string
+		want     []string
+	}{
+		{name: "both empty", want: []string{}},
+		{name: "empty override", local: []string{"gpt-5", "gpt-5"}, want: []string{"gpt-5"}},
+		{name: "empty local", override: []string{"claude-opus", "claude-opus"}, want: []string{"claude-opus"}},
+		{
+			name:     "deduplicates and preserves first occurrence order",
+			local:    []string{"gpt-5", "claude-opus", "gpt-5"},
+			override: []string{"claude-opus", "gemini-pro", "gemini-pro", "gpt-5-pro"},
+			want:     []string{"gpt-5", "claude-opus", "gemini-pro", "gpt-5-pro"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localBefore := append([]string(nil), tt.local...)
+			overrideBefore := append([]string(nil), tt.override...)
+			got := unionModelPolicyRules(tt.local, tt.override)
+			assert.Equal(t, tt.want, got)
+			if len(got) > 0 {
+				got[0] = "changed"
+			}
+			assert.Equal(t, localBefore, tt.local)
+			assert.Equal(t, overrideBefore, tt.override)
+		})
+	}
+}
+
+func TestUnionModelPolicyRules_DuplicateHeavyInputs(t *testing.T) {
+	local := make([]string, 10000)
+	override := make([]string, 10000)
+	for i := range local {
+		local[i] = "gpt-5"
+		override[i] = "claude-opus"
+	}
+	override[len(override)-1] = "gpt-5"
+
+	got := unionModelPolicyRules(local, override)
+	assert.Equal(t, []string{"gpt-5", "claude-opus"}, got)
+	// Output capacity should grow with unique rules, not combined input lengths.
+	assert.Less(t, cap(got), len(local))
 }
 
 func TestBuildAWFConfigJSON_ModelPolicyConflictDisallowedWins(t *testing.T) {

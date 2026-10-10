@@ -77,6 +77,8 @@ type PinContext struct {
 	// Warnings is a shared map for deduplicating warning messages.
 	// Keys are cache keys in the form "repo@version".
 	Warnings map[string]bool
+	// SourceVersions holds inline version comments for already-pinned steps, keyed by repo@SHA.
+	SourceVersions map[string]string
 	// RecordResolutionFailure receives unresolved pinning failures for auditing.
 	RecordResolutionFailure func(f ResolutionFailure)
 	// SkipHardcodedFallback skips version→SHA hardcoded fallback when dynamic
@@ -90,6 +92,9 @@ type PinContext struct {
 	// repository@version references before pin resolution. Keys and values use
 	// the format "owner/repo@ref". Set from aw.json action_pins.
 	Mappings map[string]string
+	// PrefixMappings rewrites the repository of a resolved pin without changing
+	// its SHA or version. Exact Mappings take precedence.
+	PrefixMappings map[string]string
 	// ContainerMappings redirects container image references to replacement
 	// image references before pin resolution. Keys are source image references
 	// (e.g. "ghcr.io/owner/image:tag") and values are replacement image

@@ -18,10 +18,10 @@ env:
   GH_AW_HARNESS_MAX_RETRIES: "4"
 tracker-id: avenger-ci
 max-turns: 50
-model: openai/gpt-5.3-codex
+model: copilot/gpt-6-astra
 engine:
-  id: codex
-  model-provider: openai
+  id: copilot
+  model-provider: github
 network:
   allowed:
     - defaults
@@ -30,17 +30,15 @@ tools:
   cli-proxy: true
   github:
     mode: local
-    toolsets: [default]
+    toolsets: [default, actions]
   bash: ["*"]
   edit:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
     mounts:
       - "/usr/bin/make:/usr/bin/make:ro"
       - "/usr/local/bin/node:/usr/local/bin/node:ro"
-      - "/usr/local/bin/npm:/usr/local/bin/npm:ro"
       - "/usr/local/lib/node_modules:/usr/local/lib/node_modules:ro"
       - "/opt/hostedtoolcache/go:/opt/hostedtoolcache/go:ro"
 if: needs.check_ci_status.outputs.ci_needs_fix == 'true'
@@ -159,9 +157,7 @@ Before doing anything:
 1. **If CI Status is "success"**: CI was passing at activation time — call `noop` immediately with "CI is passing on main branch - no cleanup needed" and **stop**.
 2. **If CI Status is "failure"**: Proceed with the repair sequence below using the CI Run ID from the pre-check.
 3. **If CI Status is missing or ambiguous**: Re-verify using the live API:
-   ```bash
-   gh run list --workflow=ci.yml --branch=main --limit=2 --json conclusion,status,databaseId
-   ```
+   use the GitHub Actions MCP tools to list completed runs for `ci.yml` on `main`; do not use `gh run list`.
    - **If both completed runs are "success"**: CI has self-healed. Call `noop` and **stop**.
    - **Otherwise**: Proceed with the repair sequence below.
 
@@ -195,16 +191,17 @@ git diff --name-only HEAD origin/main | grep '^\.github/workflows/.*\.md$'
 
 ## Step 3: Inspect the failing CI run first (mandatory)
 
-Use the CI Run ID from pre-check and identify the first failed job and failing signal before running any local validation:
+Use the GitHub Actions MCP tools, not `gh run view` (the agent's `gh` CLI is unauthenticated), and identify the first failed job and failing signal before running any local validation:
 
-```bash
-gh run view "${{ needs.check_ci_status.outputs.ci_run_id }}" --json jobs
-```
+1. Call `actions_list` with `method: list_workflow_jobs` and `resource_id` set to the CI Run ID from pre-check.
+2. Identify the first failed job.
+3. Call `get_job_logs` with that job's ID and inspect the failing output.
 
 Then inspect only the failing job logs and extract the concrete failure category (formatting, lint, tests, wasm golden, compile, or other).
 
 - If the failure is not actionable or is clearly infra/transient (network outage, rate limit, runner outage), call `noop` with a brief explanation and stop.
 - If actionable, apply the smallest fix that maps directly to the failure signal.
+- If an Actions tool is unavailable, keep the denial text and name the exact allowlist entry needed: add `actions` to `tools.github.toolsets`.
 
 ## Step 4: Format sources (only when relevant)
 

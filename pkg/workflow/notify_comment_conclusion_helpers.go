@@ -3,13 +3,33 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
+
+const conclusionWorkQueueActivationArtifactDir = "${{ runner.temp }}/gh-aw-activation"
+
+func buildDetectionNoVerdictCondition() ConditionNode {
+	job := "needs." + string(constants.DetectionJobName)
+	reason := BuildPropertyAccess(job + ".outputs.detection_reason")
+	return BuildAnd(
+		BuildNotEquals(BuildPropertyAccess(job+".result"), BuildStringLiteral("skipped")),
+		BuildOr(
+			BuildEquals(reason, BuildStringLiteral("agent_failure")),
+			BuildOr(
+				BuildEquals(reason, BuildStringLiteral("parse_error")),
+				BuildEquals(BuildPropertyAccess(job+".outputs.detection_conclusion"), BuildStringLiteral("")),
+			),
+		),
+	)
+}
 
 // buildConclusionSetupSteps extracts the common setup, token minting, and artifact steps.
 func (c *Compiler) buildConclusionSetupSteps(data *WorkflowData) []string {
@@ -25,7 +45,7 @@ func (c *Compiler) buildConclusionSetupSteps(data *WorkflowData) []string {
 		// Conclusion/notify job depends on activation, reuse its trace ID
 		notifyTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		notifyParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, notifyTraceID, notifyParentSpanID)...)
+		steps = append(steps, c.generateSetupStepForJob("conclusion", data, setupActionRef, SetupActionDestination, false, notifyTraceID, notifyParentSpanID, "")...)
 	}
 
 	// Add GitHub App token minting step if app is configured
@@ -33,9 +53,10 @@ func (c *Compiler) buildConclusionSetupSteps(data *WorkflowData) []string {
 		permissions := ComputePermissionsForSafeOutputs(data.SafeOutputs)
 		var appTokenFallbackRepo string
 		if hasWorkflowCallTrigger(data.On) {
-			appTokenFallbackRepo = "${{ needs.activation.outputs.target_repo_name }}"
+			appTokenFallbackRepo = activationTargetRepoNameExpr
 		}
 		steps = append(steps, c.buildGitHubAppTokenMintStepForRepository(
+			"conclusion",
 			data.SafeOutputs.GitHubApp,
 			permissions,
 			appTokenFallbackRepo,
@@ -52,10 +73,39 @@ func (c *Compiler) buildConclusionSetupSteps(data *WorkflowData) []string {
 	// expects, letting detection-phase usage surface in the usage artifact and count toward
 	// the AI-credits budget cap (see gh-aw#54047).
 	if IsDetectionJobEnabled(data.SafeOutputs) {
+		steps = append(steps,
+			"      - name: Warn if threat detection produced no verdict\n",
+			fmt.Sprintf("        if: %s\n", RenderCondition(BuildAnd(BuildFunctionCall("always"), buildDetectionNoVerdictCondition()))),
+			"        run: echo \"::warning::Threat detection produced no security verdict. Review the detection job logs before trusting the agent outputs.\"\n",
+		)
 		steps = append(steps, buildDetectionArtifactDownloadSteps(artifactPrefixExprForDownstreamJob(data), c.getActionPin)...)
 	}
-	steps = append(steps, buildUsageArtifactUploadSteps(artifactPrefixExprForDownstreamJob(data), data.Evals != nil && data.Evals.HasEvals(), c.getActionPin)...)
+	steps = append(steps, buildUsageArtifactInputDownloadSteps(artifactPrefixExprForDownstreamJob(data), data.Evals != nil && data.Evals.HasEvals(), usageExperimentArtifactName(data), c.getActionPin)...)
 	return steps
+}
+
+func (c *Compiler) buildConclusionWorkQueueSummaryStep(data *WorkflowData) []string {
+	if !isWorkQueueEnabled(data) {
+		return nil
+	}
+	steps := buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName: artifactPrefixExprForDownstreamJob(data) + constants.ActivationArtifactName.String(),
+		DownloadPath: conclusionWorkQueueActivationArtifactDir,
+		StepName:     "Download activation artifact for work queue summary",
+		IfCondition:  "always()",
+	}, c.getActionPin)
+	steps = append(steps,
+		"      - name: Summarize work queue activity\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/github-script")),
+	)
+	return append(steps,
+		"        with:\n",
+		"          script: |\n",
+		"            const { main } = require('${{ runner.temp }}/gh-aw/actions/work_queue_summary.cjs');\n",
+		fmt.Sprintf("            await main({ core, githubClient: github, context, snapshotPath: '%s' });\n", path.Join(conclusionWorkQueueActivationArtifactDir, "work-queue.snapshot.json")),
+	)
 }
 
 // buildConclusionNoOpStep builds the merged no-op handler step.
@@ -69,6 +119,7 @@ func (c *Compiler) buildConclusionNoOpStep(data *WorkflowData, mainJobName strin
 	var envVars []string
 	envVars = append(envVars, buildTemplatableIntEnvVar("GH_AW_NOOP_MAX", data.SafeOutputs.NoOp.Max)...)
 	envVars = append(envVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
+	envVars = append(envVars, buildEngineMetadataEnvVars(data.EngineConfig, data.Model)...)
 	envVars = append(envVars, "          GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n")
 	envVars = append(envVars, fmt.Sprintf("          GH_AW_AGENT_CONCLUSION: ${{ needs.%s.result }}\n", mainJobName))
 	envVars = append(envVars, buildTemplatableBoolEnvVar("GH_AW_NOOP_REPORT_AS_ISSUE", data.SafeOutputs.NoOp.ReportAsIssue)...)
@@ -149,6 +200,7 @@ func (c *Compiler) buildConclusionMissingToolStep(data *WorkflowData, mainJobNam
 		}
 	}
 	envVars = append(envVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
+	envVars = append(envVars, buildEngineMetadataEnvVars(data.EngineConfig, data.Model)...)
 	return c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
 		StepName:      "Record missing tool",
 		StepID:        "missing_tool",
@@ -178,6 +230,7 @@ func (c *Compiler) buildConclusionReportIncompleteStep(data *WorkflowData, mainJ
 		}
 	}
 	envVars = append(envVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
+	envVars = append(envVars, buildEngineMetadataEnvVars(data.EngineConfig, data.Model)...)
 	return c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
 		StepName:      "Record incomplete",
 		StepID:        "report_incomplete",
@@ -210,6 +263,7 @@ func (c *Compiler) buildAgentFailureCoreVars(data *WorkflowData, mainJobName str
 	envVars = append(envVars, "          GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n")
 	envVars = append(envVars, fmt.Sprintf("          GH_AW_AGENT_CONCLUSION: ${{ needs.%s.result }}\n", mainJobName))
 	envVars = append(envVars, fmt.Sprintf("          GH_AW_WORKFLOW_ID: %q\n", data.WorkflowID))
+	envVars = append(envVars, buildModelRoutingOutputEnvVars(data.EngineConfig, mainJobName)...)
 
 	expiresHours := DefaultActionFailureIssueExpiresHours
 	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailureAsIssue != nil && data.SafeOutputs.ReportFailureAsIssue.String() == "false" {
@@ -237,9 +291,6 @@ func (c *Compiler) buildAgentFailureCoreVars(data *WorkflowData, mainJobName str
 				envVars = append(envVars, fmt.Sprintf("          GH_AW_ENGINE_SECRET_FAILURE_MESSAGE: %q\n", msg))
 			}
 		}
-	}
-	if isDockerSbxRuntime(data) {
-		envVars = append(envVars, fmt.Sprintf("          GH_AW_DOCKER_SBX_SECRETS_RESULT: ${{ needs.%s.outputs.docker_sbx_secrets_result }}\n", constants.ActivationJobName))
 	}
 	if ShouldGeneratePRCheckoutStep(data) {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_CHECKOUT_PR_SUCCESS: ${{ needs.%s.outputs.checkout_pr_success }}\n", mainJobName))
@@ -334,7 +385,9 @@ func buildAgentFailureActivationStatusVars(data *WorkflowData) []string {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS: ${{ needs.%s.outputs.daily_ai_credits_guardrail_status }}\n", constants.ActivationJobName))
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_GUARDRAIL_ERROR: ${{ needs.%s.outputs.daily_ai_credits_guardrail_error }}\n", constants.ActivationJobName))
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_TOTAL: ${{ needs.%s.outputs.daily_ai_credits_total }}\n", constants.ActivationJobName))
+		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_ESTIMATED: ${{ needs.%s.outputs.daily_ai_credits_estimated }}\n", constants.ActivationJobName))
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_THRESHOLD: ${{ needs.%s.outputs.daily_ai_credits_threshold }}\n", constants.ActivationJobName))
+		envVars = append(envVars, fmt.Sprintf("          GH_AW_DAILY_AI_CREDITS_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(data.MaxDailyAICContinueOnError)))
 	}
 	return envVars
 }
@@ -412,6 +465,13 @@ func buildAgentFailureCacheMemoryVars(data *WorkflowData, mainJobName string) []
 	var envVars []string
 	if data.SafeOutputs.FailureIssueRepo != "" {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_FAILURE_ISSUE_REPO: %q\n", data.SafeOutputs.FailureIssueRepo))
+		// SEC-005: a literal "owner/repo" written in the frontmatter is trusted
+		// compile-time configuration. Values built from GitHub Actions expressions are
+		// resolved at runtime from caller-controlled data (e.g. reusable-workflow inputs),
+		// so flag them for allowlist validation by the failure-reporting scripts.
+		if hasExpressionMarker(data.SafeOutputs.FailureIssueRepo) {
+			envVars = append(envVars, "          GH_AW_FAILURE_ISSUE_REPO_FROM_EXPRESSION: \"true\"\n")
+		}
 	}
 	if timeoutValue := strings.TrimPrefix(data.TimeoutMinutes, "timeout-minutes: "); timeoutValue != "" {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_TIMEOUT_MINUTES: %q\n", timeoutValue))
@@ -436,6 +496,7 @@ func (c *Compiler) buildAgentFailureStep(data *WorkflowData, mainJobName, messag
 	if err != nil {
 		return nil, err
 	}
+	envVars = append(envVars, fmt.Sprintf("          GH_AW_DEFAULT_CHECKOUT_USES_TRIGGER_REF: %q\n", strconv.FormatBool(c.defaultCheckoutUsesTriggerRef(data))))
 	envVars = append(envVars, buildAgentFailureEngineDetectionVars(engine, data, mainJobName)...)
 	envVars = append(envVars, buildAgentFailureActivationStatusVars(data)...)
 	if messagesJSON != "" {
@@ -456,6 +517,15 @@ func (c *Compiler) buildAgentFailureStep(data *WorkflowData, mainJobName, messag
 	}), nil
 }
 
+func (c *Compiler) defaultCheckoutUsesTriggerRef(data *WorkflowData) bool {
+	if c.trialMode || !c.shouldAddCheckoutStep(data) {
+		return false
+	}
+	checkoutMgr := NewCheckoutManager(data.CheckoutConfigs)
+	override := checkoutMgr.GetDefaultCheckoutOverride()
+	return override == nil || (!override.key.wiki && override.key.repository == "" && override.ref == "")
+}
+
 // buildConclusionScriptEnvVars builds environment variables for the completion status script.
 func (c *Compiler) buildConclusionScriptEnvVars(data *WorkflowData, mainJobName string, safeOutputJobNames []string, messagesJSON string) []string {
 	// Build environment variables for the conclusion script
@@ -468,6 +538,7 @@ func (c *Compiler) buildConclusionScriptEnvVars(data *WorkflowData, mainJobName 
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_TRACKER_ID: %q\n", data.TrackerID))
 	}
 	envVars = append(envVars, fmt.Sprintf("          GH_AW_AGENT_CONCLUSION: ${{ needs.%s.result }}\n", mainJobName))
+	envVars = append(envVars, buildModelRoutingOutputEnvVars(data.EngineConfig, mainJobName)...)
 	if slices.Contains(safeOutputJobNames, string(constants.SafeOutputsJobName)) {
 		envVars = append(envVars, fmt.Sprintf("          GH_AW_SAFE_OUTPUTS_RESULT: ${{ needs.%s.result }}\n", constants.SafeOutputsJobName))
 		notifyCommentLog.Print("Added safe_outputs job result environment variable to conclusion job")
@@ -495,6 +566,9 @@ func (c *Compiler) buildConclusionScriptEnvVars(data *WorkflowData, mainJobName 
 
 // buildConclusionJobCondition builds the condition guarding the conclusion job.
 func (c *Compiler) buildConclusionJobCondition(data *WorkflowData, mainJobName string, safeOutputJobNames []string) ConditionNode {
+	if workQueueIssuesConfig(data) != nil && isWorkQueueParticipant(data) {
+		return BuildFunctionCall("always")
+	}
 	// Build the condition for this job:
 	// 1. always() - run even if agent fails
 	// 2. agent was activated (not skipped) OR an activation guardrail failed
@@ -513,10 +587,6 @@ func (c *Compiler) buildConclusionJobCondition(data *WorkflowData, mainJobName s
 	if engine, err := c.getAgenticEngine(data.AI); err == nil && hasSecretValidationStep(engine, data) {
 		secretVerificationFailed := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.secret_verification_result", constants.ActivationJobName)), BuildStringLiteral("failed"))
 		activationGuardrailsFailed = BuildOr(activationGuardrailsFailed, secretVerificationFailed)
-	}
-	if isDockerSbxRuntime(data) {
-		dockerSbxSecretsFailed := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.docker_sbx_secrets_result", constants.ActivationJobName)), BuildStringLiteral("failed"))
-		activationGuardrailsFailed = BuildOr(activationGuardrailsFailed, dockerSbxSecretsFailed)
 	}
 	if hasMaxDailyAICGuardrail(data) {
 		dailyAICExceeded := BuildEquals(BuildPropertyAccess(fmt.Sprintf("needs.%s.outputs.daily_ai_credits_exceeded", constants.ActivationJobName)), BuildStringLiteral("true"))
@@ -542,7 +612,11 @@ func (c *Compiler) buildConclusionJobCondition(data *WorkflowData, mainJobName s
 	condition := BuildAnd(alwaysFunc, BuildOr(agentNotSkipped, activationGuardrailsFailed))
 
 	if slices.Contains(safeOutputJobNames, "add_comment") {
-		return BuildAnd(condition, &NotNode{Child: BuildPropertyAccess("needs.add_comment.outputs.comment_id")})
+		noComment := ConditionNode(&NotNode{Child: BuildPropertyAccess("needs.add_comment.outputs.comment_id")})
+		if IsDetectionJobEnabled(data.SafeOutputs) {
+			noComment = BuildOr(noComment, buildDetectionNoVerdictCondition())
+		}
+		return BuildAnd(condition, noComment)
 	}
 	return condition
 }
@@ -598,17 +672,23 @@ func (c *Compiler) buildConclusionJobConcurrency(data *WorkflowData) string {
 // buildConclusionReportFailedJobsStep builds the step that queries the workflow run's jobs,
 // identifies failed non-builtin jobs, and creates a failure issue for them.
 // Returns nil when report-failed-jobs is explicitly set to false.
-func (c *Compiler) buildConclusionReportFailedJobsStep(data *WorkflowData, mainJobName string) []string {
+func (c *Compiler) buildConclusionReportFailedJobsStep(data *WorkflowData, mainJobName string) ([]string, error) {
 	// Skip when explicitly disabled via frontmatter
-	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil && !*data.SafeOutputs.ReportFailedJobs {
+	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil && strings.EqualFold(strings.TrimSpace(data.SafeOutputs.ReportFailedJobs.String()), "false") {
 		notifyCommentLog.Print("Skipping report-failed-jobs step: disabled in frontmatter")
-		return nil
+		return nil, nil
+	}
+	displayNames, err := json.Marshal(buildFailedJobsDisplayNames(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize job display names for failed-job reporting: %w", err)
 	}
 	var envVars []string
 	envVars = append(envVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
 	envVars = append(envVars, "          GH_AW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n")
+	envVars = append(envVars, "          GH_AW_JOB_RESULTS: ${{ toJSON(needs) }}\n")
+	envVars = append(envVars, fmt.Sprintf("          GH_AW_JOB_DISPLAY_NAMES: %q\n", displayNames))
 	if data.SafeOutputs != nil && data.SafeOutputs.ReportFailedJobs != nil {
-		envVars = append(envVars, fmt.Sprintf("          GH_AW_REPORT_FAILED_JOBS: %q\n", strconv.FormatBool(*data.SafeOutputs.ReportFailedJobs)))
+		envVars = append(envVars, buildTemplatableBoolEnvVar("GH_AW_REPORT_FAILED_JOBS", templatableBoolPtrToStringPtr(data.SafeOutputs.ReportFailedJobs))...)
 	} else {
 		envVars = append(envVars, "          GH_AW_REPORT_FAILED_JOBS: \"true\"\n")
 	}
@@ -619,5 +699,25 @@ func (c *Compiler) buildConclusionReportFailedJobsStep(data *WorkflowData, mainJ
 		CustomEnvVars: envVars,
 		ScriptFile:    "report_failed_jobs.cjs",
 		StepCondition: "always()",
-	})
+	}), nil
+}
+
+func buildFailedJobsDisplayNames(data *WorkflowData) map[string]string {
+	names := maps.Clone(generatedJobNames)
+	// Dynamic names fall back to job IDs rather than being interpolated into JSON.
+	for id, value := range data.Jobs {
+		if config, ok := value.(map[string]any); ok {
+			if name, ok := config["name"].(string); ok && name != "" && !containsExpression(name) {
+				names[id] = name
+			}
+		}
+	}
+	if data.SafeOutputs != nil {
+		for id, config := range data.SafeOutputs.Jobs {
+			if config != nil && config.Name != "" && !containsExpression(config.Name) {
+				names[stringutil.NormalizeSafeOutputIdentifier(id)] = config.Name
+			}
+		}
+	}
+	return names
 }

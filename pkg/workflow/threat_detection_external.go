@@ -3,6 +3,8 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,15 +14,29 @@ import (
 )
 
 func (c *Compiler) buildPrepareDetectionEngineConfigForExternalDetectorStep(data *WorkflowData) []string {
-	if c.getExternalThreatDetectionEngineID(data) != "codex" {
+	engineID := c.getExternalThreatDetectionEngineID(data)
+	if engineID != "codex" {
+		if threatLog.Enabled() {
+			threatLog.Printf("Skipping Codex config preparation: detection engine is %q", engineID)
+		}
 		return nil
 	}
+	threatLog.Print("Preparing Codex config for external threat-detect")
 
 	const emptyMCPServersJSON = `{"mcpServers":{}}`
 	shellCodexConfigPath := constants.ShellMcpConfigDir + "/config.toml"
 	codexHomeConfigPath := constants.TmpMcpConfigDir + "/config.toml"
+	codexHomeDir := constants.TmpMcpConfigDir
+	codexLogsDir := constants.TmpMcpConfigLogsDir
+	if isArcDindTopology(data) {
+		// Stage Codex's writable home with the detector inputs; the runner's
+		// private /tmp/mcp-config is not visible to the DinD daemon.
+		codexHomeDir = constants.ThreatDetectionDir + "/codex-home"
+		codexHomeConfigPath = path.Join(codexHomeDir, "config.toml")
+		codexLogsDir = path.Join(codexHomeDir, "logs")
+	}
 	detectionData := buildExternalDetectorWorkflowData(data, "codex")
-	detectionData.Model = inheritedDetectionModel(data)
+	detectionData.Model = inheritedDetectionModel(data, engineID)
 	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.Model != "" {
 		detectionData.Model = data.SafeOutputs.ThreatDetection.Model
 	}
@@ -38,7 +54,7 @@ func (c *Compiler) buildPrepareDetectionEngineConfigForExternalDetectorStep(data
 		"      - name: Prepare Codex config for threat-detect\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 		"        run: |\n",
-		fmt.Sprintf("          mkdir -p %q %q %q\n", constants.ShellMcpConfigDir, constants.TmpMcpConfigDir, constants.TmpMcpConfigLogsDir),
+		fmt.Sprintf("          mkdir -p %q %q %q\n", constants.ShellMcpConfigDir, codexHomeDir, codexLogsDir),
 		fmt.Sprintf("          printf '%%s\\n' %q > %q\n", emptyMCPServersJSON, constants.ShellMcpServersJsonPath),
 		"          # Point Codex at the AWF OpenAI proxy and disable websocket startup.\n",
 		fmt.Sprintf("          cat > %q << %s\n", shellCodexConfigPath, codexConfigDelimiter), //nolint:generatedyamlheredoc // Legacy detector config rendering remains to be migrated.
@@ -100,23 +116,37 @@ func buildThreatDetectionWorkflowData(data *WorkflowData, engineID string) *Work
 	}
 
 	detectionData := &WorkflowData{
-		AI:                engineID,
-		ActionCache:       data.ActionCache,
-		Features:          data.Features,
-		Jobs:              data.Jobs,
-		Permissions:       data.Permissions,
-		ParsedFrontmatter: data.ParsedFrontmatter,
-		CachedPermissions: data.CachedPermissions,
-		ModelCosts:        data.ModelCosts,
-		IsDetectionRun:    true,
-		RunnerConfig:      data.RunnerConfig,
-		TimeoutMinutes:    "timeout-minutes: " + resolveDetectionJobTimeoutValue(data),
-		CompiledVersion:   data.CompiledVersion,
+		AI:                   engineID,
+		ActionCache:          data.ActionCache,
+		Features:             data.Features,
+		Jobs:                 data.Jobs,
+		Permissions:          data.Permissions,
+		ParsedFrontmatter:    data.ParsedFrontmatter,
+		CachedPermissions:    data.CachedPermissions,
+		ModelCosts:           data.ModelCosts,
+		IsDetectionRun:       true,
+		RunnerConfig:         data.RunnerConfig,
+		TimeoutMinutes:       "timeout-minutes: " + resolveDetectionJobTimeoutValue(data),
+		CompiledVersion:      data.CompiledVersion,
+		ContainerPinMappings: maps.Clone(data.ContainerPinMappings),
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				Type: SandboxTypeAWF,
+				Type:   SandboxTypeAWF,
+				Images: maps.Clone(getSandboxAgentImages(data)),
 			},
 		},
+	}
+	if isOTLPEnabled(data) {
+		detectionData.ExcludedEnv = append(detectionData.ExcludedEnv, otlpSandboxExcludedEnvVarNames...)
+	}
+	delete(detectionData.SandboxConfig.Agent.Images, awfImageRoleRouter)
+	if ResolveEngineID(data) == engineID {
+		detectionData.ModelMappings = data.ModelMappings
+	} else {
+		detectionData.ModelMappings = MergeImportedModelAliases(nil, nil)
+	}
+	if pullPolicy := dockerImagePullPolicy(data); pullPolicy != "" {
+		detectionData.RawFrontmatter = map[string]any{"docker-image-pull-policy": pullPolicy}
 	}
 
 	if firewallConfig := getFirewallConfig(data); firewallConfig != nil {
@@ -130,8 +160,40 @@ func buildThreatDetectionWorkflowData(data *WorkflowData, engineID string) *Work
 		}
 		detectionData.SandboxConfig.Agent.Version = firewallCopy.Version
 	}
+	if len(detectionData.SandboxConfig.Agent.Images) == 0 {
+		detectionData.SandboxConfig.Agent.Images = buildThreatDetectionContainerImages(detectionData)
+	}
 
 	return detectionData
+}
+
+// buildThreatDetectionContainerImages translates AWF container pin redirects into
+// the closed runtime manifest expected by AWF. A complete manifest is emitted only
+// when at least one required AWF role is redirected.
+func buildThreatDetectionContainerImages(data *WorkflowData) map[string]string {
+	if len(data.ContainerPinMappings) == 0 {
+		return nil
+	}
+
+	imageTag := getAWFImageTag(getFirewallConfig(data))
+	images := make(map[string]string)
+	hasMappedImage := false
+	for _, role := range requiredAWFImageRoles(data) {
+		image := defaultAWFImageForRole(role, imageTag)
+		if applyContainerPinMappingFromData(image, data) != image {
+			hasMappedImage = true
+		}
+		resolved := resolveContainerImage(image, data)
+		if !awfPinnedImagePattern.MatchString(resolved) {
+			threatLog.Printf("Skipping detection container manifest: %s image is not digest-pinned", role)
+			return nil
+		}
+		images[role] = resolved
+	}
+	if !hasMappedImage {
+		return nil
+	}
+	return images
 }
 
 // buildPullAWFContainersStep creates a step that pre-pulls AWF (agent workflow firewall)
@@ -144,8 +206,11 @@ func (c *Compiler) buildPullAWFContainersStep(data *WorkflowData) []string {
 	// collectDockerImages returns only the AWF firewall images (no MCP tool images).
 	detectionData := buildThreatDetectionWorkflowData(data, "")
 	detectionData.Tools = map[string]any{}
+	if isGitHubCLIModeEnabled(data) {
+		detectionData.Tools["github"] = map[string]any{"mode": "gh-proxy"}
+	}
 
-	images := collectDockerImages(detectionData.Tools, detectionData, c.actionMode)
+	images := collectDockerImages(map[string]any{}, detectionData, c.actionMode)
 	if len(images) == 0 {
 		threatLog.Print("No AWF container images to pre-pull for detection job")
 		return nil
@@ -153,7 +218,7 @@ func (c *Compiler) buildPullAWFContainersStep(data *WorkflowData) []string {
 	threatLog.Printf("Pre-pulling %d AWF container image(s) for detection job", len(images))
 
 	var b strings.Builder
-	generateDownloadDockerImagesStep(&b, images)
+	generateDownloadDockerImagesStep(&b, images, dockerImagePullPolicy(data))
 	if b.Len() == 0 {
 		return nil
 	}
@@ -173,25 +238,35 @@ func (c *Compiler) buildPullAWFContainersStep(data *WorkflowData) []string {
 // It mirrors threat-detection engine resolution: threat-detection.engine overrides main engine.
 func (c *Compiler) getThreatDetectionEngineID(data *WorkflowData) string {
 	var engineID string
-
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil &&
+	hasExplicitEngine := data.SafeOutputs != nil &&
+		data.SafeOutputs.ThreatDetection != nil &&
 		data.SafeOutputs.ThreatDetection.EngineConfig != nil &&
-		data.SafeOutputs.ThreatDetection.EngineConfig.ID != "" {
+		data.SafeOutputs.ThreatDetection.EngineConfig.ID != ""
+
+	if hasExplicitEngine {
 		engineID = data.SafeOutputs.ThreatDetection.EngineConfig.ID
 	} else {
-		engineID = data.AI
-		if engineID == "" && data.EngineConfig != nil && data.EngineConfig.ID != "" {
-			engineID = data.EngineConfig.ID
-		}
+		engineID = ResolveEngineID(data)
 	}
 
 	if engineID == "" {
 		engineID = "claude"
 	}
+	threatLog.Printf("Resolved base threat detection engine: %s", engineID)
 
-	// Threat detection currently does not support the Pi engine backend.
-	// Normalize to Copilot so workflows with engine: pi still get a working detector.
+	if !hasExplicitEngine {
+		if provider, ok := resolveWorkflowEngineProvider(data, engineID); ok {
+			if detectionEngineID := threatDetectionEngineForProvider(provider); detectionEngineID != "" {
+				threatLog.Printf("Selecting threat detection engine %q for main provider %q", detectionEngineID, provider)
+				return detectionEngineID
+			}
+		}
+	}
+
+	// Threat detection currently does not support the Pi engine backend. If Pi's
+	// provider has no matching detector, fall back to Copilot.
 	if engineID == "pi" {
+		threatLog.Print("Normalizing pi engine to copilot for threat detection")
 		return "copilot"
 	}
 
@@ -200,10 +275,25 @@ func (c *Compiler) getThreatDetectionEngineID(data *WorkflowData) string {
 	// normalized to the engine declared by their definition (engine.detection-engine),
 	// falling back to the default built-in detection engine.
 	if !isThreatDetectionCapableEngineID(engineID) {
-		return c.resolveCustomEngineDetectionEngineID(engineID)
+		resolved := c.resolveCustomEngineDetectionEngineID(engineID)
+		threatLog.Printf("Custom engine %q is not threat-detection capable; resolved to %q", engineID, resolved)
+		return resolved
 	}
 
 	return engineID
+}
+
+func threatDetectionEngineForProvider(provider LLMProvider) string {
+	switch provider {
+	case LLMProviderGitHub:
+		return "copilot"
+	case LLMProviderAnthropic:
+		return "claude"
+	case LLMProviderOpenAI:
+		return "codex"
+	default:
+		return ""
+	}
 }
 
 // defaultThreatDetectionEngineID is the built-in engine used for threat detection when
@@ -254,19 +344,32 @@ type externalDetectorPathSetup struct {
 // name, so the mounted ${RUNNER_TEMP}/gh-aw/bin/ directory must be prepended to
 // PATH in the container command. Non-ARC topologies also need a host-side copy
 // into that mounted directory; ARC/DinD already stages Copilot there during install.
+// Every ARC detection engine also needs the detector binary and prepared inputs
+// staged on the shared volume before AWF starts.
 func (c *Compiler) buildExternalDetectorPathSetup(data *WorkflowData, engineID string) externalDetectorPathSetup {
+	setup := externalDetectorPathSetup{}
+	if isArcDindTopology(data) {
+		setup.hostSetup = `bash "${RUNNER_TEMP}/gh-aw/actions/stage_threat_detection_arc_dind.sh" stage`
+		setup.commandPrefix = `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `
+		if engineID == "codex" {
+			setup.commandPrefix += `export CODEX_HOME="${RUNNER_TEMP}/gh-aw/threat-detection/codex-home" && `
+		}
+	}
 	if engineID == "codex" && NewCodexEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
-		return externalDetectorPathSetup{commandPrefix: codexBYOKAPIKeyExport() + " && "}
+		setup.commandPrefix += codexBYOKAPIKeyExport() + " && "
+		return setup
+	}
+	if engineID == "claude" && NewClaudeEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
+		setup.commandPrefix += claudeCopilotAPIKeyExport() + " && "
+		return setup
 	}
 	if engineID != "copilot" {
-		return externalDetectorPathSetup{}
-	}
-	setup := externalDetectorPathSetup{
-		commandPrefix: `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `,
+		return setup
 	}
 	if isArcDindTopology(data) {
 		return setup
 	}
+	setup.commandPrefix = `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `
 	setup.hostSetup = copilotBinaryPathSetup
 	return setup
 }
@@ -325,6 +428,8 @@ func (c *Compiler) buildInstallDetectionEngineForExternalDetectorStep(data *Work
 		filteredInstallSteps = append([]GitHubActionStep{GenerateNodeJsSetupStep()}, filteredInstallSteps...)
 	}
 
+	filteredInstallSteps = applyNodeSetupOverrides(filteredInstallSteps, data)
+
 	var yaml strings.Builder
 	arcDind := isArcDindTopology(threatDetectionData)
 	if arcDind && installStepsContainNodeSetup(filteredInstallSteps) {
@@ -344,11 +449,10 @@ func isAWFBinaryInstallStep(step GitHubActionStep) bool {
 }
 
 func appendThreatDetectionRWMount(mounts []string) []string {
-	threatDetectionMount := constants.ThreatDetectionDir + ":" + constants.ThreatDetectionDir + ":rw"
-	if slices.Contains(mounts, threatDetectionMount) {
+	if slices.Contains(mounts, threatDetectionRWMount) {
 		return mounts
 	}
-	return append(mounts, threatDetectionMount)
+	return append(mounts, threatDetectionRWMount)
 }
 
 // buildExternalDetectorExecutionStep creates the AWF execution step for the external
@@ -383,7 +487,7 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	// ${{ vars.GH_AW_MODEL_DETECTION_COPILOT || ... || 'auto' }}, and when no org var
 	// is set COPILOT_MODEL is 'auto'. The AWF API proxy has no pricing for 'auto' and
 	// returns HTTP 400, causing every inference attempt to fail.
-	resolvedDetectionModel := inheritedDetectionModel(data)
+	resolvedDetectionModel := inheritedDetectionModel(data, engineID)
 	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.Model != "" {
 		resolvedDetectionModel = data.SafeOutputs.ThreatDetection.Model
 	}
@@ -397,8 +501,8 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	if resolvedDetectionModel == "" {
 		resolvedDetectionModel = "detection"
 	}
-	// Pi workflows normalise to Copilot; strip the provider prefix so the Copilot CLI
-	// receives a bare model ID rather than a "pi/model-name" string.
+	// Pi workflows use a provider-matched built-in detection engine; strip the
+	// provider prefix so it receives a bare model ID.
 	// Precedence mirrors the inline path: explicit threat-detection.engine.id overrides
 	// the main engine config, which overrides the legacy top-level AI field.
 	originalEngineID := data.AI
@@ -410,20 +514,16 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 		data.SafeOutputs.ThreatDetection.EngineConfig.ID != "" {
 		originalEngineID = data.SafeOutputs.ThreatDetection.EngineConfig.ID
 	}
-	if engineID == "copilot" && originalEngineID == "pi" {
+	if originalEngineID == "pi" {
 		resolvedDetectionModel = extractPiModelID(resolvedDetectionModel)
 	}
 	threatDetectionData.Model = resolvedDetectionModel
-	// Propagate the model alias map so the detection AWF config includes
-	// apiProxy.models, enabling the harness to resolve aliases (e.g. "haiku") to
-	// concrete model IDs before the Copilot CLI makes inference requests.
-	threatDetectionData.ModelMappings = data.ModelMappings
 	// Propagate default AI credits pricing so the detection AWF config includes
 	// apiProxy.defaultAiCreditsPricing when the main workflow configures it.
 	threatDetectionData.DefaultAiCreditsPricing = data.DefaultAiCreditsPricing
 
 	threatDetectionData.NetworkPermissions = &NetworkPermissions{
-		Allowed: getThreatDetectionAdditionalAllowedDomains(data),
+		Allowed: getThreatDetectionAdditionalAllowedDomains(data, engineID),
 	}
 	// Add a read-write mount so the threat-detect binary can write
 	// detection_result.json inside the container and it becomes visible
@@ -432,7 +532,11 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 
 	// Compute which env vars to exclude from the AWF container. The API proxy
 	// handles authentication, so the raw credentials must not reach the container.
-	excludeEnvVarNames := ComputeAWFExcludeEnvVarNames(threatDetectionData, engineCoreSecretVarNames(engineID))
+	coreSecretVarNames := engineCoreSecretVarNames(engineID)
+	if engineID == "claude" {
+		coreSecretVarNames = claudeSecretEnvVarNames(threatDetectionData)
+	}
+	excludeEnvVarNames := ComputeAWFExcludeEnvVarNames(threatDetectionData, coreSecretVarNames)
 
 	// Compute allowed domains for the detection engine. The AWF firewall for the
 	// detection job must permit the engine's required API endpoints. Without this,
@@ -465,7 +569,7 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	// no longer writes any step-summary output (see
 	// github/gh-aw-threat-detection#792), so the flag is intentionally omitted here.
 	npmPathSetup := GetNpmBinPathSetup()
-	threatDetectCmd := buildThreatDetectCommand(npmPathSetup, engineID, data.SafeOutputs.ThreatDetection)
+	threatDetectCmd := buildThreatDetectCommand(npmPathSetup, engineID, data.SafeOutputs.ThreatDetection, isArcDindTopology(threatDetectionData))
 
 	// Build the complete AWF command. BuildAWFCommand handles config file setup,
 	// ARC/DinD probes, tool cache mount, and the log tee pattern.
@@ -510,10 +614,14 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 		continueOnErrorExpr = data.SafeOutputs.ThreatDetection.ContinueOnErrorExpr
 	}
 
+	executionCondition := detectionStepCondition + " && steps.threat_detect_install.outcome == 'success'"
+	if isArcDindTopology(threatDetectionData) {
+		executionCondition += " && steps.detection_staging_reset.outcome == 'success'"
+	}
 	steps := []string{
 		"      - name: Execute threat detection with AWF\n",
 		"        id: detection_agentic_execution\n",
-		fmt.Sprintf("        if: %s\n", detectionStepCondition),
+		fmt.Sprintf("        if: %s\n", executionCondition),
 		"        continue-on-error: true\n",
 		// Bound the step at the workflow level as well as through
 		// GH_AW_TIMEOUT_MINUTES: the env var is only honoured once the binary is
@@ -531,6 +639,9 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	// Pass context as environment variables: AWF's --env-all forwards them to
 	// threat-detect without interpolating user-controlled prompt text into a command.
 	steps = append(steps, c.buildThreatDetectionContextEnvVars(data, continueOnError, continueOnErrorExpr)...)
+	if isArcDindTopology(threatDetectionData) {
+		steps = append(steps, "          THREAT_DETECT_BINARY: ${{ steps.threat_detect_install.outputs.binary-path }}\n")
+	}
 	steps = append(steps, "        run: |\n")
 	for _, line := range strings.SplitAfter(command, "\n") {
 		if line == "" {
@@ -546,7 +657,7 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	return steps
 }
 
-func buildThreatDetectCommand(npmPathSetup, engineID string, config *ThreatDetectionConfig) string {
+func buildThreatDetectCommand(npmPathSetup, engineID string, config *ThreatDetectionConfig, arcDind bool) string {
 	args := []string{
 		"threat-detect",
 		"--engine", shellEscapeArg(engineID),
@@ -564,10 +675,15 @@ func buildThreatDetectCommand(npmPathSetup, engineID string, config *ThreatDetec
 		}
 	}
 
-	args = append(args,
-		"--output", shellEscapeArg(constants.ThreatDetectionResultPath),
-		shellEscapeArg(constants.ThreatDetectionDir),
-	)
+	resultPath := shellEscapeArg(constants.ThreatDetectionResultPath)
+	inputPath := shellEscapeArg(constants.ThreatDetectionDir)
+	if arcDind {
+		// These compiler-owned expressions must expand inside the sandbox, with
+		// quotes retained so runner temp paths containing spaces remain single args.
+		resultPath = strconv.Quote(rewriteArcDindPath(constants.ThreatDetectionResultPath))
+		inputPath = strconv.Quote(rewriteArcDindPath(constants.ThreatDetectionDir))
+	}
+	args = append(args, "--output", resultPath, inputPath)
 
 	return fmt.Sprintf("%s && %s", npmPathSetup, strings.Join(args, " "))
 }
@@ -634,6 +750,7 @@ func (c *Compiler) buildUploadDetectionArtifactStep(data *WorkflowData) []string
 	// untrusted agent transcript, so bundling them does not introduce the secret-exfiltration
 	// risk that keeps detection.log off this artifact.
 	if isFirewallEnabled(data) {
+		threatLog.Print("Including firewall logs in detection artifact upload")
 		steps = append(steps,
 			"            "+detectionFirewallLogsDir+"/logs/\n",
 			"            "+detectionFirewallLogsDir+"/audit/\n",
@@ -650,7 +767,8 @@ func (c *Compiler) buildUploadDetectionArtifactStep(data *WorkflowData) []string
 // parse_threat_detection_results.cjs path. Outputs (not env vars) are used exclusively;
 // downstream jobs consume these via needs.detection.outputs.* expressions.
 // The step ID (detection_conclusion) and env vars (RUN_DETECTION, DETECTION_AGENTIC_EXECUTION_OUTCOME,
-// GH_AW_DETECTION_CONTINUE_ON_ERROR) are byte-identical to the inline conclude step.
+// GH_AW_DETECTION_CONTINUE_ON_ERROR) match the inline conclude step; THREAT_DETECT_INSTALL_OUTCOME is
+// additionally passed because only the external path installs a pinned binary.
 func (c *Compiler) buildExternalDetectorConcludeStep(data *WorkflowData) []string {
 	// Determine continue-on-error mode (same logic as buildDetectionConclusionStep).
 	continueOnError := true
@@ -683,6 +801,12 @@ func (c *Compiler) buildExternalDetectorConcludeStep(data *WorkflowData) []strin
 		"        env:\n",
 		"          RUN_DETECTION: ${{ steps.detection_guard.outputs.run_detection }}\n",
 		"          DETECTION_AGENTIC_EXECUTION_OUTCOME: ${{ steps.detection_agentic_execution.outcome }}\n",
+		// The conclude script must never invoke a detector that was not installed
+		// under compiler-pinned digest verification: on a failed install the binary on
+		// PATH is absent, unverified, or the install script's fail-closed placeholder.
+		// The placeholder cannot set conclusion outputs itself, so the script emits the
+		// agent_failure conclusion from this outcome instead.
+		"          THREAT_DETECT_INSTALL_OUTCOME: ${{ steps.threat_detect_install.outcome }}\n",
 		coeEnvLine,
 		"        run: |\n",
 		fmt.Sprintf("          bash \"${RUNNER_TEMP}/gh-aw/actions/conclude_threat_detection.sh\" %s\n", shellEscapeArg(constants.ThreatDetectionResultPath)),

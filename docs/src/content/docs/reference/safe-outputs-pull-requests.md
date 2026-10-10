@@ -11,7 +11,7 @@ Code-writing types (`create-pull-request` and `push-to-pull-request-branch`) enf
 
 ## Pull Request Creation (`create-pull-request:`)
 
-Creates a PR with the agent's code changes. Falls back to opening an issue if PR creation is blocked (e.g. org settings) — set `fallback-as-issue: false` to disable. Set `max` above `1` to allow multiple independent PRs per run.
+Creates a PR with the agent's code changes. Falls back to opening an issue if PR creation is blocked (e.g. org settings) — set `fallback-as-issue: false` to disable. The default `max: 1` is a **per-workflow-run quota shared by all agents and sub-agents**, not a per-agent limit. Set `max` to the number of PRs the run may create when using parallel agents or creating multiple independent PRs; excess `create_pull_request` calls are rejected.
 
 ```yaml wrap
 safe-outputs:
@@ -312,7 +312,7 @@ safe-outputs:
   submit-pull-request-review:
     max: 1
     allowed-events: [COMMENT, REQUEST_CHANGES]  # include REQUEST_CHANGES when superseding older blocking reviews
-    supersede-older-reviews: true  # dismiss older same-workflow REQUEST_CHANGES reviews after replacement
+    supersede-older-reviews: true  # dismiss older same-workflow blockers after a clean COMMENT review with no inline findings
     target: "triggering"           # or "*", or explicit PR number
     target-repo: "owner/repo"      # cross-repository
     allowed-repos: ["org/repo1"]   # additional allowed repositories
@@ -323,7 +323,7 @@ safe-outputs:
 
 Use `allowed-events` to control review decisions (`APPROVE`, `COMMENT`, `REQUEST_CHANGES`). Prefer `allowed-events: [COMMENT]` by default so bot reviews remain informative and non-blocking.
 
-When you intentionally allow `REQUEST_CHANGES`, set `supersede-older-reviews: true` to dismiss older blocking reviews from the same workflow after posting a replacement review. This behavior is best-effort.
+When you intentionally allow `REQUEST_CHANGES`, set `supersede-older-reviews: true` to dismiss older blocking bot reviews from the same workflow after posting a clean `COMMENT` review without inline findings. Only reviews older than the clean replacement are eligible, and a new blocking review or one with inline findings does not dismiss earlier findings. This best-effort behavior uses a review-body provenance marker even when the visible footer is disabled.
 
 When `target: "*"` is configured, the agent must supply `pull_request_number` in each `submit_pull_request_review` tool call to identify which PR to review — omitting it will cause the review to fail. For cross-repository scenarios, the agent can also supply `repo` (in `owner/repo` format) to route the review to a PR in a different repository; the value must match `target-repo` or appear in `allowed-repos`.
 
@@ -399,7 +399,7 @@ safe-outputs:
       - "**/*.lock"
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
     github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
-    fallback-as-pull-request: true        # on non-fast-forward failure, create fallback PR to original PR branch (default: true)
+    fallback-as-pull-request: true        # on non-fast-forward or workflow-permission timeout, create fallback PR (default: true)
     signed-commits: true                  # signed commits are required (default); set false to use git push directly
     ignore-missing-branch-failure: false  # treat deleted/missing branch errors as skipped instead of failed (default: false)
     check-branch-protection: true         # set to false to skip the branch protection pre-flight check (default: true)
@@ -414,6 +414,8 @@ safe-outputs:
 ```
 
 When `push-to-pull-request-branch` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
+
+`create_pull_request` stages a patch/bundle for processing after the agent finishes; its tool response does not return a PR number. A `push_to_pull_request_branch` call cannot target a PR created earlier in the same agent run, even with a `temporary_id`, because the branch is not yet available remotely. Push follow-up commits in a later run after the PR exists.
 
 ### Destination branch
 
@@ -433,7 +435,7 @@ By default, pushes are replayed through GitHub's signed commit API because `sign
 
 ### Cross-repo usage
 
-`push-to-pull-request-branch` supports pushing to pull requests in a different repository via `target-repo` (and optionally `allowed-repos`). For fork-backed pull requests, set `head-repo` to the exact repository that owns the PR head branch; follow-up pushes are permitted only when the PR head repository matches that value exactly. When `target-repo` is set, **the target repository must be checked out into the workflow workspace** using the `checkout:` frontmatter field with a `path:` specified. Use `target-repo: "*"` to let the agent choose the target repository at runtime (the safe_outputs job will check out all `checkout:` repositories into subdirectories automatically).
+`push-to-pull-request-branch` supports pushing to pull requests in a different repository via `target-repo` (and optionally `allowed-repos`). For fork-backed pull requests, set `head-repo` to the exact repository that owns the PR head branch; follow-up pushes are permitted only when the PR head repository matches that value exactly. When `target-repo` is set, **the target repository must be checked out into the workflow workspace** using either the `checkout:` frontmatter field with a `path:` specified or a custom `steps:` entry that clones it under `$GITHUB_WORKSPACE`. Use `target-repo: "*"` to let the agent choose the target repository at runtime (the safe_outputs job will check out all `checkout:` repositories into subdirectories automatically).
 
 ```yaml wrap
 checkout:
@@ -519,7 +521,7 @@ checkout:
 
 If `push-to-pull-request-branch` (or `create-pull-request`) fails, the safe-output pipeline cancels all remaining non-code-push outputs. Each cancelled output is marked with an explicit reason such as "Cancelled: code push operation failed". The failure details appear in the agent failure issue or comment generated by the conclusion job.
 
-When `fallback-as-pull-request` is enabled (default), non-fast-forward push failures trigger a fallback pull request that targets the original PR branch. Set `fallback-as-pull-request: false` to disable this fallback behavior.
+When `fallback-as-pull-request` is enabled (default), non-fast-forward push failures and exhausted workflow-permission check timeouts trigger a fallback pull request that targets the original PR branch. Set `fallback-as-pull-request: false` to disable this fallback behavior.
 
 When `ignore-missing-branch-failure: true` is set, push failures caused by a deleted or missing PR branch return `skipped: true` instead of a hard failure. This is useful when the PR branch may have been deleted before the safe-output job runs (for example, on auto-merged PRs). Without this flag, a missing branch is a terminal error.
 
@@ -562,7 +564,7 @@ safe-outputs:
         - .cursor/                # allow updates to the .cursor/ directory
 ```
 
-The `exclude` list names files by **basename** (e.g., `AGENTS.md`) or **path prefix** (e.g., `.agents/`) to remove from the default protected set. Dot-folder path prefixes in the `exclude` list (e.g. `.cursor/`) also opt that directory out of the general top-level-dot-folder protection rule. The remaining protected files still enforce the configured policy. This is useful when a workflow is explicitly designed to manage one specific instruction file or configuration directory without disabling all protection.
+The `exclude` list names files by **basename** (e.g., `AGENTS.md`) or **path prefix** (e.g., `.agents/`) to remove from the default protected set. To exclude only an **exact repository path**, start it with `/`: `exclude: ["/pyproject.toml"]` allows the root `pyproject.toml` while nested files such as `lib/foo/pyproject.toml` remain protected. Dot-folder path prefixes in the `exclude` list (e.g. `.cursor/`) also opt that directory out of the general top-level-dot-folder protection rule. The remaining protected files still enforce the configured policy. This is useful when a workflow is explicitly designed to manage one specific instruction file or configuration directory without disabling all protection.
 
 :::tip[Workflows that update top-level Markdown files]
 `CHANGELOG.md` is excluded by default. If your workflow is explicitly designed to modify another protected root-level Markdown file such as `README.md`, add it to the `exclude` list so the agent can commit the change.

@@ -156,7 +156,7 @@ func TestGenerateDefaultCheckoutStep(t *testing.T) {
 		})
 		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
 		combined := strings.Join(lines, "")
-		assert.Contains(t, combined, "ref: develop", "should include ref override")
+		assert.Contains(t, combined, "ref: \"develop\"", "should include ref override")
 	})
 
 	t.Run("trial mode overrides user config", func(t *testing.T) {
@@ -334,7 +334,7 @@ func TestGenerateAdditionalCheckoutSteps(t *testing.T) {
 		combined := strings.Join(lines, "")
 		assert.Contains(t, combined, "repository: owner/libs", "should include repo")
 		assert.Contains(t, combined, "path: ./libs/owner-libs", "should include path")
-		assert.Contains(t, combined, "ref: main", "should include ref")
+		assert.Contains(t, combined, "ref: \"main\"", "should include ref")
 		assert.Contains(t, combined, "persist-credentials: false", "must always have persist-credentials: false")
 	})
 
@@ -418,6 +418,19 @@ func TestParseCheckoutConfigs(t *testing.T) {
 		assert.Equal(t, "${{ secrets.MY_TOKEN }}", configs[0].GitHubToken, "github-token should be set")
 		require.NotNil(t, configs[0].FetchDepth, "fetch-depth should be set")
 		assert.Equal(t, 0, *configs[0].FetchDepth, "fetch-depth should be 0")
+	})
+
+	t.Run("pull-request false disables generated PR checkout", func(t *testing.T) {
+		configs, err := ParseCheckoutConfigs(map[string]any{"pull-request": false})
+		require.NoError(t, err)
+		require.Len(t, configs, 1)
+		require.NotNil(t, configs[0].PullRequest)
+		assert.False(t, *configs[0].PullRequest)
+	})
+
+	t.Run("pull-request must be a boolean", func(t *testing.T) {
+		_, err := ParseCheckoutConfigs(map[string]any{"pull-request": "false"})
+		require.ErrorContains(t, err, "checkout.pull-request must be a boolean")
 	})
 
 	t.Run("negative fetch-depth returns error", func(t *testing.T) {
@@ -730,18 +743,17 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{},
 		})
-		assert.Contains(t, content, "$GITHUB_WORKSPACE", "should show full workspace path for root checkout")
+		assert.Contains(t, content, "${{ github.workspace }}", "should resolve the full workspace path for root checkout at runtime")
 		assert.Contains(t, content, "(cwd)", "root checkout should be marked as cwd")
 		assert.Contains(t, content, "${{ github.repository }}", "should reference github.repository expression for default checkout")
 	})
 
-	t.Run("checkout with explicit repo shows full path", func(t *testing.T) {
+	t.Run("nested checkout of host repo shows runtime-resolved absolute path", func(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
-			{Repository: "owner/target", Path: "./target"},
+			{Repository: "myorg/myrepo", Path: "myrepo"},
 		})
-		assert.Contains(t, content, "repo `owner/target` → `$GITHUB_WORKSPACE/target`", "should present checkout as repo-to-directory mapping")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/target", "should show full workspace path")
-		assert.Contains(t, content, "owner/target", "should show the configured repo")
+		assert.Contains(t, content, "repo `myorg/myrepo` → `${{ github.workspace }}/myrepo`", "should present the nested self-repository checkout with a runtime-resolved absolute path")
+		assert.Contains(t, content, "myorg/myrepo", "should show the configured repo")
 		assert.NotContains(t, content, "github.repository", "should not include github.repository expression for explicit repo")
 		assert.NotContains(t, content, "(cwd)", "non-root checkout should not be marked as cwd")
 	})
@@ -767,11 +779,11 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 			{Repository: "owner/target", Path: "./target", Current: true},
 			{Repository: "owner/libs", Path: "./libs"},
 		})
-		assert.Contains(t, content, "$GITHUB_WORKSPACE", "should include workspace root for root checkout")
+		assert.Contains(t, content, "${{ github.workspace }}", "should include workspace root for root checkout")
 		assert.Contains(t, content, "(cwd)", "root checkout should be marked as cwd")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/target", "should include full path for target checkout")
+		assert.Contains(t, content, "${{ github.workspace }}/target", "should include full path for target checkout")
 		assert.Contains(t, content, "owner/target", "should include target repo")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/libs", "should include full path for libs checkout")
+		assert.Contains(t, content, "${{ github.workspace }}/libs", "should include full path for libs checkout")
 		assert.Contains(t, content, "owner/libs", "should include libs repo")
 		assert.Contains(t, content, "**current**", "current checkout should be marked")
 	})
@@ -819,6 +831,8 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{Repository: "owner/repo"},
 		})
+		assert.Contains(t, content, "separate shallow, credential-free checkout", "should distinguish the workspace root from configured checkouts")
+		assert.Contains(t, content, "confirm your working directory matches that path", "should require checking the working directory first")
 		assert.Contains(t, content, "has NOT been checked out", "should mention branches that are not checked out")
 		assert.Contains(t, content, "fetch:", "should mention the fetch option for resolution")
 	})

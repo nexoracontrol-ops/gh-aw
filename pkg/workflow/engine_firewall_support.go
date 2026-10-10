@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -22,10 +23,15 @@ func hasNetworkRestrictions(networkPermissions *NetworkPermissions) bool {
 		return false
 	}
 
+	// Blocked domains always restrict access, including when allowed is defaults.
+	if len(networkPermissions.Blocked) > 0 {
+		return true
+	}
+
 	// If allowed domains are specified and it's not just the defaults ecosystem, we have restrictions
 	if len(networkPermissions.Allowed) > 0 {
 		// Check if it's ONLY "defaults" (which means use default ecosystem, not a restriction)
-		if len(networkPermissions.Allowed) == 1 && networkPermissions.Allowed[0] == "defaults" {
+		if len(networkPermissions.Allowed) == 1 && slices.Contains(networkPermissions.Allowed, "defaults") {
 			return false
 		}
 		return true
@@ -33,11 +39,6 @@ func hasNetworkRestrictions(networkPermissions *NetworkPermissions) bool {
 
 	// Empty allowed list [] means deny-all, which is a restriction
 	if networkPermissions.ExplicitlyDefined && len(networkPermissions.Allowed) == 0 {
-		return true
-	}
-
-	// If blocked domains are specified, we have restrictions
-	if len(networkPermissions.Blocked) > 0 {
 		return true
 	}
 
@@ -134,7 +135,7 @@ func generateFirewallLogParsingStep(workflowName string, workflowData *WorkflowD
 	// non-interactive sudo (sudo -n) with a non-sudo chmod fallback. Profiles where AWF
 	// ran with host privileges (docker-sudo-iptables, cloud-hypervisor) use plain sudo.
 	scriptArg := ""
-	if isAWFNetworkIsolationEnabled(workflowData) && getSandboxRuntimeProfile(workflowData).Rootless {
+	if isAWFNetworkIsolationEnabled(workflowData) && getSandboxRuntimeProfile(workflowData).Rootless && !hasCloudHypervisorEnclaves(workflowData) {
 		scriptArg = " --rootless"
 	}
 

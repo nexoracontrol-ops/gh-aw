@@ -295,7 +295,9 @@ func (c *Compiler) buildJobs(data *WorkflowData, markdownPath string) error {
 	frontmatter := data.RawFrontmatter
 	lockFilename := filepath.Base(stringutil.MarkdownToLockFile(markdownPath))
 
-	c.resolveSafeOutputActionSchemas(data, markdownPath)
+	if err := c.resolveSafeOutputActionSchemas(data, markdownPath); err != nil {
+		return fmt.Errorf("failed to resolve safe-output action schemas: %w", err)
+	}
 
 	activationJobCreated, err := c.buildActivationAndMainJobs(data, frontmatter, lockFilename)
 	if err != nil {
@@ -326,14 +328,15 @@ func (c *Compiler) buildJobs(data *WorkflowData, markdownPath string) error {
 	return nil
 }
 
-func (c *Compiler) resolveSafeOutputActionSchemas(data *WorkflowData, markdownPath string) {
+func (c *Compiler) resolveSafeOutputActionSchemas(data *WorkflowData, markdownPath string) error {
 	// Resolve custom safe-output actions early so that tool schemas (derived from action.yml)
 	// are available when buildMainJobWrapper → generateMCPSetup → generateToolsMetaJSON →
 	// generateDynamicTools runs. Without this early resolution the dynamic_tools entry for
 	// each action tool would have an empty schema because Inputs/ActionDescription are nil.
 	if data.SafeOutputs != nil && len(data.SafeOutputs.Actions) > 0 {
-		c.resolveAllActions(data, markdownPath)
+		return c.resolveAllActions(data, markdownPath)
 	}
+	return nil
 }
 
 // buildActivationAndMainJobs builds the activation chain and the primary agent job.
@@ -401,6 +404,7 @@ func (c *Compiler) finalizeBuiltJobs(data *WorkflowData) error {
 
 	c.ensureOTLPOIDCJobPermissions(data)
 	c.ensureDriveMemoryJobPermissions(data)
+	c.annotateGeneratedJobs(data)
 
 	if err := c.validateSafeOutputStepTokenReferences(data); err != nil {
 		return err
@@ -532,6 +536,10 @@ func (c *Compiler) buildMemoryManagementJobs(data *WorkflowData) error {
 	if err != nil {
 		return err
 	}
+	pushLedgerJobName, err := c.buildPushLedgerChangesJobWrapper(data, threatDetectionEnabledForSafeJobs)
+	if err != nil {
+		return err
+	}
 
 	// Build update_cache_memory job if cache-memory is configured and threat detection is enabled
 	updateCacheMemoryJobName, err := c.buildUpdateCacheMemoryJobWrapper(data, threatDetectionEnabledForSafeJobs)
@@ -556,11 +564,25 @@ func (c *Compiler) buildMemoryManagementJobs(data *WorkflowData) error {
 	}
 
 	// Update conclusion job dependencies
-	if err := c.updateConclusionJobDependencies(pushRepoMemoryJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName); err != nil {
+	if err := c.updateConclusionJobDependencies(pushRepoMemoryJobName, pushLedgerJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (c *Compiler) buildPushLedgerChangesJobWrapper(data *WorkflowData, threatDetectionEnabled bool) (string, error) {
+	if data.LedgerConfig == nil || !data.LedgerConfig.Enabled() {
+		return "", nil
+	}
+	job, err := c.buildPushLedgerChangesJob(data, threatDetectionEnabled)
+	if err != nil {
+		return "", fmt.Errorf("push_ledger_changes job could not be built: %w", err)
+	}
+	if err := c.jobManager.AddJob(job); err != nil {
+		return "", fmt.Errorf("push_ledger_changes job could not be added: %w", err)
+	}
+	return job.Name, nil
 }
 
 // buildPushRepoMemoryJobWrapper builds the push_repo_memory job if repo-memory is configured.
@@ -687,7 +709,7 @@ func (c *Compiler) buildPushEvalsStateJobWrapper(data *WorkflowData) (string, er
 }
 
 // updateConclusionJobDependencies updates the conclusion job to depend on memory management jobs if they exist.
-func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName string) error {
+func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, pushLedgerJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName string) error {
 	conclusionJob, exists := c.jobManager.GetJob("conclusion")
 	if !exists {
 		return nil
@@ -696,6 +718,9 @@ func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, update
 	if pushRepoMemoryJobName != "" {
 		conclusionJob.Needs = append(conclusionJob.Needs, pushRepoMemoryJobName)
 		compilerJobsLog.Printf("Added push_repo_memory dependency to conclusion job")
+	}
+	if pushLedgerJobName != "" {
+		conclusionJob.Needs = append(conclusionJob.Needs, pushLedgerJobName)
 	}
 
 	if updateCacheMemoryJobName != "" {

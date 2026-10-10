@@ -13,6 +13,11 @@ const {
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   DETECTION_LOG_FILENAME,
+  DEFAULT_MCP_CALL_WATCHDOG_MS,
+  MCP_CALL_TRANSPORT_GRACE_MS,
+  MAX_RESTORE_RUNS,
+  MAX_RESTORE_PAGES,
+  SCAN_WINDOW_MS,
 } = require("./constants.cjs");
 
 describe("constants", () => {
@@ -83,6 +88,21 @@ describe("constants", () => {
     });
   });
 
+  describe("Codex MCP watchdog timeouts", () => {
+    it("should export the default call timeout and transport grace period", () => {
+      expect(DEFAULT_MCP_CALL_WATCHDOG_MS).toBe(120_000);
+      expect(MCP_CALL_TRANSPORT_GRACE_MS).toBe(60_000);
+    });
+  });
+
+  describe("daily AIC scan cache restore limits", () => {
+    it("should export the bounded run and page counts and scan window", () => {
+      expect(MAX_RESTORE_RUNS).toBe(10);
+      expect(MAX_RESTORE_PAGES).toBe(25);
+      expect(SCAN_WINDOW_MS).toBe(24 * 60 * 60 * 1000);
+    });
+  });
+
   describe("module exports", () => {
     it("should export all expected constants", () => {
       const exported = require("./constants.cjs");
@@ -99,6 +119,11 @@ describe("constants", () => {
         "MANIFEST_FILE_PATH",
         "TEMPORARY_ID_MAP_FILE_PATH",
         "DETECTION_LOG_FILENAME",
+        "DEFAULT_MCP_CALL_WATCHDOG_MS",
+        "MCP_CALL_TRANSPORT_GRACE_MS",
+        "MAX_RESTORE_RUNS",
+        "MAX_RESTORE_PAGES",
+        "SCAN_WINDOW_MS",
       ];
       for (const key of expectedKeys) {
         expect(exported).toHaveProperty(key);

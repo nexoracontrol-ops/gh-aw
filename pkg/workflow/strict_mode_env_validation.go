@@ -27,6 +27,19 @@ import (
 //
 // No other engine.env var is allowed to have secrets.
 func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
+	return c.validateEnvSecretsWithModels(frontmatter, BuiltinModelAliases())
+}
+
+func (c *Compiler) validateEarlyEnvSecrets(frontmatter map[string]any) error {
+	_, config, _ := c.ExtractEngineConfig(frontmatter)
+	if config != nil && len(config.FallbackModels) > 0 {
+		// Provider aliases are not available until imports have been merged.
+		return c.validateEnvSecretsSection(frontmatter, "env", nil)
+	}
+	return c.validateEnvSecrets(frontmatter)
+}
+
+func (c *Compiler) validateEnvSecretsWithModels(frontmatter map[string]any, models map[string][]string) error {
 	// Check top-level env section (no allowed overrides here)
 	if err := c.validateEnvSecretsSection(frontmatter, "env", nil); err != nil {
 		return err
@@ -38,8 +51,14 @@ func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
 			// Determine which env var keys may carry secrets: those that the engine itself
 			// requires (e.g. COPILOT_GITHUB_TOKEN for the copilot engine).
 			// The second return value is *EngineConfig (not an error); we only need the engine ID.
-			engineSetting, _, _ := c.ExtractEngineConfig(frontmatter)
+			engineSetting, engineConfig, model := c.ExtractEngineConfig(frontmatter)
 			allowedEnvVarKeys := c.getEngineBaseEnvVarKeys(engineSetting)
+			if engineConfig != nil && len(engineConfig.FallbackModels) > 0 {
+				data := &WorkflowData{EngineConfig: engineConfig, Model: model, ModelMappings: models}
+				for _, name := range fallbackProviderSecretNames(data) {
+					allowedEnvVarKeys[name] = struct{}{}
+				}
+			}
 
 			if err := c.validateEnvSecretsSection(engineObj, "engine.env", allowedEnvVarKeys); err != nil {
 				return err
@@ -148,9 +167,9 @@ func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName 
 		// engine.env secrets are excluded from the agent sandbox via awf --exclude-env
 		// (requires AWF v0.25.3+). On older AWF versions this protection is not applied and
 		// the values will reach the agent container.
-		warningMsg = fmt.Sprintf("Warning: secrets detected in 'engine.env' section will be excluded from the agent sandbox via awf --exclude-env (requires AWF %s+); on older AWF versions the agent process will see these values. Found: %s. Consider using engine-specific secret configuration instead.", constants.AWFExcludeEnvMinVersion, strings.Join(secretRefs, ", "))
+		warningMsg = fmt.Sprintf("secrets detected in 'engine.env' section will be excluded from the agent sandbox via awf --exclude-env (requires AWF %s+); on older AWF versions the agent process will see these values. Found: %s. Consider using engine-specific secret configuration instead.", constants.AWFExcludeEnvMinVersion, strings.Join(secretRefs, ", "))
 	} else {
-		warningMsg = fmt.Sprintf("Warning: secrets detected in '%s' section will be leaked to the agent container. Found: %s. Consider using engine-specific secret configuration instead.", sectionName, strings.Join(secretRefs, ", "))
+		warningMsg = fmt.Sprintf("secrets detected in '%s' section will be leaked to the agent container. Found: %s. Consider using engine-specific secret configuration instead.", sectionName, strings.Join(secretRefs, ", "))
 	}
 	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
 	c.IncrementWarningCount()

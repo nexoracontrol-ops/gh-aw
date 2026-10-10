@@ -10,14 +10,11 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-model: openai/gpt-5.3-codex
+model: openai/gpt-5.6-terra
 engine:
   id: codex
   model-provider: openai
 strict: true
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:

@@ -45,9 +45,63 @@ func RhsExprForIndex(rhs []ast.Expr, idx int) (ast.Expr, bool) {
 	}
 }
 
+// MatchDiscardedErrorCall reports whether assign has the form value, _ = pkg.Func(...)
+// and resolves the selected function to its imported package.
+func MatchDiscardedErrorCall(pass *analysis.Pass, assign *ast.AssignStmt) (call *ast.CallExpr, pkgPath, funcName string, ok bool) {
+	if pass == nil || pass.TypesInfo == nil || assign == nil || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+		return nil, "", "", false
+	}
+	var secondLHS ast.Expr
+	for index, lhs := range assign.Lhs {
+		if index == 1 {
+			secondLHS = lhs
+			break
+		}
+	}
+	blank, ok := secondLHS.(*ast.Ident)
+	if !ok || blank.Name != "_" {
+		return nil, "", "", false
+	}
+	var rhs ast.Expr
+	for _, expr := range assign.Rhs {
+		rhs = expr
+		break
+	}
+	call, ok = rhs.(*ast.CallExpr)
+	if !ok {
+		return nil, "", "", false
+	}
+	pkgPath, funcName, ok = PackageCall(pass, call)
+	if !ok {
+		return nil, "", "", false
+	}
+	return call, pkgPath, funcName, true
+}
+
+// PackageCall resolves a package-qualified call and returns its import path and
+// selected function name.
+func PackageCall(pass *analysis.Pass, call *ast.CallExpr) (pkgPath, funcName string, ok bool) {
+	if pass == nil || pass.TypesInfo == nil || call == nil {
+		return "", "", false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", "", false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return "", "", false
+	}
+	pkgName, ok := pass.TypesInfo.Uses[ident].(*types.PkgName)
+	if !ok || pkgName.Imported() == nil {
+		return "", "", false
+	}
+	return pkgName.Imported().Path(), sel.Sel.Name, true
+}
+
 // IsStringLiteral reports whether expr is a string literal.
 func IsStringLiteral(expr ast.Expr) bool {
-	lit, ok := expr.(*ast.BasicLit)
+	lit, ok := UnwrapParenExpr(expr).(*ast.BasicLit)
 	return ok && lit.Kind == token.STRING
 }
 
@@ -702,31 +756,6 @@ func SwapImportEdits(fset *token.FileSet, file *ast.File, addPkg, removePkg stri
 	}
 }
 
-// BuildContainsFix builds the suggested fix rewriting a comparison to
-// strings.Contains. fixMessage is used as the SuggestedFix.Message field so
-// callers can identify the rewritten function (e.g. "Index" vs "Count").
-func BuildContainsFix(files []*ast.File, expr *ast.BinaryExpr, pkgText, sText, subText string, negated bool, fixMessage string) []analysis.SuggestedFix {
-	if HasOverlappingComment(files, expr.Pos(), expr.End()) {
-		return nil
-	}
-
-	var replacement string
-	if negated {
-		replacement = "!" + pkgText + ".Contains(" + sText + ", " + subText + ")"
-	} else {
-		replacement = pkgText + ".Contains(" + sText + ", " + subText + ")"
-	}
-
-	return []analysis.SuggestedFix{{
-		Message: fixMessage,
-		TextEdits: []analysis.TextEdit{{
-			Pos:     expr.Pos(),
-			End:     expr.End(),
-			NewText: []byte(replacement),
-		}},
-	}}
-}
-
 // UniverseErrorInterface returns the built-in error interface type, or nil if
 // it cannot be resolved from types.Universe.
 func UniverseErrorInterface() *types.Interface {
@@ -743,7 +772,7 @@ func UniverseErrorInterface() *types.Interface {
 
 // StringLitValue returns the unquoted string value of a string-literal AST node.
 func StringLitValue(expr ast.Expr) (string, bool) {
-	lit, ok := expr.(*ast.BasicLit)
+	lit, ok := UnwrapParenExpr(expr).(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
 		return "", false
 	}

@@ -726,6 +726,7 @@ func TestExtractConfigFields_FirstWinsAndAccumulates(t *testing.T) {
 	first := map[string]any{
 		"max-turns":             10,
 		"max-tool-denials":      5,
+		"max-tool-calls":        17,
 		"max-runs":              3,
 		"max-turn-cache-misses": 4,
 		"max-ai-credits":        1234,
@@ -733,7 +734,7 @@ func TestExtractConfigFields_FirstWinsAndAccumulates(t *testing.T) {
 		"mcp-servers":           map[string]any{"server-a": map[string]any{"url": "https://a.example.com"}},
 		"safe-outputs":          map[string]any{"enabled": true},
 		"mcp-scripts":           map[string]any{"setup": "echo first"},
-		"runtimes":              map[string]any{"node": map[string]any{"version": "20"}},
+		"runtimes":              map[string]any{"node": map[string]any{"version": "24"}},
 		"network":               map[string]any{"allow": []any{"github.com"}},
 		"permissions":           map[string]any{"contents": "read"},
 		"secret-masking":        map[string]any{"enabled": true},
@@ -759,6 +760,7 @@ func TestExtractConfigFields_FirstWinsAndAccumulates(t *testing.T) {
 
 	assert.Equal(t, "10", acc.mergedMaxTurns, "max-turns should be first-wins")
 	assert.Equal(t, "5", acc.mergedMaxToolDenials, "max-tool-denials should be first-wins")
+	assert.Equal(t, "17", acc.mergedMaxToolCalls, "max-tool-calls should be first-wins")
 	assert.Equal(t, "3", acc.mergedMaxRuns, "max-runs should be first-wins")
 	assert.Equal(t, "4", acc.mergedMaxTurnCacheMisses, "max-turn-cache-misses should be first-wins")
 	assert.Equal(t, "1234", acc.mergedMaxAICredits, "max-ai-credits should be first-wins")

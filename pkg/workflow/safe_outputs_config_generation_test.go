@@ -123,17 +123,26 @@ func TestGenerateSafeOutputsConfigNeutralizesAllUnresolvableNeedsForms(t *testin
 
 func TestGenerateSafeOutputsConfigPreservesResolvableNeedsExpressions(t *testing.T) {
 	data := &WorkflowData{
+		AgentJobNeeds: []string{"setup"},
 		SafeOutputs: &SafeOutputsConfig{
-			Needs: []string{"approval_allowlist"},
-			AddComments: &AddCommentsConfig{
-				AllowedCommentIDs: []string{"${{ needs.prepare.outputs.comment_ids }}"},
+			Needs: []string{"setup", "approval_allowlist"},
+			UpdatePullRequests: &UpdatePullRequestsConfig{
+				UpdateEntityConfig: UpdateEntityConfig{
+					SafeOutputTargetConfig: SafeOutputTargetConfig{
+						Target: "${{ needs.setup.outputs.pull_request_number }}",
+					},
+				},
+			},
+			ApproveWorkflowRun: &ApproveWorkflowRunConfig{
+				AllowedPullRequests: []string{"${{ needs.approval_allowlist.outputs.eligible_pull_request_numbers }}"},
 			},
 		},
 	}
 
 	result, err := generateSafeOutputsConfig(data)
 	require.NoError(t, err)
-	assert.Contains(t, result, "needs.prepare.outputs.comment_ids")
+	assert.Contains(t, result, "needs.setup.outputs.pull_request_number")
+	assert.NotContains(t, result, "needs.approval_allowlist")
 }
 
 func TestSanitizeAgentSafeOutputsConfigNoOp(t *testing.T) {
@@ -626,6 +635,7 @@ func TestGenerateSafeOutputsConfigAddLabelsBlocked(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			AddLabels: &AddLabelsConfig{
 				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+				MaxLabels:            strPtr("25"),
 				SafeOutputTargetConfig: SafeOutputTargetConfig{
 					Target:         "*",
 					TargetRepoSlug: "microsoft/vscode",
@@ -647,6 +657,8 @@ func TestGenerateSafeOutputsConfigAddLabelsBlocked(t *testing.T) {
 
 	addLabelsConfig, ok := parsed["add_labels"].(map[string]any)
 	require.True(t, ok, "Expected add_labels key in config")
+	assert.InDelta(t, 5, addLabelsConfig["max"], 0)
+	assert.InDelta(t, 25, addLabelsConfig["max_labels"], 0)
 
 	blocked, ok := addLabelsConfig["blocked"]
 	require.True(t, ok, "Expected blocked field in add_labels config")

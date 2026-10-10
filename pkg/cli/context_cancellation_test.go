@@ -92,7 +92,7 @@ func TestAuditWorkflowRunWithCancellation(t *testing.T) {
 	cancel()
 
 	// Try to audit a run with a cancelled context
-	err := AuditWorkflowRun(ctx, 123456, AuditOptions{
+	_, err := AuditWorkflowRun(ctx, 123456, AuditOptions{
 		OutputDir: "/tmp/test-audit",
 	})
 
@@ -118,9 +118,14 @@ func TestRunWorkflowsOnGitHubCancellationDuringExecution(t *testing.T) {
 // TestDownloadWorkflowLogsTimeoutRespected tests that timeout-minutes is respected
 func TestDownloadWorkflowLogsTimeoutRespected(t *testing.T) {
 	originalFetch := logsFetchWorkflowRunBatch
+	originalFetchRateLimit := fetchRateLimitForHostFunc
 	t.Cleanup(func() {
 		logsFetchWorkflowRunBatch = originalFetch
+		fetchRateLimitForHostFunc = originalFetchRateLimit
 	})
+	fetchRateLimitForHostFunc = func(context.Context, string) (rateLimitResource, error) {
+		return rateLimitResource{}, nil
+	}
 	logsFetchWorkflowRunBatch = func(ctx context.Context, _ LogsDownloadOptions, _ string, _ int, _ bool) (workflowRunBatch, error) {
 		<-ctx.Done()
 		return workflowRunBatch{}, ctx.Err()

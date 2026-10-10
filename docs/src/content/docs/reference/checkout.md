@@ -9,6 +9,8 @@ The `checkout:` frontmatter field controls how `actions/checkout` is invoked in 
 
 By default, the agent checks out the repository where the workflow is running with a shallow fetch (`fetch-depth: 1`). If triggered by a `pull_request` event, it also checks out the PR head ref. For `pull_request_target` events, checkout of the PR head branch is **disabled by default** — the head branch may be deleted (merged/closed PRs) or inaccessible (fork PRs), causing the step to hard-fail. For most workflows, this default checkout is sufficient and no `checkout:` configuration is necessary.
 
+Before the agent job, activation separately checks out workflow configuration to load runtime imports and skills. On `pull_request`, `pull_request_review`, and `pull_request_review_comment` events, this sparse checkout uses the PR **base SHA**, not the PR head; on other events it retains the normal activation ref. For reusable `workflow_call` workflows, it uses the resolved callee SHA when there is no active PR event, and skips cross-repository checkout if authentication may fall back to the caller's repository-scoped `GITHUB_TOKEN`. The `checkout:` options below describe the agent job and do not override this activation checkout.
+
 Use `checkout:` when you need to check out additional branches, check out multiple repositories, or to disable checkout entirely for workflows that don't need to access code or can access code dynamically through the GitHub Tools.
 
 ## Custom Checkout Settings
@@ -124,6 +126,15 @@ checkout: false
 
 This is equivalent to omitting the checkout step from the agent job. Custom dev-mode steps (such as "Checkout actions folder") are unaffected.
 
+## Disabling the PR Branch Checkout
+
+To keep the normal repository checkout but suppress the compiler-generated "Checkout PR branch" step and its associated base-config snapshot/restore steps, set `pull-request: false` under `checkout`:
+
+```yaml wrap
+checkout:
+  pull-request: false
+```
+
 ## Target-Only Checkout (`permissions.contents: none`)
 
 Sidecar (MultiRepoOps) workflows often need to operate on a target repository without checking out the repository that hosts the workflow itself. Setting `permissions.contents: none` suppresses only the default workflow-repository checkout and the "Checkout PR branch" step; any other explicitly configured `checkout:` entries (such as a target repository) are still checked out normally:
@@ -159,7 +170,36 @@ checkout:
   ref: ${{ github.event.pull_request.base.sha }}
 ```
 
-This produces the "Checkout PR branch" step pointing at the safe base ref. Do **not** use `github.event.pull_request.head.sha` or `refs/pull/.../head` in a privileged `pull_request_target` job — that would check out untrusted code in a context with write permissions.
+This produces a configured checkout pointing at the safe base ref; the "Checkout PR branch" step remains disabled for `pull_request_target`. Do **not** use `github.event.pull_request.head.sha` or `refs/pull/.../head` in a privileged `pull_request_target` job — that would check out untrusted code in a context with write permissions.
+
+### Explicit Trusted Checkout Policy
+
+Strict mode rejects `pull_request_target` checkouts unless checkout is explicitly disabled, targets the supported base repository/ref, or matches a literal pair in `on.pull_request_target.allowed-checkouts`. Declare this policy in the main workflow's frontmatter; it is not inherited from imports. The default restrictions remain unchanged when the policy is omitted.
+
+```aw wrap
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+    acknowledge-risk: true
+    allowed-checkouts:
+      - repository: dotnet/AspNetCore.Docs
+        ref: main
+if: github.event.pull_request.merged == true
+
+checkout:
+  - repository: dotnet/AspNetCore.Docs
+    ref: main
+    path: .
+    current: true
+```
+
+`on.pull_request_target.allowed-checkouts` defaults to no additional trusted checkouts. Each entry requires a literal `owner/repository` and a non-empty literal branch, tag, or commit SHA. Matching is exact and case-sensitive; repository/ref pairs cannot be combined across entries. Expressions, wildcards, and `refs/pull/...` refs are rejected in the policy. Every configured checkout must independently satisfy the policy or the existing base-checkout rules. Do not configure `checkout.fetch` for these checkouts: follow-up fetches can add refs beyond the trusted checkout, so they do not satisfy the policy. External repositories with omitted or PR-dependent refs remain rejected. Wiki checkouts are not covered by this allowlist.
+
+`on.pull_request_target.acknowledge-risk` defaults to `false`. Setting it to `true` suppresses **only** the strict-mode dangerous-trigger warning, including for `checkout: false` or a supported base checkout. It neither allows other checkouts nor disables unrelated warnings, strict validation, or safe-update checks. An allowlist without acknowledgment still emits the trigger warning.
+
+> [!CAUTION]
+> This policy records maintainer trust, not proof that checked-out code is safe. Prefer immutable commit SHAs; literal branches and tags can move. Keep workflow code and helpers on trusted base refs, read source PR changes as data, and never execute PR-controlled code with privileged credentials. Checkout authentication (`github-app` or `github-token`) and safe-output publication must still be configured separately. This example illustrates compilation policy, not runtime authentication or publication validation.
 
 ## Marking a Primary Repository (`current: true`)
 
@@ -187,6 +227,13 @@ checkout:
 By default, generated checkout steps set `persist-credentials: false`, which causes `actions/checkout` to remove credentials in its post-step. In repositories with submodules or sparse checkouts, that post-step can fail with missing submodule URL or path errors.
 
 Set `force-clean-git-credentials: true` on a checkout target to opt into an explicit cleanup step instead. The compiler emits the checkout with `persist-credentials: true`, then injects a `Clean git credentials after checkout` step immediately after it. The cleanup removes the credential helper and `http.*.extraheader` entries from both `.git/config` and any `.git/modules/*/config`, including nested submodules.
+
+Cleanup is fail-closed: a failed helper, invalid git configuration, or residual
+credential helper, authentication header, or authenticated URL stops the job
+before agent execution. A separate read-only verification checks the effective
+configuration, including included config files, without logging token values.
+The final pre-agent credential cleanup has the same verification requirement.
+With no checkout or git config files, cleanup and verification are no-ops.
 
 ```yaml wrap
 checkout:

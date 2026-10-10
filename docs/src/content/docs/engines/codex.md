@@ -7,28 +7,40 @@ description: Select and authenticate OpenAI Codex as the AI engine for GitHub Ag
 
 ## Selecting Codex + OpenAI as the AI engine
 
-To select Codex as the AI engine, with inference hosted and and billed through an OpenAI subscription, add this to the workflow frontmatter:
+To select Codex as the AI engine, with inference hosted and billed through the OpenAI API, add this to the workflow frontmatter:
 
 ```yaml
 engine: codex
+model: openai/gpt-6.1-sol
 ```
 
 To authenticate, provide a [`CODEX_API_KEY`](/gh-aw/reference/auth/#openai_api_key) or [`OPENAI_API_KEY`](/gh-aw/reference/auth/#openai_api_key) as a GitHub Actions repository secret.
+
+ChatGPT subscription login is not configured by this integration.
 
 Recompile the workflow with `gh aw compile` and commit the changes to your repository. The workflow will now run with Codex as the AI engine.
 
 ## Selecting Codex + GitHub as the AI engine
 
-To select Codex as the AI engine, with inference hosted and billed through a GitHub Copilot subscription, add a `copilot/` model declaration. This configures Codex's BYOK provider to use GitHub Copilot inference. Select a Codex model because the Codex runtime relies on model capabilities that general-purpose models do not provide. For example:
+To select Codex as the AI engine, with inference hosted and billed through a GitHub Copilot subscription, add a `copilot/` model declaration. This configures Codex's BYOK provider to use GitHub Copilot inference. Select a Codex-compatible model available to your Copilot account. For example:
 
 ```yaml
 engine:
   id: codex
-  model: copilot/gpt-5.3-codex
+  model: copilot/gpt-6.1-sol
 ```
+
+GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, GPT-6 Astra, and GPT-5.6 Sol, Terra, and Luna support Codex through the Responses API without a `-codex` suffix. Check [Codex model support](https://developers.openai.com/codex/models), [API pricing](https://developers.openai.com/api/docs/pricing), and [API deprecations](https://developers.openai.com/api/docs/deprecations) before pinning a model; a cached pricing entry alone does not establish availability.
+
+Both `copilot/auto` and `auto` with `engine.model-provider: github` delegate model selection to the Copilot gateway through the Responses API. The bare spelling does not change Codex's default OpenAI provider; select GitHub explicitly to use Copilot inference.
+
 To authenticate:
 - For organization-billed usage, grant [`copilot-requests: write`](/gh-aw/reference/auth/#copilot-requests-write-permission).
 - Otherwise, provide a [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) secret containing a fine-grained PAT with Copilot Requests access.
+
+GitHub inference requires the AWF sandbox. Do not set `sandbox.agent: false` for this provider. For a model supplied through an expression or repository variable, set `engine.model-provider: github` explicitly; runtime model prefixes do not change the selected credentials.
+
+GitHub inference disables Codex's native shell and JavaScript code-mode tools because the Copilot compatibility adapter does not support the custom `exec` tool. gh-aw generates a direct-tool model catalog from the installed Codex binary's bundled metadata, preserving the other model settings. This also disables code mode for models that select it independently of feature flags. MCP tools and the supported `apply_patch` tool remain available. The installed Codex command must support `debug models --bundled`; `engine.config` cannot re-enable these features or replace the managed catalog. OpenAI inference is unchanged.
 
 Recompile the workflow with `gh aw compile` and commit the changes to your repository. The workflow will now run with Codex as the AI engine.
 
@@ -63,9 +75,53 @@ Analyze the repository and create a concise daily status report covering:
 
 ## Capabilities and limitations
 
-Codex supports native web search when `tools.web-search` is enabled and can disable shell execution completely. Codex cannot enforce a nonempty per-command `tools.bash` allowlist and does not support bare mode, `max-continuations`, native `engine.agent` selection, or custom `engine.harness` scripts. See the [AI engine feature comparison](/gh-aw/reference/engines/#engine-feature-comparison).
+Codex enables its shared native search/browsing tool when either `tools.web-search` or `tools.web-fetch` is enabled. Search and page fetching cannot be disabled independently; use `network.hosted-web` to restrict hosted retrieval. Codex can disable shell execution completely but cannot enforce a nonempty per-command `tools.bash` allowlist.
+
+With OpenAI inference through the AWF sandbox, enabling `network.hosted-web` also enables Codex's standalone `web.run` search tool for Responses Lite models, which do not receive the hosted `web_search` tool. Without hosted web, this provider flag is not set. Codex standalone search does not support `network.hosted-web.max-uses`; omit that limit when using Codex with OpenAI inference.
+
+`network.hosted-web` is not functional with Codex using GitHub Copilot inference. The compiler rejects this combination; use OpenAI inference to enable Codex standalone web search.
+
+Codex does not support bare mode, Copilot-style `max-continuations`, or native `engine.agent` selection. `engine.harness.use` can select a replacement harness that has been provisioned in the setup-action directory before execution. See the [AI engine feature comparison](/gh-aw/reference/engines/#engine-feature-comparison).
 
 When a workflow does not declare any `plugins`, GitHub Agentic Workflows writes [`features.plugins=false`](https://developers.openai.com/codex/config-reference/#features) to Codex's generated `config.toml`. This prevents Codex from contacting the ChatGPT plugin catalog or synchronizing the curated plugin repository at startup. Codex does not provide a narrower setting that disables only startup synchronization, so workflows that declare Agent Plugins keep the plugin subsystem and its startup checks enabled. Directly configured MCP servers are unaffected.
+
+Plugins are registered after configuration generation in the same `CODEX_HOME` used for execution. Inline skills use `.codex/skills/<name>/SKILL.md`.
+
+## Custom Codex configuration
+
+`engine.config` accepts TOML that is parsed and structurally merged with the generated configuration. Root settings remain at the root, and table settings preserve unrelated defaults:
+
+```yaml wrap
+engine:
+  id: codex
+  config: |
+    model_reasoning_effort = "high"
+```
+
+Generated configuration disables the default metrics exporter and preserves native MCP timeouts and client headers. MCP connections and the AWF provider's connection settings remain gateway-managed; configure upstream servers through `mcp-servers` and inference endpoints through `engine.api-target` or `engine.env.OPENAI_BASE_URL`.
+
+Use `${ENV_VAR}` inside TOML strings to reference an environment value configured through `engine.env`. GitHub Actions expressions are not accepted directly inside `engine.config`. The native integration supports OpenAI Responses-compatible inference and GitHub inference; an Anthropic backend requires a Responses-compatible bridge configured as an OpenAI endpoint.
+
+For shell environment filtering, use either `[shell_environment_policy.filters]` or the legacy `include_only`/`exclude` arrays. Selecting one representation replaces inherited settings from the other; declaring both in the same custom configuration is a compile-time error.
+
+## Session artifacts
+
+The `agent` artifact retains native `agent-stdio.log` and normalized `agent-session.jsonl`. The conclusion job projects essential fields into `usage/aw_session.jsonl`, following the [unified session contract](/gh-aw/specs/unified-agent-session-specification/).
+
+| Codex observation | Session mapping |
+| --- | --- |
+| Thread startup and recognized legacy headers | `session.init`, with observed model, working directory, reasoning effort, and available inventories. |
+| Agent text, reasoning, and user text | `assistant.message`, `assistant.reasoning`, and `user.message`, with exact content. Explicit provider refusal signals use `assistant.refusal`; natural-language disclaimers do not. |
+| Commands and MCP calls | Independent `tool.execution_start` and `tool.execution_complete` events, preserving native IDs, arguments, outputs, and explicit failures, including declined commands. |
+| File changes | An `apply_patch` tool completion with observed changes and status. A change summary does not supply executed patch arguments or a missing start. |
+| Web searches and collaboration calls | Standard tool events with observed queries/actions or receiver IDs/prompts, and available search results or agent states. Completing `spawn_agent` does not mean the child finished. |
+| Completed turns and session errors | `session.result`, with cumulative per-turn usage or separate error observations. A completed CLI turn does not establish task success. |
+
+Tool IDs remain scoped to their observed thread for correlation across retries. Unfinished tools remain dangling; orphan completions do not acquire invented inputs. Known message updates are snapshots, not text deltas: only the latest available content is exposed as a core message, while superseded snapshots remain native evidence. Todo-list snapshots and unknown native extensions remain available without fabricating tool executions.
+
+Reported totals and cache aliases are counted once. Later authoritative accounting snapshots replace corresponding totals rather than adding to them; unavailable counts, duration, and cost remain absent. Legacy message sections retain JSON-looking answers as text instead of interpreting them as execution or usage records.
+
+Regression fixtures include sanitized excerpts from [Smoke Codex](https://github.com/github/gh-aw/actions/runs/36909965579), [Daily Documentation Updater](https://github.com/github/gh-aw/actions/runs/36850958249), and an [unsupported-model failure](https://github.com/github/gh-aw/actions/runs/37100404405). Advanced tool, refusal, overflow, and mixed-format cases are synthetic protocol-shaped regressions, not claims that these features appeared in the sampled runs.
 
 ## GitHub Agentic Workflows vs. running Codex directly in Actions
 

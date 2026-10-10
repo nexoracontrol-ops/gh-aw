@@ -1,0 +1,116 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const { parsePiConfig, preparePiRuntime, nativePiProvider, resolvePiPackageFile, verifyPiVersion } = await import("./pi_runtime.cjs");
+let dir;
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-runtime-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(dir, "agent"));
+  vi.stubEnv("RUNNER_TEMP", dir);
+  vi.stubEnv("GH_AW_PI_STAGING_DIR", path.join(dir, "staging"));
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("Pi runtime configuration", () => {
+  it("copies activation-staged agents and skills into the managed user scope", () => {
+    fs.mkdirSync(path.join(dir, "staging/agents"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "staging/skills/report"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "staging/agents/reader.md"), "Agent.");
+    fs.writeFileSync(path.join(dir, "staging/skills/report/SKILL.md"), "Skill.");
+    preparePiRuntime({});
+    expect(fs.readFileSync(path.join(dir, "agent/agents/reader.md"), "utf8")).toBe("Agent.");
+    expect(fs.readFileSync(path.join(dir, "agent/skills/report/SKILL.md"), "utf8")).toBe("Skill.");
+  });
+  it.each(["0.99.2", "1.0.0-beta.1", "unexpected"])("rejects an incompatible actual CLI version: %s", version => {
+    expect(() => verifyPiVersion("pi", () => version)).toThrow("v1.0.0 or newer");
+  });
+  it.each(["1.0.0", "1.1.0", "2.0.0", "Pi 1.0.0"])("accepts an actual compatible version: %s", version => {
+    expect(() => verifyPiVersion("pi", () => version)).not.toThrow();
+  });
+
+  it("uses the install-time package root even when sandbox npm paths differ", () => {
+    const root = path.join(dir, "host-toolcache/pi");
+    fs.mkdirSync(path.join(root, "dist"), { recursive: true });
+    fs.writeFileSync(path.join(root, "dist/index.js"), "export {};");
+    vi.stubEnv("GH_AW_PI_PACKAGE_ROOT", root);
+    expect(fs.realpathSync(resolvePiPackageFile("dist/index.js"))).toBe(fs.realpathSync(path.join(root, "dist/index.js")));
+  });
+
+  it("finds the package from the real CLI symlink without depending on NODE_PATH", () => {
+    const root = path.join(dir, "alternate-node/lib/node_modules/@earendil-works/pi-coding-agent");
+    const bin = path.join(dir, "alternate-node/bin");
+    fs.mkdirSync(path.join(root, "dist/bundle"), { recursive: true });
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(root, "package.json"), '{"name":"@earendil-works/pi-coding-agent"}');
+    fs.writeFileSync(path.join(root, "dist/index.js"), "export {};");
+    fs.writeFileSync(path.join(root, "dist/bundle/cli.js"), "");
+    fs.symlinkSync(path.join(root, "dist/bundle/cli.js"), path.join(bin, "pi"));
+    vi.stubEnv("PATH", bin);
+    vi.stubEnv("NODE_PATH", "");
+    vi.stubEnv("GH_AW_PI_PACKAGE_ROOT", "");
+    expect(fs.realpathSync(resolvePiPackageFile("dist/index.js"))).toBe(fs.realpathSync(path.join(root, "dist/index.js")));
+  });
+
+  it("retains installed package declarations in the same runtime directory", () => {
+    fs.mkdirSync(path.join(dir, "agent"));
+    fs.writeFileSync(path.join(dir, "agent/settings.json"), '{"packages":["npm:example@1.0.0"]}');
+    const result = preparePiRuntime({ settings: { defaultThinkingLevel: "high", defaultProjectTrust: "always" } });
+    expect(result.settings.packages).toEqual(["npm:example@1.0.0"]);
+    expect(result.settings.retry).toEqual({ enabled: true, maxRetries: 2, baseDelayMs: 1000, maxAgentDelayMs: 30000 });
+    expect(result.settings.defaultTools).toEqual(["+codemode", "+tool_search"]);
+    expect(result.settings.defaultProjectTrust).toBe("never");
+    expect(result.settings.defaultThinkingLevel).toBe("high");
+  });
+
+  it("merges retry defaults with partial installed and workflow settings", () => {
+    fs.mkdirSync(path.join(dir, "agent"));
+    fs.writeFileSync(path.join(dir, "agent/settings.json"), JSON.stringify({ retry: { maxRetries: 4 } }));
+    const result = preparePiRuntime({ settings: { retry: { baseDelayMs: 500 } } });
+    expect(result.settings.retry).toEqual({ enabled: true, maxRetries: 4, baseDelayMs: 500, maxAgentDelayMs: 30000 });
+  });
+
+  it("applies the routed model effort instead of a fixed setting", () => {
+    fs.mkdirSync(path.join(dir, "agent"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "agent/model-routing-selection.json"), JSON.stringify({ wire_model: "claude-opus-5", mapped_effort: "off" }));
+    vi.stubEnv("GH_AW_MODEL_ROUTING", "1");
+    const result = preparePiRuntime({ settings: { defaultThinkingLevel: "high" } });
+    expect(result.routingSelection).toEqual({ wire_model: "claude-opus-5", mapped_effort: "off" });
+    expect(result.settings.defaultThinkingLevel).toBe("off");
+  });
+
+  it("fails closed when the routed selection file is missing", () => {
+    vi.stubEnv("GH_AW_MODEL_ROUTING", "1");
+    expect(() => preparePiRuntime({})).toThrow("AWF model routing selection is unavailable to Pi");
+  });
+
+  it("uses only gateway-authorized MCP servers and preserves scoped headers", () => {
+    fs.mkdirSync(path.join(dir, "gh-aw/mcp-config"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "gh-aw/mcp-config/mcp-servers.json"), JSON.stringify({ mcpServers: { safeoutputs: { url: "http://gateway/mcp/safeoutputs", headers: { Authorization: "gateway-session-token" } } } }));
+    preparePiRuntime({ mcp: { exposure: "codemode", toolExposure: { safeoutputs: { noop: "direct" } } } });
+    const mcp = JSON.parse(fs.readFileSync(path.join(dir, "agent/mcp.json"), "utf8"));
+    expect(mcp.mcpServers.safeoutputs).toMatchObject({ exposure: "codemode", toolExposure: { noop: "direct" }, headers: { Authorization: "gateway-session-token" } });
+    expect(fs.statSync(path.join(dir, "agent/mcp.json")).mode & 0o777).toBe(0o600);
+  });
+
+  it("reports malformed settings instead of discarding installed packages", () => {
+    fs.mkdirSync(path.join(dir, "agent"));
+    fs.writeFileSync(path.join(dir, "agent/settings.json"), "invalid");
+    expect(() => preparePiRuntime({})).toThrow();
+  });
+
+  it.each(["null", "[]", '{"other":{}}', '{"settings":false}', '{"mcp":{"exposure":"invalid"}}'])("rejects invalid configuration: %s", raw => {
+    expect(() => parsePiConfig(raw)).toThrow();
+  });
+
+  it("preserves native provider identifiers instead of defaulting to Copilot", () => {
+    expect(nativePiProvider("google")).toBe("google");
+    expect(nativePiProvider("openrouter")).toBe("openrouter");
+    expect(nativePiProvider("codex")).toBe("openai");
+  });
+});

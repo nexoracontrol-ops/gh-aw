@@ -1,21 +1,22 @@
 module github.com/github/gh-aw
 
-go 1.26.8
+go 1.26.9
 
 require (
 	charm.land/bubbles/v2 v2.2.1
-	charm.land/bubbletea/v2 v2.0.9
+	charm.land/bubbletea/v2 v2.0.10
 	charm.land/huh/v2 v2.0.3
 	charm.land/lipgloss/v2 v2.0.6
 	github.com/charmbracelet/colorprofile v0.4.3
-	github.com/charmbracelet/x/exp/golden v0.0.0-20260816001655-68d539dca504
+	github.com/charmbracelet/x/exp/golden v0.1.0
 	github.com/charmbracelet/x/term v0.2.2
-	github.com/cli/go-gh/v2 v2.16.0
+	github.com/cli/go-gh/v2 v2.16.1
 	github.com/creack/pty v1.1.24
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-yaml v1.19.2
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/rivo/uniseg v0.4.7
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/sourcegraph/conc v0.3.0
@@ -31,12 +32,17 @@ require (
 	golang.org/x/mod v0.41.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/term v0.46.0
-	golang.org/x/tools v0.50.0
+	golang.org/x/tools v0.51.0
 	gonum.org/v1/gonum v0.17.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require golang.org/x/net v0.59.0
+require (
+	github.com/charmbracelet/x/ansi v0.11.8
+	github.com/rhysd/actionlint v1.7.12
+	go.yaml.in/yaml/v3 v3.0.5
+	golang.org/x/net v0.60.0
+)
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -55,7 +61,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/harmonica v0.2.0 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260811164956-006e29f97886 // indirect
-	github.com/charmbracelet/x/ansi v0.11.8 // indirect
 	github.com/charmbracelet/x/exp/ordered v0.1.0 // indirect
 	github.com/charmbracelet/x/exp/strings v0.0.0-20251106172358-54469c29c2bc // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
@@ -90,7 +95,6 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/openai/openai-go/v3 v3.52.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
-	github.com/rhysd/actionlint v1.7.12 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/securego/gosec/v2 v2.29.0 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
@@ -109,12 +113,11 @@ require (
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
 	golang.org/x/exp v0.0.0-20240909161429-701f63a606c0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
+	golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/vuln v1.7.0 // indirect

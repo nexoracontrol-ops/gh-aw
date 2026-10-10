@@ -5,6 +5,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/gitutil"
@@ -27,6 +28,45 @@ func TestSharedPRDiffDataFetchValidatesHeadSHAForCacheHit(t *testing.T) {
 	assert.Contains(t, text, "pr-data-head-sha.txt", "Shared PR prefetch should persist head SHA marker")
 	assert.Contains(t, text, "--json number,title,body,headRefName,headRefOid,additions,deletions,changedFiles,files", "Shared PR prefetch should capture head SHA in metadata")
 	assert.Contains(t, text, "Cache hit: using pre-fetched PR data for head", "Shared PR prefetch should verify cache by current head SHA")
+	assert.Contains(t, text, "fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number", "Shared PR prefetch should resolve centralized slash-command PR numbers")
+	assert.Contains(t, text, "item_type == 'pull_request'", "Shared PR prefetch should only use aw_context item_number for pull requests")
+	assert.Contains(t, text, "::error::Unable to determine the pull request number from the event context.", "Shared PR prefetch should reject missing PR context")
+	assertSubstringsInOrder(t, text, []string{
+		`CACHE_HEAD_SHA=""`,
+		"fetch_review_comments",
+		"# Skip diff and metadata fetch",
+	}, "Shared PR prefetch should refresh review comments before checking cached diff data")
+	assert.NotContains(t, text, `-f /tmp/gh-aw/agent/pr-review-comments.json ]; then`, "Review comments should not control diff cache hits")
+	assert.Contains(t, text, "if ! gh api --paginate", "Shared PR prefetch should reject GitHub API failures")
+	assert.Contains(t, text, "Failed to fetch files for PR #${PR_NUMBER}", "Shared PR prefetch should report GitHub API failures")
+}
+
+func TestPRDataPrefetchRejectsAPIFailuresBeforeSavingCacheData(t *testing.T) {
+	t.Parallel()
+	repoRoot, err := gitutil.FindGitRoot()
+	if err != nil {
+		t.Skipf("Skipping test: not in a git repository: %v", err)
+	}
+
+	for _, workflow := range []string{
+		filepath.Join(".github", "workflows", "shared", "pr-diff-data-fetch.md"),
+		filepath.Join(".github", "workflows", "pr-data-prefetch.yml"),
+	} {
+		workflowPath := filepath.Join(repoRoot, workflow)
+		content, readErr := os.ReadFile(workflowPath)
+		require.NoError(t, readErr, "Should read %s", workflow)
+
+		text := string(content)
+		assert.Contains(t, text, "if ! gh api --paginate", "%s should reject GitHub API failures", workflow)
+		assert.Contains(t, text, "Failed to fetch files for PR #${PR_NUMBER}", "%s should report GitHub API failures", workflow)
+		assertSubstringsInOrder(t, text, []string{
+			"if ! gh api --paginate",
+			`echo "::error::Failed to fetch files for PR #${PR_NUMBER}: $(cat /tmp/gh-aw/agent/pr-diff.err)" >&2`,
+			"exit 1",
+			`head -n "${PR_DIFF_MAX_LINES}" /tmp/gh-aw/agent/pr-diff.full > /tmp/gh-aw/agent/pr-diff.patch`,
+			"pr-data-head-sha.txt",
+		}, "%s should reject API failures before saving a valid cache head marker", workflow)
+	}
 }
 
 func TestTopReviewWorkflowsHaveHeadAwarePRDataCacheKeys(t *testing.T) {
@@ -36,10 +76,25 @@ func TestTopReviewWorkflowsHaveHeadAwarePRDataCacheKeys(t *testing.T) {
 		t.Skipf("Skipping test: not in a git repository: %v", err)
 	}
 
+	for _, workflow := range []string{
+		"mattpocock-skills-reviewer.md",
+		"ponytail-reviewer.md",
+		"pr-code-quality-reviewer.md",
+	} {
+		workflowPath := filepath.Join(repoRoot, ".github", "workflows", workflow)
+		content, readErr := os.ReadFile(workflowPath)
+		require.NoError(t, readErr, "Should read %s", workflow)
+		text := string(content)
+		assert.Contains(t, text, "key: pr-prefetch-${{ github.event.pull_request.head.sha || format('{0}-{1}'", "%s should use the PR head SHA for pull_request runs and a unique slash-command key", workflow)
+		assert.Contains(t, text, "github.run_id", "%s should make slash-command cache keys unique so refreshed data can be saved", workflow)
+		assert.Contains(t, text, "item_type == 'pull_request'", "%s should only use aw_context item_number for pull requests", workflow)
+		assert.Contains(t, text, "pr-prefetch-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request'", "%s should restore cache data with a centralized slash-command fallback", workflow)
+	}
+
 	mattWorkflowPath := filepath.Join(repoRoot, ".github", "workflows", "mattpocock-skills-reviewer.md")
 	mattContent, err := os.ReadFile(mattWorkflowPath)
 	require.NoError(t, err, "Should read mattpocock-skills-reviewer workflow")
-	assert.Contains(t, string(mattContent), "key: pr-prefetch-${{ github.event.pull_request.head.sha || github.event.issue.number }}", "Matt reviewer should use head-aware key with issue fallback")
+	assert.Contains(t, string(mattContent), `${GITHUB_WORKSPACE}/.github/skills`, "Matt reviewer should discover skills from the restored workspace directory")
 
 	sentinelWorkflowPath := filepath.Join(repoRoot, ".github", "workflows", "test-quality-sentinel.md")
 	sentinelContent, err := os.ReadFile(sentinelWorkflowPath)
@@ -74,4 +129,19 @@ func TestImpeccableSkillsReviewerHasDeterministicSkillSelectionGuidance(t *testi
 	assert.Contains(t, text, "`mixed_unclear`")
 	assert.Contains(t, text, "Select 1–2 Impeccable modes", "Impeccable reviewer should limit selected modes")
 	assert.Contains(t, text, "If the Impeccable skill cannot be found or read, do not abort", "Impeccable reviewer should continue when skill discovery fails")
+}
+
+func assertSubstringsInOrder(t *testing.T, text string, substrings []string, msgAndArgs ...any) {
+	t.Helper()
+
+	searchFrom := 0
+	for _, substring := range substrings {
+		relativeIndex := -1
+		if searchFrom <= len(text) {
+			relativeIndex = strings.Index(text[searchFrom:], substring)
+		}
+		require.NotEqual(t, -1, relativeIndex, msgAndArgs...)
+		index := searchFrom + relativeIndex
+		searchFrom = index + len(substring)
+	}
 }

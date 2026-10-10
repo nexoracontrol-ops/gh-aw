@@ -121,7 +121,7 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("report_intent");
       expect(result.markdown).toContain("Rendered summary content");
       const resultData = getSessionResultData(result.logEntries);
-      expect(resultData?.numTurns).toBe(1);
+      expect(resultData?.numTurns).toBeUndefined();
     });
 
     it("renders tool output preview from result.content in Copilot CLI events.jsonl", () => {
@@ -553,6 +553,7 @@ describe("parse_copilot_log.cjs", () => {
 
     it("should handle missing log file", async () => {
       process.env.GH_AW_AGENT_OUTPUT = "/nonexistent/file.log";
+      vi.spyOn(fs, "existsSync").mockReturnValue(false);
       await main();
       expect(mockCore.info).toHaveBeenCalledWith("Log path not found: /nonexistent/file.log");
     });

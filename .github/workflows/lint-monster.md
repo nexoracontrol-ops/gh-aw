@@ -14,7 +14,7 @@ permissions:
 
 
 tracker-id: lint-monster
-model: openai/gpt-5.3-codex
+model: openai/gpt-6-luna
 engine:
   id: codex
   model-provider: openai
@@ -81,9 +81,6 @@ safe-outputs:
 imports:
   - shared/otlp.md
   - shared/reporting.md
-sandbox:
-  agent:
-    runtime: cloud-hypervisor
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

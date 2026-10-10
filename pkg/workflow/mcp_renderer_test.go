@@ -124,6 +124,102 @@ func TestNewMCPConfigRenderer(t *testing.T) {
 	}
 }
 
+func TestRenderWorkQueueMCPUsesSnapshotAndFinishIntentMounts(t *testing.T) {
+	worker := &WorkflowData{Tools: map[string]any{"work-queue": map[string]any{"worker": true}}}
+	t.Run("JSON Copilot", func(t *testing.T) {
+		var output strings.Builder
+		renderer := NewMCPConfigRenderer(MCPRendererOptions{Format: "json", IncludeCopilotFields: true, IsLast: true})
+		renderer.RenderWorkQueueMCP(&output, worker)
+		rendered := output.String()
+		if !strings.Contains(rendered, `"work-queue": {`) {
+			t.Fatalf("expected work-queue MCP server: %s", rendered)
+		}
+		if !strings.Contains(rendered, `"work_queue_read"`) {
+			t.Fatalf("expected the read tool to be exposed: %s", rendered)
+		}
+		if !strings.Contains(rendered, constants.WorkQueueSnapshotMount) {
+			t.Fatalf("expected a read-only snapshot mount: %s", rendered)
+		}
+		if !strings.Contains(rendered, constants.WorkQueueFinishIntentMount) || !strings.Contains(rendered, `"work_queue_claim_finish"`) {
+			t.Fatalf("expected the finish tool to use the safe-output intent mount: %s", rendered)
+		}
+		if strings.Contains(rendered, "GITHUB_TOKEN") || strings.Contains(rendered, constants.DefaultWorkspaceMount) || strings.Contains(rendered, constants.DefaultTmpGhAwMount) {
+			t.Fatalf("queue MCP must not receive Git credentials or workspace mounts: %s", rendered)
+		}
+	})
+
+	t.Run("Codex TOML", func(t *testing.T) {
+		var output strings.Builder
+		renderer := NewMCPConfigRenderer(MCPRendererOptions{Format: "toml"})
+		renderer.RenderWorkQueueMCP(&output, worker)
+		rendered := output.String()
+		if !strings.Contains(rendered, "[mcp_servers.work-queue]") {
+			t.Fatalf("expected work-queue MCP server: %s", rendered)
+		}
+		if !strings.Contains(rendered, constants.WorkQueueSnapshotMount) {
+			t.Fatalf("expected a read-only snapshot mount: %s", rendered)
+		}
+		if !strings.Contains(rendered, constants.WorkQueueFinishIntentMount) {
+			t.Fatalf("expected the safe-output intent mount: %s", rendered)
+		}
+		if strings.Contains(rendered, "GITHUB_TOKEN") || strings.Contains(rendered, constants.DefaultWorkspaceMount) || strings.Contains(rendered, constants.DefaultTmpGhAwMount) {
+			t.Fatalf("queue MCP must not receive Git credentials or workspace mounts: %s", rendered)
+		}
+	})
+}
+
+func TestRenderWorkQueueObserverMCPIsReadOnly(t *testing.T) {
+	observer := &WorkflowData{Tools: map[string]any{"work-queue": true}}
+	for _, format := range []string{"json", "toml"} {
+		t.Run(format, func(t *testing.T) {
+			var output strings.Builder
+			renderer := NewMCPConfigRenderer(MCPRendererOptions{Format: format, IncludeCopilotFields: true})
+			renderer.RenderWorkQueueMCP(&output, observer)
+			rendered := output.String()
+			if !strings.Contains(rendered, constants.WorkQueueSnapshotMount) || !strings.Contains(rendered, `"observer"`) {
+				t.Fatalf("observer requires its read-only snapshot and protected role: %s", rendered)
+			}
+			for _, denied := range []string{constants.WorkQueueFinishIntentMount, "work_queue_submit", "work_queue_dispatch_next", "work_queue_claim_finish", "GITHUB_TOKEN", constants.DefaultWorkspaceMount, constants.DefaultTmpGhAwMount} {
+				if strings.Contains(rendered, denied) {
+					t.Fatalf("observer MCP must not expose %s: %s", denied, rendered)
+				}
+			}
+			if format == "json" && !strings.Contains(rendered, `"tools": ["work_queue_read", "work_queue_explain"]`) {
+				t.Fatalf("observer must advertise only read/explain: %s", rendered)
+			}
+		})
+	}
+}
+
+func TestWorkQueueMCPIsRegisteredInManifest(t *testing.T) {
+	data := &WorkflowData{Tools: map[string]any{"work-queue": true}}
+	if !strings.Contains(strings.Join(collectMCPTools(data), ","), "work-queue") {
+		t.Fatal("expected the enabled queue tool to register an MCP server")
+	}
+	servers := collectMCPServersForManifest(data)
+	if len(servers) != 1 || servers[0].Name != "work-queue" {
+		t.Fatalf("expected queue server in manifest, got %#v", servers)
+	}
+	if len(servers[0].Tools) != 2 || strings.Join(servers[0].Tools, ",") != "work_queue_explain,work_queue_read" {
+		t.Fatalf("expected only observer read/explain tools, got %#v", servers[0].Tools)
+	}
+	for _, participant := range []*WorkflowData{
+		{Tools: map[string]any{"work-queue": map[string]any{"worker": true}}},
+		{Tools: map[string]any{"work-queue": true}, SafeOutputs: &SafeOutputsConfig{DispatchWorkflow: &DispatchWorkflowConfig{Workflows: []string{"worker"}}}},
+	} {
+		servers := collectMCPServersForManifest(participant)
+		found := false
+		for _, server := range servers {
+			if server.Name == "work-queue" && len(server.Tools) == 5 {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected participant queue control tools, got %#v", servers)
+		}
+	}
+}
+
 func TestRenderSafeOutputsMCP_JSON_Copilot(t *testing.T) {
 	pinnedGhAwNodeImage := resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil)
 	renderer := NewMCPConfigRenderer(MCPRendererOptions{

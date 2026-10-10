@@ -1755,22 +1755,22 @@ mcp-servers:
 
 #### 10.9.2 Constraints
 
-Blanket `allow` is incompatible with `guards_mode: strict`, so the compiler MUST reject that combination at compile time. The list form remains compatible with `strict` because it relaxes only the default sink-visibility for named servers while leaving other protections in place. In list form, every server ID MUST map to an actual MCP server declared in the workflow's `tools` or `mcp-servers` list; unknown IDs MUST be rejected at compile time. With non-strict mode (`filter` or `propagate`), the blanket form disables both the forced `repos="public"` override (Section 4.1.3.8) and the `sink-visibility` runtime-verification override (Section 10.8.4).
+Both forms are incompatible with `guards_mode: strict`, so the compiler MUST reject either form at compile time. In list form, every server ID MUST map to an actual MCP server declared in the workflow's `tools` or `mcp-servers` list; unknown IDs MUST be rejected at compile time. With non-strict mode (`filter` or `propagate`), the compiler MUST warn because action logs are public and agents may expose private data. The blanket form disables both the forced `repos="public"` override (Section 4.1.3.8) and the `sink-visibility` runtime-verification override (Section 10.8.4).
 
 #### 10.9.3 Compiler Responsibilities
 
 When the compiler encounters `private-to-public-flows`, it MUST validate the chosen form, emit the matching gateway configuration, and record the opt-out in the audit trail.
 
-For blanket `allow`, the compiler MUST reject `guards_mode: strict`, set `gateway.forcePublicRepos: false` in the generated JSON stdin config, and skip setting `sink-visibility` in write-sink guard policies even if the target repo is public at compile time.
+For blanket `allow`, the compiler MUST reject `guards_mode: strict`, warn in non-strict mode, set `gateway.forcePublicRepos: false` in the generated JSON stdin config, and skip setting `sink-visibility` in write-sink guard policies even if the target repo is public at compile time.
 
-For list form, the compiler MUST verify that every listed server ID exists in the workflow's declared `tools` or `mcp-servers` list, set `gateway.sinkVisibilityExemptServers` to that list in the generated JSON stdin config, and leave `forcePublicRepos` unchanged.
+For list form, the compiler MUST reject `guards_mode: strict`, warn in non-strict mode, verify that every listed server ID exists in the workflow's declared `tools` or `mcp-servers` list, set `gateway.sinkVisibilityExemptServers` to that list in the generated JSON stdin config, and leave `forcePublicRepos` unchanged.
 
 #### 10.9.4 Interaction Matrix
 
 | `guards_mode` | `private-to-public-flows` | Forced `repos="public"` | Default `sink-visibility` enforced | Strict-mode compatible |
 |---|---|---|---|---|
 | `strict` | `allow` | ❌ **Rejected** (compile error) | — | ❌ |
-| `strict` | `[servers...]` | ✅ Yes | ✅ Yes (except listed servers) | ✅ |
+| `strict` | `[servers...]` | ❌ **Rejected** (compile error) | — | ❌ |
 | `strict` | *(omitted)* | ✅ Yes | ✅ Yes | ✅ |
 | `filter` / `propagate` | `allow` | ❌ Disabled | ❌ Disabled | N/A |
 | `filter` / `propagate` | `[servers...]` | ✅ Yes | ✅ Yes (except listed servers) | N/A |
@@ -1780,7 +1780,7 @@ For list form, the compiler MUST verify that every listed server ID exists in th
 
 This opt-out exists for workflows that legitimately need to read from private repos and post summaries to public issue trackers, aggregate private data into public dashboards, or cross-post between private and public repos.
 
-The strict-mode incompatibility ensures organizations requiring maximum security cannot accidentally enable this escape hatch.
+The strict-mode incompatibility ensures organizations requiring maximum security cannot accidentally enable this escape hatch. Non-strict warnings make the risk explicit because workflow logs are public and agents may expose private data through public destinations.
 
 **Compliance Test**: T-WS-005 (Section 11.1.12)
 
@@ -2351,37 +2351,29 @@ Content-Type: application/json
 - **Updated**: Compliance Checklist (Section 11.2) — added Write-Sink Guard Policy row (T-WS-*, Level 2, Standard)
 - **Updated**: JSON Schema — added typed `write-sink` property to `guard-policies` in both `stdioServerConfig` and `httpServerConfig`; added `forcePublicRepos` property to `gatewayConfig`
 
-### Version 1.14.0 (Draft)
-
-- **Added**: Section 10 — Guard Policy
-  - Formal specification of the guard policy mechanism for integrity-based content filtering on the GitHub MCP server
-  - Section 10.1 — Overview: describes the purpose and relationship to the integrity filtering reference
-  - Section 10.2 — Integrity Levels: defines `merged`, `approved`, `unapproved`, `none`, and `blocked` levels
-  - Section 10.3 — Guard Policy Fields: field reference table covering `min-integrity`, `allowed-repos`, `blocked-users`, `trusted-users`, `approval-labels`, and `refusal-labels`
-  - Section 10.4 — Effective Integrity Computation: normative 6-step algorithm with precedence rules
-  - Section 10.5 — `approval-labels` Field: semantics, constraints, and configuration example
-  - Section 10.6 — `refusal-labels` Field: new field; semantics, constraints, combined example, and requirements
-  - Section 10.7 — Centralized Management via GitHub Variables: `GH_AW_GITHUB_REFUSAL_LABELS` variable added
-- **Added**: `refusal-labels` guard policy field (Section 10.6)
-  - The inverse of `approval-labels`: items bearing any listed label have effective integrity downgraded to `none`
-  - Overrides `trusted-users` and `approval-labels` promotion; `blocked-users` still takes precedence
-  - Accepts a literal array or a GitHub Actions expression (comma- or newline-separated list)
-  - Empty list is a no-op
-- **Added**: Compliance test category 11.1.11 — Guard Policy Tests (T-GP-001 through T-GP-010)
-  - T-GP-004 through T-GP-008 specifically cover `refusal-labels` behavior
-- **Updated**: Compliance Checklist (Section 11.2) — added Guard Policy row (T-GP-*, Level 2, Standard)
-- **Renumbered**: Former Section 10 (Compliance Testing) is now Section 11; all subsection references updated accordingly
-- **Added**: `GH_AW_GITHUB_REFUSAL_LABELS` to the centralized management variables table (Section 10.7)
-
-### Version 1.14.0 (Draft)
+### Version 1.14.1 (Draft)
 
 - **Breaking**: `headers` field removed from `opentelemetry` configuration in JSON schema and gateway config spec (Section 4.1.3.7)
   - Authentication headers MUST now be provided via the `OTEL_EXPORTER_OTLP_HEADERS` environment variable (standard OTel convention)
   - gh-aw automatically forwards `OTEL_EXPORTER_OTLP_HEADERS` to the mcpg container when `observability.otlp` is configured
   - This keeps credentials out of the stdin JSON config pipe and follows the [OTel SDK environment variable spec](https://opentelemetry.io/docs/specs/otel/protocol/exporter/#configuration-options)
-- **Updated**: T-OTEL-006 — now verifies `OTEL_EXPORTER_OTLP_HEADERS` env var is read and applied (instead of `headers` JSON field)
-- **Updated**: JSON Schema — removed `headers` property from `opentelemetryConfig` definition
+- **Updated**: T-OTEL-006 — now verifies `OTEL_EXPORTER_OTLP_HEADERS` env var is read and applied instead of a `headers` JSON field
+- **Updated**: JSON Schema — removed `headers` property from `opentelemetryConfig`
 - **Updated**: Appendix A.6 and A.7 examples to remove `headers` from JSON config and document env var usage
+
+### Version 1.14.0 (Draft)
+
+- **Added**: Section 10 — Guard Policy, covering the mechanism for integrity-based content filtering on the GitHub MCP server.
+  - Includes the overview, integrity levels, guard policy fields, effective integrity computation algorithm, `approval-labels`, `refusal-labels`, and centralized GitHub variable management.
+- **Added**: `refusal-labels` guard policy field (Section 10.6)
+  - The inverse of `approval-labels`: items bearing any listed label have effective integrity downgraded to `none`
+  - Overrides `trusted-users` and `approval-labels` promotion; `blocked-users` still takes precedence
+  - Accepts a literal array or a GitHub Actions expression (comma- or newline-separated list)
+  - Empty list is a no-op
+- **Added**: Compliance test category 11.1.11 — Guard Policy Tests (T-GP-001 through T-GP-010), including `refusal-labels` coverage in T-GP-004 through T-GP-008
+- **Updated**: Compliance Checklist (Section 11.2) — added Guard Policy row (T-GP-*, Level 2, Standard)
+- **Renumbered**: Former Section 10 (Compliance Testing) is now Section 11; all subsection references updated accordingly
+- **Added**: `GH_AW_GITHUB_REFUSAL_LABELS` to the centralized management variables table (Section 10.7)
 
 ### Version 1.13.0 (Draft)
 
@@ -2404,7 +2396,7 @@ Content-Type: application/json
 - **Added**: Compliance tests T-OTEL-011 and T-OTEL-012 for string-form header parsing
 - **Updated**: JSON Schema `opentelemetryConfig.headers` changed from a plain `object` type to `oneOf [object, string]`
 
-### Version 1.11.0 (Draft)
+### Version 1.11.1 (Draft)
 
 - **Added**: `opentelemetry` field to gateway configuration (Section 4.1.3, 4.1.3.6)
   - Optional object for configuring OpenTelemetry distributed tracing of MCP calls
@@ -2413,10 +2405,7 @@ Content-Type: application/json
   - `traceId`: Parent trace ID (32-char lowercase hex) for W3C trace context propagation
   - `spanId`: Parent span ID (16-char lowercase hex) for W3C trace context propagation
   - `serviceName`: Logical service name in the `service.name` resource attribute (default: `"mcp-gateway"`)
-- **Added**: Section 4.1.3.6 — OpenTelemetry Configuration
-  - Full field reference table with types, requirements, and descriptions
-  - Tracing behavior requirements (span attributes, W3C `traceparent` construction, export protocol)
-  - Failure handling requirements (export failures MUST NOT affect MCP processing)
+- **Added**: Section 4.1.3.6 — OpenTelemetry Configuration, including field requirements, tracing behavior, and failure handling
 - **Added**: Compliance test category 10.1.10 — OpenTelemetry Tests (T-OTEL-001 through T-OTEL-010)
 - **Added**: OpenTelemetry example configurations (Appendix A.6, A.7)
 - **Added**: Normative references for W3C Trace Context and OTLP

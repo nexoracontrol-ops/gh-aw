@@ -29,7 +29,9 @@ on:
           }
           core.info(`has_changes=${hasChanges}`);
           core.setOutput('has_changes', hasChanges ? 'true' : 'false');
-max-daily-ai-credits: 10000
+max-daily-ai-credits:
+  value: 10000
+  backend: repo-memory
 permissions:
   contents: read
   issues: read
@@ -38,8 +40,8 @@ permissions:
 tracker-id: daily-cli-performance
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.3-codex
+  model-provider: github
+model: copilot/gpt-6-luna
 tools:
   cli-proxy: true
   repo-memory:
@@ -81,7 +83,6 @@ features:
 sandbox:
   agent:
     id: awf
-    runtime: cloud-hypervisor
 evals:
   - id: benchmarks_run
     question: Did the agent run CLI performance benchmarks and track performance trends?

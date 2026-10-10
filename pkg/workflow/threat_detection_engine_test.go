@@ -3,10 +3,14 @@
 package workflow
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
+
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestBuildDetectionEngineExecutionStepWithThreatDetectionEngine(t *testing.T) {
@@ -160,6 +164,60 @@ func TestBuildDetectionEngineExecutionStepMaxAICreditsNotInheritedFromMainAgent(
 	}
 }
 
+func TestBuildDetectionEngineExecutionStepInheritsMaxTurnCacheMisses(t *testing.T) {
+	compiler := NewCompiler()
+
+	t.Run("inherits max-turn-cache-misses from the workflow", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "claude",
+			EngineConfig: &EngineConfig{
+				MaxTurnCacheMisses: 500,
+			},
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+		}
+
+		allSteps := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+		if !strings.Contains(allSteps, `maxCacheMisses\":500`) {
+			t.Fatalf("expected detection steps to inherit maxCacheMisses 500, got:\n%s", allSteps)
+		}
+	})
+
+	t.Run("falls back to the compile default when the workflow does not configure it", func(t *testing.T) {
+		t.Setenv(compilerenv.DefaultMaxTurnCacheMisses, "")
+
+		data := &WorkflowData{
+			AI: "claude",
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+		}
+
+		allSteps := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+		if !strings.Contains(allSteps, fmt.Sprintf(`maxCacheMisses\":%d`, constants.DefaultMaxTurnCacheMisses)) {
+			t.Fatalf("expected detection steps to use default maxCacheMisses, got:\n%s", allSteps)
+		}
+	})
+
+	t.Run("does not inherit the agent max-turns cap", func(t *testing.T) {
+		data := &WorkflowData{
+			AI: "claude",
+			EngineConfig: &EngineConfig{
+				MaxRuns: 3,
+			},
+			SafeOutputs: &SafeOutputsConfig{
+				ThreatDetection: &ThreatDetectionConfig{},
+			},
+		}
+
+		allSteps := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+		if !strings.Contains(allSteps, fmt.Sprintf(`maxRuns\":%d`, constants.DefaultMaxRuns)) {
+			t.Fatalf("expected detection steps to keep default maxRuns, got:\n%s", allSteps)
+		}
+	})
+}
+
 func TestBuildDetectionEngineExecutionStepCodexIncludesMCPSetup(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -179,9 +237,8 @@ func TestBuildDetectionEngineExecutionStepCodexIncludesMCPSetup(t *testing.T) {
 	if !strings.Contains(stepsString, "Start MCP Gateway") {
 		t.Errorf("Expected Codex detection steps to include MCP setup, got:\n%s", stepsString)
 	}
-	if !strings.Contains(stepsString, "model_provider = \"openai-proxy\"") {
-		t.Errorf("Expected Codex detection MCP config to include openai-proxy model provider, got:\n%s", stepsString)
-	}
+	config := decodeCodexBootstrap(t, stepsString)
+	assert.Equal(t, "openai-proxy", config["model_provider"])
 }
 
 func TestBuildDetectionEngineExecutionStepDefaultsHarnessMaxRetriesToZero(t *testing.T) {

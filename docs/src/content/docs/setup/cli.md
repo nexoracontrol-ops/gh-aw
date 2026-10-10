@@ -88,8 +88,6 @@ See the [setup-cli action README](https://github.com/github/gh-aw/blob/main/acti
 
 For invalid nested command paths, `gh aw` now fails explicitly instead of falling back to parent help output. For example, `gh aw secrets gh --help` returns an unknown-command error rather than reprinting `gh aw secrets` help.
 
-Use `gh aw version` to print the current version.
-
 ### The `--push` Flag
 
 `gh aw run --push` stages workflow files (including transitive imports), commits them, and pushes before dispatching the workflow. It refuses to proceed when unrelated files are already staged.
@@ -100,13 +98,7 @@ For `init`, `update`, and `upgrade`, use `--create-pull-request` instead.
 
 Commands are organized by workflow lifecycle: creating, building, testing, monitoring, and managing workflows.
 
-Use this table to choose between the similarly named setup commands:
-
-| Command | Best fit |
-|---------|----------|
-| [`gh aw add-wizard`](#add-wizard) | Guided, interactive setup for an existing workflow, including prompts for engine auth and secrets |
-| [`gh aw add`](#add) | Direct, non-interactive installation of an existing local, remote, or packaged workflow |
-| [`gh aw new`](#new) | Scaffold a new workflow template in this repository before writing custom instructions |
+To choose between the setup commands: [`add-wizard`](#add-wizard) is guided and interactive (prompts for engine auth and secrets), [`add`](#add) installs a local, remote, or packaged workflow non-interactively, and [`new`](#new) scaffolds a new workflow template.
 
 ### Getting Workflows
 
@@ -237,7 +229,7 @@ gh aw secrets set MY_SECRET --value-from-env MY_TOKEN          # From env var
 
 **Options:** `--repo/-r`, `--value`, `--value-from-env`, `--api-url`
 
-For Claude workflows, set `ANTHROPIC_API_KEY` or configure [Anthropic WIF](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif). `CLAUDE_CODE_OAUTH_TOKEN`, including a token from `claude login`, is not supported; it is silently ignored, so the run instead fails with an authentication error from the Claude CLI that never mentions the token, which is the signal to switch credentials.
+For Claude workflows, set `ANTHROPIC_API_KEY` or configure [Anthropic WIF](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif). `CLAUDE_CODE_OAUTH_TOKEN`, including a token from `claude login`, is not supported; the CLI rejects it with an error naming `CLAUDE_CODE_OAUTH_TOKEN` and pointing to these alternatives.
 
 ##### `secrets bootstrap`
 
@@ -249,7 +241,7 @@ gh aw secrets bootstrap --engine copilot                 # Check only Copilot se
 gh aw secrets bootstrap --non-interactive                # Display missing secrets without prompting
 ```
 
-**Options:** `--engine/-e` (copilot, claude, codex, gemini, pi), `--non-interactive`, `--repo/-r`
+**Options:** `--engine/-e` (copilot, claude, codex, gemini, pi, agy (experimental)), `--non-interactive`, `--repo/-r`
 
 See [Authentication](/gh-aw/reference/auth/) for details.
 
@@ -347,11 +339,19 @@ gh aw compile --dependabot                 # Generate dependency manifests
 gh aw compile --purge                      # Remove orphaned .lock.yml files
 ```
 
+For `--zizmor` and `--poutine`, compilation automatically uses a binary on `PATH` when its version is at least 1.30.1 or 1.1.6, respectively. The version is checked with `zizmor --version` or `poutine version --disable-version-check`. If the binary is missing, too old, or its version cannot be determined, the scanner uses the pinned Docker image instead. Other Docker-based checks still require Docker.
+
 If the repository root contains an [`aw.yml` manifest](/gh-aw/reference/aw-yml-package-manifest/), `gh aw compile` validates it before compiling workflows.
 
 Unlike `gh aw upgrade`, `gh aw compile` does not run codemods unless you pass `--fix`.
 
-**Options:** `--action-mode`, `--action-tag`, `--actionlint`, `--actions-repo`, `--allow-action-refs`, `--approve`, `--dependabot`, `--dir/-d`, `--engine/-e`, `--fail-fast`, `--fix`, `--force/-f`, `--force-refresh-action-pins`, `--force-refresh-container-pins`, `--gh-aw-ref`, `--ghes`, `--grant`, `--grype`, `--json/-j`, `--logical-repo/-l`, `--models`, `--no-check-update`, `--no-emit`, `--poutine`, `--purge`, `--refresh-stop-time`, `--runner-guard`, `--schedule-seed`, `--shellcheck`, `--show-all`, `--staged`, `--stats`, `--strict`, `--syft`, `--trial`, `--validate`, `--validate-images`, `--watch/-w`, `--yamllint`, `--zizmor`
+**Options:** `--action-mode`, `--action-tag`, `--actionlint`, `--actions-repo`, `--allow-action-refs`, `--approve`, `--dependabot`, `--dry-run`, `--dir/-d`, `--engine/-e`, `--environment`, `--fail-fast`, `--fix`, `--force/-f`, `--force-refresh-action-pins`, `--force-refresh-container-pins`, `--gh-aw-ref`, `--ghes`, `--grant`, `--grype`, `--json/-j`, `--logical-repo/-l`, `--models`, `--no-check-update`, `--no-emit`, `--poutine`, `--purge`, `--refresh-stop-time`, `--require-self-hosted-runners`, `--runner-guard`, `--schedule-seed`, `--shellcheck`, `--show-all`, `--staged`, `--stats`, `--strict`, `--syft`, `--trial`, `--validate`, `--validate-images`, `--watch/-w`, `--yamllint`, `--zizmor`
+
+**`--dry-run` flag:** Compile with strict source validation, staged safe outputs, shellcheck, model checks, and warnings as errors. Docker-based image validation and scanners are opt-in. Without Docker, required run-step linting uses native shellcheck. Missing required checks or model inventory block compilation. Compiler-managed GitHub mutations are disabled, including push jobs, memory/cache persistence, work-queue operations, reusable safe-output calls, reactions, comments/issues, label removal, and issue locking. Emitted locks remove `OTEL_*` and `GH_AW_OTLP_*` variables from workflow, job, step, container, and service environment mappings and disable automatic OTLP configuration and authentication. The runtime records `dry_run` in `aw_info.json` and warns that custom scripts/jobs, agent shell commands, external MCP servers, and custom credentials remain unverified. Explicitly disabling a required check is rejected; `--no-emit`, `--watch`, `--approve`, and `--allow-action-refs` are incompatible. This flag does not upload or execute workflows and is distinct from `--action-mode dev`. The compile MCP input is `dry_run`; `validate_images: true` opts into required image validation. See [Development Testing Mode](/gh-aw/reference/compilation-process/#development-testing-mode).
+
+Dry-run locks also omit daily credit accounting, retain existing per-run caps or promote configured/imported daily limits, and add manual dispatch restricted to maintainer/admin actors without bot exemptions. `DEBUG=workflow:compiler_development,cli:compile_development` reports mutations without configuration values.
+
+**`--environment NAME` flag:** Replace the environment on every compiled job, including approval and custom jobs. The name must be literal, non-blank, at most 255 characters, and contain no control characters or GitHub Actions expressions. Reusable-workflow caller jobs cause an error because GitHub Actions forbids an environment on them. Environment overrides do not isolate authorized repository/organization/enterprise secrets or grant execution permission; review replacement approval protections before testing.
 
 **`--gh-aw-ref` flag:** Convenience alias for `--action-mode release --action-tag <ref>`. Accepts a branch name, tag, or commit SHA targeting the `github/gh-aw` repository. Branch and tag names are resolved to their full commit SHA at compile time, so the baked-in reference is immutable and reproducible. Useful for E2E-testing workflows compiled against a specific gh-aw revision.
 
@@ -362,6 +362,8 @@ Unlike `gh aw upgrade`, `gh aw compile` does not run codemods unless you pass `-
 **Error Reporting:** Displays detailed error messages with file paths, line numbers, column positions, and contextual code snippets.
 
 **JSON Output (`--json`):** Emits an array of `ValidationResult` objects. Each result includes a `labels` field listing all repository labels referenced in safe-outputs (`create-issue.labels`, `create-discussion.labels`, `create-pull-request.labels`, `add-labels.allowed`). Use `--json --no-emit` to collect label references without writing compiled files.
+
+With `--dry-run`, workflow warnings invalidate only the affected workflow. Compiler/scanner diagnostics that cannot be attributed to one workflow appear as separate results with `scope: "batch"`; their `workflow` field identifies the diagnostic source rather than a workflow path. Any invalid result fails development compilation, even when individual workflows remain valid.
 
 **Dependabot Integration (`--dependabot`):** Generates dependency manifests and `.github/dependabot.yml` by analyzing runtime tools across all workflows. See [Dependabot Support reference](/gh-aw/reference/dependabot/).
 
@@ -459,18 +461,31 @@ List workflows with basic information (name, engine, compilation status) without
 gh aw list                                  # List all workflows
 gh aw list ci-                              # Filter by pattern (case-insensitive)
 gh aw list --json                           # Output in JSON format
+gh aw list --stale                          # List workflows with stale or missing lock files
 gh aw list --label automation               # Filter by label
 gh aw list --dir custom/workflows           # List from a local custom directory
 gh aw list --repo owner/repo --path .github/workflows  # List from a remote repository
 ```
 
-**Options:** `--json/-j`, `--label`, `--dir/-d`, `--path`, `--repo/-r`
+**Options:** `--json/-j`, `--label`, `--stale`, `--dir/-d`, `--path`, `--repo/-r`
 
-Two flags control the workflow directory location, with different purposes:
-- `--dir` (`-d`): overrides the **local** workflow directory. Applies only when `--repo` is not set.
-- `--path`: specifies the workflow directory path in a **remote** repository. Use together with `--repo`.
+`--dir` (`-d`) overrides the local workflow directory and applies only when `--repo` is not set. `--path` specifies the workflow directory in a remote repository and is used with `--repo`.
 
-Fast enumeration without GitHub API queries. For detailed status including enabled/disabled state and run information, use `status` instead.
+`list` enumerates workflows locally without GitHub API queries. For enabled/disabled state and run information, use `status` instead.
+
+For local workflows, `compiled` is `Yes` when the source frontmatter matches the generated `.lock.yml`, `No` when the hashes differ, and `N/A` when the lock file is missing. JSON output is a top-level array with one object per workflow and the same values in each object's `compiled` field. Use `--stale` to inspect only stale or missing lock files:
+
+```bash
+gh aw list --stale
+```
+
+For CI, fail when any lock file is stale or missing:
+
+```bash
+gh aw list --json | jq -e 'all(.[]; .compiled == "Yes")'
+```
+
+Run the check from the repository root. If it reports workflows, run `gh aw compile <workflow-id>` for each one and commit the regenerated `.lock.yml` files with their sources.
 
 #### `status`
 
@@ -506,46 +521,45 @@ To diagnose an actual download failure, enable the logs API and download debug n
 DEBUG=cli:logs_github_api,cli:logs_download gh aw logs --verbose --json
 ```
 
-**Workflow name matching**: The logs command accepts both workflow IDs (kebab-case filename without `.md`, e.g., `ci-failure-doctor`) and display names (from frontmatter, e.g., `CI Failure Doctor`). Matching is case-insensitive for convenience:
+`logs` accepts both workflow IDs (kebab-case filename without `.md`, for example `ci-failure-doctor`) and display names from frontmatter (for example `CI Failure Doctor`); matching is case-insensitive.
 
 ```bash wrap
 gh aw logs ci-failure-doctor               # Workflow ID
-gh aw logs CI-FAILURE-DOCTOR               # Case-insensitive ID
-gh aw logs "CI Failure Doctor"             # Display name
-gh aw logs "ci failure doctor"             # Case-insensitive display name
+gh aw logs "ci failure doctor"             # Display name (case-insensitive)
 ```
 
-**`--cache-before` flag (cache cleanup):** Deletes cached run folders in the output directory whose run creation date is older than the specified cutoff. Accepts the same date/time delta formats as `--start-date` and `--end-date` (e.g. `-1d`, `-1w`, `-1mo`) as well as absolute dates (`YYYY-MM-DD`). Cleanup runs before the download step to free disk space first; failures are non-fatal and logged as warnings. The previous `--after` spelling is kept as a hidden, deprecated alias.
+`--cache-before` deletes cached `run-{ID}` folders older than a cutoff before downloading. It accepts the same relative and absolute date formats as `--start-date` and `--end-date`; the deprecated hidden alias `--after` still works. The command reads the run creation time from `run_summary.json` when present, otherwise it falls back to the directory modification time.
 
 ```bash wrap
-gh aw logs --cache-before -1w                        # Evict local cache older than 1 week, then proceed with normal run download
-gh aw logs --cache-before -30d                       # Evict local cache entries older than 30 days
-gh aw logs --cache-before 2024-01-01                 # Evict local cache entries from before a specific date
-gh aw logs my-workflow --cache-before -1mo -c 20     # Evict local cache older than 1 month, then download 20 runs of a specific workflow
+gh aw logs --cache-before -1w                        # Evict cache older than 1 week, then download as normal
+gh aw logs --cache-before 2024-01-01                 # Evict cache entries before a specific date
+gh aw logs my-workflow --cache-before -1mo -c 20     # Evict, then download 20 runs of one workflow
 ```
 
-Only directories matching the `run-{ID}` naming pattern inside the output directory are considered. The run's creation timestamp is read from `run_summary.json` inside each folder; if that file is absent (e.g., incomplete download), the directory's modification time is used as a fallback.
-
-**`--train` flag:** Trains log template weights from the downloaded runs and writes `drain3_weights.json` to the logs output directory. The trained weights improve anomaly detection accuracy in subsequent `gh aw audit` and `gh aw logs` runs. To embed weights into the binary as defaults, copy the file to `pkg/agentdrain/data/default_weights.json` and rebuild.
+`--train` writes `drain3_weights.json` to the logs output directory using downloaded runs. Those weights improve anomaly detection in later `gh aw audit` and `gh aw logs` runs. To embed them as defaults, copy the file to `pkg/agentdrain/data/default_weights.json` and rebuild.
 
 ```bash wrap
 gh aw logs --train                    # Train on last 10 runs
 gh aw logs my-workflow --train -c 50  # Train on up to 50 runs of a specific workflow
 ```
 
-**`--stdin` flag:** Reads run IDs or URLs from stdin (one per line) instead of discovering runs from the GitHub API. Mutually exclusive with the workflow-name positional argument. Date, count, and workflow-name filters are ignored when `--stdin` is set; content filters (`--engine`, `--firewall`, `--safe-output`, etc.) still apply. Blank lines and `#`-prefixed comment lines are ignored. Bare numeric IDs require `--repo owner/repo` because they carry no embedded repo context. Full run URLs are self-contained and do not require `--repo`.
+`--stdin` reads run IDs or URLs from standard input, one per line, instead of discovering runs from the GitHub API. It cannot be combined with a workflow-name positional argument. Date, count, and workflow-name filters are ignored in this mode, but content filters such as `--engine`, `--firewall`, and `--safe-output` still apply. Blank lines and `#` comments are ignored. Bare numeric IDs require `--repo owner/repo`; full run URLs do not.
 
 ```bash wrap
-cat run-ids.txt | gh aw logs --stdin
 echo "1234567890" | gh aw logs --stdin --engine claude
 cat run-ids.txt | gh aw logs --stdin --repo owner/repo   # required for bare numeric IDs
-gh aw logs --runtime gvisor                              # Filter to runs using a specific sandbox agent runtime
+gh aw logs --runtime cloud-hypervisor                    # Filter to runs using a specific sandbox agent runtime
 ```
 
-**Options:** `--after-run-id`, `--artifacts`, `--before-run-id`, `--cache-before`, `--cached-jsonl`, `--count/-c`, `--end-date`, `--engine/-e`, `--evals`, `--exclude-staged`, `--filtered-integrity`, `--firewall`, `--format`, `--json/-j`, `--last`, `--no-firewall`, `--output/-o`, `--parse`, `--ref`, `--report-file`, `--repo/-r`, `--runtime`, `--safe-output`, `--start-date`, `--stdin`, `--summary-file`, `--timeout`, `--tool-graph`, `--train`
+**Options:** `--after-run-id`, `--artifacts`, `--audit`, `--before-run-id`, `--cache-before`, `--cached-jsonl`, `--count/-c`, `--drain3-weights`, `--dry-run`, `--end-date`, `--engine/-e`, `--evals`, `--exclude-staged`, `--filtered-integrity`, `--firewall`, `--format`, `--graders`, `--ignore-workflow-runs`, `--json/-j`, `--last`, `--max-github-api-rate-limit`, `--max-storage`, `--no-dry-run`, `--no-firewall`, `--output/-o`, `--parse`, `--prune-older-runs`, `--ref`, `--report-file`, `--repo/-r`, `--runtime`, `--safe-output`, `--start-date`, `--stdin`, `--summary-file`, `--timeout`, `--tool-graph`, `--train`
 
 `logs` defaults `--artifacts` to `usage` for faster, compact downloads. The `--last` flag is an alias for `--count/-c`.
+`--dry-run` selects only dry-run runs; `--no-dry-run` excludes them. These flags are mutually exclusive and work with workflow targets or `--stdin`. Older valid metadata without `dry_run` counts as a normal run; missing or malformed `aw_info.json` is excluded when either filter is active. Unified sessions preserve the flag as `workflow.info.data.dryRun`, and audit engine configuration exposes `dry_run`.
 When multiple targets run concurrently, `--count` limits the combined number of workflow runs and `--timeout` limits the total wall-clock download time across all targets.
+
+`--evals` and `--graders` each pull in a matching artifact set automatically: `--evals` includes results from `evals.jsonl`, `--graders` includes deterministic grader results and their artifacts. `--audit` generates `audit.json` in each downloaded run's cache directory (comparisons use only the runs downloaded in that invocation). `--ignore-workflow-runs` excludes specific run IDs (or `slug/ID` values, where the slug is informational and matching uses the numeric ID) from an otherwise matching set.
+
+`--max-storage` bounds total logs cache size in MB after pruning non-essential data; `--prune-older-runs` additionally removes the oldest completed runs when that pruning alone can't satisfy `--max-storage`. `--max-github-api-rate-limit` pauses (single target) or stops (multiple targets) further downloads once the given number of core API requests have been used — pass a positive value for an absolute budget or a negative value to reserve that many requests from the current rate limit. `--drain3-weights` points `--train` at an existing `drain3_weights.json` to seed pattern training instead of starting from scratch.
 
 `--cached-jsonl` reuses compatible, schema-versioned run records and workflow-run discovery responses. It writes exactly one JSON value per line, appending every complete `gh run list` payload before downloading artifacts and available GitHub API rate-limit reports after collection. Each enriched `run` record includes job execution data, sanitized MCP tool-call metadata, and available engine, model, runtime, and component versions for downstream dashboards. Raw tool errors, arguments, responses, and artifact bodies are excluded. Discovered runs therefore remain available when a timeout or API limit interrupts processing. Records from incompatible schema versions are ignored. Use `gh aw json-schema logs-jsonl` to generate the schema for each JSON Lines item.
 
@@ -573,17 +587,16 @@ gh aw audit 12345678 --repo owner/repo                    # Specify repository f
 **`--stdin` flag:** Reads run IDs or URLs from stdin (one per line), bypassing the need to pass positional arguments. Mutually exclusive with positional run-ID arguments. Blank lines and `#`-prefixed lines are ignored. Bare numeric IDs require `--repo owner/repo`; full URLs carry their own repo context.
 
 ```bash wrap
-echo "1234567890" | gh aw audit --stdin
 echo -e "1234567890\n9876543210" | gh aw audit --stdin   # diff mode: first is base
 cat run-ids.txt | gh aw audit --stdin --repo owner/repo
-gh aw audit 1234567890 --runtime gvisor                  # Skip run unless sandbox agent runtime matches
+gh aw audit 1234567890 --runtime cloud-hypervisor        # Skip run unless sandbox agent runtime matches
 ```
 
-**Options:** `--artifacts`, `--evals`, `--experiment`, `--format`, `--json/-j`, `--output/-o`, `--parse`, `--repo/-r`, `--runtime`, `--stdin`, `--variant`
+**Options:** `--artifacts`, `--evals`, `--experiment`, `--format`, `--group`, `--json/-j`, `--no-baseline`, `--output/-o`, `--parse`, `--repo/-r`, `--runtime`, `--stdin`, `--variant`
 
 The `--repo` flag accepts `owner/repo` format and is required when passing a bare numeric run ID without a full URL, allowing the command to locate the correct repository.
 
-The `--artifacts` flag selects which artifact sets to download (default: `all`). Valid sets include `activation`, `agent`, `all`, `detection`, `evals`, `experiment`, `firewall`, `github-api`, `graders`, `mcp`, and `usage`. Use `all` to download the full artifact set. Unlike `gh aw logs`, which defaults to `usage`, `audit` defaults to `all` for comprehensive analysis. The `--experiment` flag filters to runs that include the named experiment; `--variant` further restricts to a specific variant value and requires `--experiment` to be set. The `--output/-o` flag overrides the output directory.
+The `--artifacts` flag selects which artifact sets to download (default: `all`). Valid sets include `activation`, `agent`, `all`, `detection`, `evals`, `experiment`, `firewall`, `github-api`, `graders`, `info`, `mcp`, `usage`, and `work-queue`. The `work-queue` set downloads queue snapshots, worker finish intents, and workflow logs for coordinator operation reporting. Use `all` to download the full artifact set. Unlike `gh aw logs`, which defaults to `usage`, `audit` defaults to `all` for comprehensive analysis. The `--experiment` flag filters to runs that include the named experiment; `--variant` further restricts to a specific variant value and requires `--experiment` to be set. The `--output/-o` flag overrides the output directory.
 
 Logs are saved to `.github/aw/logs/run-{id}/` with filenames indicating the extraction level. Pre-agent failures (integrity filtering, missing secrets, binary install) surface the actual error in `failure_analysis.error_summary`. Invalid run IDs return a human-readable error.
 
@@ -610,14 +623,43 @@ Compare behavior between two or more workflow runs to detect policy regressions,
 ```bash wrap
 gh aw audit 12345 12346                     # Compare two runs
 gh aw audit 12345 12346 12347 12348         # Compare base against 3 runs
-gh aw audit 12345 12346 --format markdown   # Markdown output for PR comments
-gh aw audit 12345 12346 --json              # JSON for CI integration
-gh aw audit 12345 12346 --repo owner/repo   # Specify repository
+gh aw audit 12345 12346 --format markdown   # Markdown for PR comments (or --json for CI)
 ```
 
 The diff output shows: new or removed network domains, status changes (allowed ↔ denied), volume changes (>100% threshold), MCP tool invocation changes, run metric comparisons (token usage, duration, turns), tokens-per-turn changes, and per-tool and per-bash-command call breakdowns.
 
 **Options:** `--artifacts`, `--format` (pretty, markdown; default: pretty), `--json/-j`, `--output/-o`, `--repo/-r`
+
+#### `sessions`
+
+Experimental: download a unified agent session for an existing workflow run. The command writes
+`usage/aw_session.jsonl` to standard output without changing its contents. If that
+file is absent, it reconstructs the session from the agent artifact using the same
+engine parsers as `audit`, including available MCP and firewall evidence.
+Reconstruction does not fetch missing downstream artifacts; the collection record
+identifies absent components and source warnings.
+Runs from older `gh-aw` versions do not need `aw_session.jsonl` or
+`agent-session.jsonl`: native Copilot events, Pi streams, and raw engine logs are
+parsed into the current unified format. Legacy `agent-artifacts` and standalone
+`agent-stdio-log`/`agent-stdio.log` artifacts are supported, along with
+`aw-info`/`aw_info` or activation metadata.
+
+```bash wrap
+gh aw sessions download 1234567890 --repo owner/repo
+gh aw sessions download https://github.com/owner/repo/actions/runs/1234567890 --format markdown
+gh aw sessions download 1234567890 -o session.jsonl
+```
+
+**Options:** `--format` (`jsonl` or `markdown`; default: `jsonl`),
+`--output/-o` (output file), `--repo/-r` (`[HOST/]owner/repo`; defaults to the
+current repository).
+
+JSONL preserves the complete unified session payload. Markdown uses the shared,
+bounded summary renderer, omits user prompts and private tool payloads, and
+reports display truncation. Node.js is required for reconstruction and Markdown
+rendering, but not for downloading an existing unified JSONL file. Missing
+artifacts, download failures, and invalid session files return errors.
+The command and its output formats may change.
 
 #### `graders`
 
@@ -810,11 +852,9 @@ gh aw update --org my-org --create-issue --yes  # Auto-accept per-repo confirmat
 
 **Options:** `--dir/-d`, `--no-merge`, `--major`, `--force/-f`, `--engine/-e`, `--no-stop-after`, `--stop-after`, `--no-release-bump`, `--no-security-scanner`, `--approve`, `--create-pull-request`, `--create-issue`, `--org`, `--repos`, `--yes/-y`, `--no-compile`, `--no-redirect`, `--cool-down`, `--repo/-r`
 
-Org mode (`--org`) previews or creates workflow update pull requests across every repository in an organization. Use `--repos` to limit org mode to repositories matching one or more glob patterns, `--create-issue` to open an issue in each repository that has pending updates (requires `--org`), and `--yes/-y` to auto-accept per-repository confirmations (required in CI).
+Org mode (`--org`) previews or creates workflow update pull requests across every repository in an organization. Use `--repos` to limit matches, `--create-issue` to open an issue in each repository with pending updates, and `--yes/-y` to auto-accept per-repository confirmations in CI.
 
-The `--no-redirect` flag causes `update` to fail when the source workflow has a [`redirect`](/gh-aw/reference/frontmatter/) field, rather than following the redirect to its new location. Use this when you want explicit control over redirect handling.
-
-The `--repo/-r` flag runs the update against a different repository. The target repository is checked out in an isolated shallow clone under `.github/aw/updates/<sanitized-repo-id>`. When combined with `--create-pull-request`, the resulting PR is opened against the target repository instead of the current one.
+`--no-redirect` makes `update` fail when the source workflow has a [`redirect`](/gh-aw/reference/frontmatter/) field instead of following it. `--repo/-r` runs the update against a different repository by checking out an isolated shallow clone under `.github/aw/updates/<sanitized-repo-id>`; with `--create-pull-request`, the PR targets that repository instead of the current one.
 
 #### `deploy`
 
@@ -885,7 +925,9 @@ gh aw env update defaults.yml --scope org --org my-org --dry-run
 gh aw env update defaults.yml --scope ent --enterprise my-enterprise --yes
 ```
 
-**Options:** `--scope` (required), `--repo/-r`, `--org`, `--enterprise`, `--yes/-y`, `--dry-run`
+**Options:** `--scope` (required), `--repo/-r`, `--org`, `--enterprise`, `--visibility`, `--yes/-y`, `--dry-run`
+
+The `--visibility` flag sets access for newly created org or ent variables (`all`, `private`, or `selected`; default: `all`). Existing variables keep their current visibility. The flag is rejected with `--scope repo`.
 
 For repository scope, `--repo` currently accepts `owner/repo` only. To target GitHub Enterprise Server, select the host via `GH_HOST` rather than prefixing the repository with `[HOST/]`.
 
@@ -911,6 +953,8 @@ gh aw mcp add workflow server --transport stdio   # Prefer stdio transport
 gh aw mcp add workflow server --registry https://custom.registry.com/v1  # Use custom registry
 gh aw mcp add workflow server --tool-id my-server  # Override the tool ID
 ```
+
+**`mcp list-tools` options:** `--server` (required)
 
 **`mcp inspect` options:** `--check-secrets`, `--inspector`, `--server`, `--tool`
 
@@ -957,7 +1001,7 @@ gh aw domains weekly-research --json    # Output workflow domains in JSON format
 
 **Options:** `--json/-j`
 
-When no workflow is specified, lists all workflows with a summary of allowed and blocked domain counts. When a workflow is specified, lists all effective allowed and blocked domains including domains expanded from ecosystem identifiers (e.g., `node`, `python`, `github`) and engine defaults.
+When no workflow is specified, lists all workflows with a summary of allowed and blocked domain counts. When a workflow is specified, lists all effective allowed and blocked domains including domains expanded from named domain sets (e.g., `node`, `python`, `github`, `copilot`) and engine defaults.
 
 ### Utility Commands
 
@@ -1025,6 +1069,18 @@ gh aw hash-frontmatter .github/workflows/audit-workflows.md
 
 Includes all frontmatter fields, imported workflow frontmatter (BFS traversal), template expressions containing `env.` or `vars.`, and version information (gh-aw, awf, agents).
 
+#### `json-schema`
+
+Print the JSON Schema for structured command output.
+
+```bash wrap
+gh aw json-schema audit        # Schema for gh aw audit --json
+gh aw json-schema logs         # Schema for gh aw logs --json
+gh aw json-schema logs-jsonl   # Schema for each gh aw logs --cached-jsonl line
+```
+
+**Schema arguments:** `audit`, `logs`, `logs-jsonl`. The schema is written to stdout. See [JSON output schemas](/gh-aw/reference/audit/#json-output-schemas).
+
 ## Shell Completions
 
 Enable tab completion for workflow names, engines, and paths. After running `gh aw completion install`, restart your shell or source your configuration file.
@@ -1062,7 +1118,7 @@ gh aw logs workflow --repo github.enterprise.com/owner/repo      # Use with comm
 
 For GHE Cloud with data residency (`*.ghe.com`), see the dedicated [Debugging GHE Cloud guide](/gh-aw/troubleshooting/debug-ghe/).
 
-Commands that support `--create-pull-request` — including `gh aw add`, `gh aw init`, `gh aw update`, and `gh aw upgrade` — automatically detect the enterprise host from the git remote and route PR creation to the correct GHES instance. `gh aw audit` and `gh aw add-wizard` do the same, so running them inside a GHES repository usually does not require setting `GH_HOST` manually.
+Commands that support `--create-pull-request`, including `gh aw add`, `gh aw init`, `gh aw update`, and `gh aw upgrade`, auto-detect the enterprise host from the git remote and route PR creation to the correct GHES instance. `gh aw audit` and `gh aw add-wizard` do the same, so running them inside a GHES repository usually does not require setting `GH_HOST` manually.
 
 #### Configuring `gh` CLI on GHES
 
@@ -1093,7 +1149,7 @@ The setup action installs the script at `/opt/gh-aw/actions/configure_gh_for_ghe
 
 ## Debug Logging
 
-Enable detailed debugging with namespace, message, and time diffs.
+Enable detailed debugging with namespace, message, and time diffs:
 
 ```bash wrap
 DEBUG=* gh aw compile                # All logs
@@ -1101,13 +1157,13 @@ DEBUG=cli:* gh aw compile            # CLI only
 DEBUG=*,-tests gh aw compile         # All except tests
 ```
 
-Use `--verbose` flag for user-facing details.
+Use `--verbose` for user-facing detail.
 
 ## Smart Features
 
 ### Fuzzy Workflow Name Matching
 
-Auto-suggests similar workflow names on typos using Levenshtein distance.
+Typos in workflow names trigger suggestions based on Levenshtein distance.
 
 ```bash wrap
 gh aw compile audti-workflows
@@ -1115,7 +1171,7 @@ gh aw compile audti-workflows
 # Did you mean: audit-workflows?
 ```
 
-Works with: compile, enable, disable, logs, mcp commands.
+Supported in `compile`, `enable`, `disable`, `logs`, and `mcp` commands.
 
 ## Troubleshooting
 
@@ -1132,9 +1188,9 @@ See [Common Issues](/gh-aw/troubleshooting/common-issues/) and [Error Reference]
 
 ## Learn More
 
-- [Quick Start](/gh-aw/setup/quick-start/) - Get your first workflow running
-- [Frontmatter](/gh-aw/reference/frontmatter/) - Configuration options
-- [Adding Existing Workflows](/gh-aw/guides/working-with-workflows/#adding-existing-workflows) - Adding workflows from other repositories
-- [Security Guide](/gh-aw/introduction/architecture/) - Security best practices
-- [MCP Server Guide](/gh-aw/reference/gh-aw-as-mcp-server/) - MCP server configuration
-- [Agent Factory](/gh-aw/agent-factory-status/) - Agent factory status
+- [Quick Start](/gh-aw/setup/quick-start/) for your first workflow
+- [Frontmatter](/gh-aw/reference/frontmatter/) for configuration options
+- [Adding Existing Workflows](/gh-aw/guides/working-with-workflows/#adding-existing-workflows) for installing workflows from other repositories
+- [Security Guide](/gh-aw/introduction/architecture/) for security best practices
+- [MCP Server Guide](/gh-aw/reference/gh-aw-as-mcp-server/) for MCP server configuration
+- [Agent Factory](/gh-aw/agent-factory-status/) for agent factory status

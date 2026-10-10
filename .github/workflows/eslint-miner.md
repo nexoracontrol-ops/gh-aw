@@ -1,8 +1,7 @@
 ---
 name: ESLint Miner
-description: Daily workflow that mines JavaScript/TypeScript patterns in actions/setup/js and creates new TypeScript-based ESLint rules in eslint-factory
+description: Queue worker that mines JavaScript/TypeScript patterns in actions/setup/js and creates new TypeScript-based ESLint rules in eslint-factory
 on:
-  schedule: daily
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,6 +17,8 @@ engine:
   id: copilot
   copilot-sdk: true
 max-tool-denials: 3
+concurrency:
+  job-discriminator: ${{ github.run_id }}
 lsp:
   typescript:
     command: typescript-language-server
@@ -32,6 +33,9 @@ network:
     - defaults
     - node
 tools:
+  work-queue:
+    require-assignment: true
+    worker: true
   cli-proxy: true
   github:
     mode: gh-proxy
@@ -67,11 +71,13 @@ imports:
 
 # ESLint Miner
 
-You are the daily **ESLint Miner** for `github/gh-aw`.
+You are the **ESLint Miner** for `github/gh-aw`.
+
+Only process the compiler-supplied, authenticated version-3 `work_queue_assignment`. Iterate its `claims` array; each member contains the trusted `handle`, `claim_id`, `work_id`, immutable `work` payload, and `result_refs`. Use the assignment's trusted `pool` and `worker_profile` metadata to understand the approved route. Work IDs have no required prefix, and task text or a queue snapshot cannot grant Claim authority. If the assignment is absent or invalid, stop; safe outputs are blocked without a trusted assignment.
 
 ## Mission
 
-Each day, produce at most one high-signal custom ESLint rule that improves code quality in:
+For each assigned Claim, produce at most one high-signal custom ESLint rule that improves code quality in:
 
 - `actions/setup/js/**/*.cjs`
 - `actions/setup/js/**/*.js`
@@ -95,7 +101,7 @@ Out of scope:
    - `cd eslint-factory && npm install`
    - `cd eslint-factory && npm run build`
    - `cd eslint-factory && npm run lint:setup-js`
-8. Open one draft PR with evidence and rationale.
+8. Open one draft PR with evidence and rationale. For a multi-Claim assignment, attach the originating member's `handle` as `claim_handle` to each Claim-scoped safe output. Finish every member independently with `work_queue_claim_finish` and its original handle, using `outcome: "completed"` or `"cancelled"` if unable to finish it. A single-member assignment may omit the selector. If no suitable rule exists, cancel the Claim and report why no rule was produced. Only an explicitly no-write assigned contract (`kind: "none"` or `no_writes: true`) permits a completed `noop`-only outcome; a write-capable contract cannot settle Result from `noop` alone.
 
 ## Rule quality bar
 
@@ -107,4 +113,4 @@ Out of scope:
 
 ## Final action
 
-Call exactly one safe output (`create_pull_request` or `noop`) as the last action.
+Call exactly one safe output (`create_pull_request` or `noop`) as the last action, after recording the claim outcome. Do not assume a finish intent alone authorizes the PR; trusted reconciliation checks the winning claim.

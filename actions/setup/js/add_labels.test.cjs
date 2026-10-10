@@ -74,6 +74,7 @@ describe("add_labels", () => {
     };
 
     mockContext = {
+      eventName: "issues",
       repo: {
         owner: "test-owner",
         repo: "test-repo",
@@ -92,6 +93,16 @@ describe("add_labels", () => {
   });
 
   describe("main factory", () => {
+    it.each(["", "invalid", "2.5", 0])("rejects invalid max_labels configuration %j", async max_labels => {
+      await expect(main({ max_labels })).rejects.toThrow("Invalid max-labels value");
+    });
+
+    it("accepts a resolved max_labels expression as an integer string", async () => {
+      const handler = await main({ max_labels: "25" });
+
+      expect(typeof handler).toBe("function");
+    });
+
     it("should create a handler function with default configuration", async () => {
       const handler = await main();
       expect(typeof handler).toBe("function");
@@ -127,6 +138,28 @@ describe("add_labels", () => {
         expect(result.success).toBe(true);
         expect(result.number).toBe(123);
         expect(addLabelsCalls[0].issue_number).toBe(123);
+      });
+
+      it("rejects an unauthorized triggering number from workflow_dispatch", async () => {
+        mockContext.eventName = "workflow_dispatch";
+        mockContext.payload = {
+          inputs: {
+            event_name: "issues",
+            event_payload: JSON.stringify({ issue: { number: "123" } }),
+          },
+        };
+        const handler = await main({ max: 10, target: "triggering" });
+        const addLabelsCalls = [];
+        mockGithub.rest.issues.addLabels = async params => {
+          addLabelsCalls.push(params);
+          return {};
+        };
+
+        const result = await handler({ labels: ["bug"] }, {});
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("ERR_TARGET_AUTHORIZATION");
+        expect(addLabelsCalls).toHaveLength(0);
       });
 
       it("AL-001 defaults to the triggering item when target is omitted", async () => {
@@ -692,6 +725,7 @@ describe("add_labels", () => {
     });
 
     it("should add labels to a pull request from context", async () => {
+      mockContext.eventName = "pull_request";
       mockContext.payload = {
         pull_request: {
           number: 789,
@@ -733,7 +767,8 @@ describe("add_labels", () => {
       expect(result.error.includes("Invalid item number")).toBe(true);
     });
 
-    it("should handle missing item_number and no context", async () => {
+    it("should skip when the triggering context has no issue or pull request", async () => {
+      mockContext.eventName = "workflow_dispatch";
       mockContext.payload = {};
 
       const handler = await main({ max: 10 });
@@ -746,7 +781,8 @@ describe("add_labels", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error.includes("No issue/PR number available")).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain('Target is "triggering" but not running in issue or pull request context');
     });
 
     it("should respect max count limit", async () => {
@@ -1384,6 +1420,39 @@ describe("add_labels", () => {
       expect(result.error).toContain("received 11");
     });
 
+    it("allows more than ten labels when max_labels permits it, independently of max calls", async () => {
+      const labels = Array.from({ length: 16 }, (_, i) => `label${i + 1}`);
+      mockGithub._repoLabels = labels;
+      const added = [];
+      mockGithub.rest.issues.addLabels = async params => {
+        added.push(params.labels);
+        return {};
+      };
+      const handler = await main({ max: 2, max_labels: 25 });
+
+      expect((await handler({ labels }, {})).success).toBe(true);
+      expect(added[0]).toEqual(labels);
+      expect((await handler({ labels: ["label1"] }, {})).success).toBe(true);
+      expect((await handler({ labels: ["label2"] }, {})).success).toBe(false);
+      expect(added).toHaveLength(2);
+    });
+
+    it("rejects an entire call exceeding max_labels instead of dropping extra labels", async () => {
+      const added = [];
+      mockGithub.rest.issues.addLabels = async params => {
+        added.push(params.labels);
+        return {};
+      };
+      const handler = await main({ max: 10, max_labels: 2 });
+
+      const result = await handler({ labels: ["bug", "enhancement", "documentation"] }, {});
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Cannot add more than 2 labels");
+      expect(added).toHaveLength(0);
+      expect((await handler({ labels: ["bug", "enhancement"] }, {})).success).toBe(true);
+      expect(added).toEqual([["bug", "enhancement"]]);
+    });
+
     it("should resolve temporary ID in item_number to real issue number", async () => {
       const handler = await main({ max: 10, target: "*" });
       const addLabelsCalls = [];
@@ -1621,7 +1690,7 @@ describe("add_labels", () => {
       expect(result.labelsAdded[0].length).toBe(64);
     });
 
-    it("should handle numeric string from context payload correctly", async () => {
+    it("should reject a string issue number from context", async () => {
       const handler = await main({ max: 10 });
       const addLabelsCalls = [];
 
@@ -1643,8 +1712,9 @@ describe("add_labels", () => {
         {}
       );
 
-      expect(result.success).toBe(true);
-      expect(addLabelsCalls).toHaveLength(1);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("ERR_TARGET_AUTHORIZATION");
+      expect(addLabelsCalls).toHaveLength(0);
     });
 
     it("should reject invalid non-numeric value from context", async () => {
@@ -1664,7 +1734,7 @@ describe("add_labels", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("No issue/PR number available");
+      expect(result.error).toContain("ERR_TARGET_AUTHORIZATION");
     });
 
     it("should skip when item does not have all required_labels", async () => {
